@@ -3,7 +3,7 @@
  */
 
 import { normalizeRoutingFields, repos, composeSpecDiff, type Project, type Service, type ServicePublicEndpoint } from "@repo/db";
-import { aliasConflictsWithSiblings, getProjectType, mergeAdvanced, normalizeServiceLabel, normalizeAliasStrict, safeErrorMessage, withTimeout, type ComposeAdvanced, type ServiceContainerState, type StackId } from "@repo/core";
+import { aliasConflictsWithSiblings, commandToArgv, getProjectType, mergeAdvanced, normalizeServiceLabel, normalizeAliasStrict, safeErrorMessage, withTimeout, type ComposeAdvanced, type ServiceContainerState, type StackId } from "@repo/core";
 import {
   BuildLogger,
   DockerRuntime,
@@ -484,6 +484,8 @@ export async function createService(
   // service counts as a sibling, which is exactly right for a new row.
   await validateServiceAlias(projectId, "", advanced, project.internalAlias);
 
+  const command = trimOrNull(data.command);
+
   const created = await repos.service.create({
     projectId,
     name,
@@ -495,8 +497,15 @@ export async function createService(
     dependsOn: data.dependsOn ?? [],
     environment: data.environment ?? {},
     volumes: data.volumes ?? [],
-    command: trimOrNull(data.command),
-    commandArgv: data.commandArgv ?? null, // #332
+    command,
+    // #332: derive the argv when the caller sent only the text `command` — the
+    // dashboard's service form and the app installer (app-install.service.ts,
+    // which forwards a template's string command) both do. A row stored with a
+    // text command and a null argv is only rescued by the deploy-time backfill in
+    // `toComposeSpec`; deriving it at the insert keeps the two columns consistent
+    // without depending on that, and out of resolveComposeCmd's legacy
+    // `sh -c <command>` fallback. An explicit argv still wins, `[]` included.
+    commandArgv: data.commandArgv ?? commandToArgv(command), // #332
     restart: data.restart ?? "unless-stopped",
     advanced,
     ...routing,
@@ -589,6 +598,17 @@ export async function updateService(
     if (key in patch) {
       patch[key] = trimOrNull(patch[key]);
     }
+  }
+  // #332: `commandArgv` is what the runtime actually runs — resolveComposeCmd
+  // prefers it and only falls back to `sh -c <command>` for legacy rows that have
+  // no argv at all. The dashboard's service form sends the one-line `command` and
+  // no argv, so a text-only edit left the PREVIOUS argv in the row: the container
+  // went on running the old command while the UI showed the new one, and clearing
+  // the field never handed the image's own CMD back. Re-derive alongside the trim
+  // so the two columns can't disagree. An explicit argv from an argv-aware caller
+  // (the compose parser, the CLI, a snapshot replay) still wins, `[]` included.
+  if ("command" in patch && patch.commandArgv === undefined) {
+    patch.commandArgv = commandToArgv(patch.command);
   }
   // Monorepo sub-app build settings: same trim-or-null treatment so empty
   // strings become null in DB (matches the rest of the service columns).
