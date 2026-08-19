@@ -98,7 +98,7 @@ export function parseListeningPorts(procText: string): Set<number> {
  */
 export function parsePortProbeOutput(out: string, port: number): boolean | null {
   const trimmed = out.trim();
-  if (!trimmed || trimmed === "__UNAVAILABLE__") {
+  if (trimmed === "__UNAVAILABLE__") {
     return null;
   }
   if (trimmed === "__LISTEN__") {
@@ -111,11 +111,7 @@ export function parsePortProbeOutput(out: string, port: number): boolean | null 
   if (/^\d+(\s+\d+)*$/m.test(trimmed)) {
     return true;
   }
-  // procfs dump: contains header or hex rows
-  if (trimmed.includes("local_address") || /^\s*\d+:\s+[0-9A-Fa-f]{8}:[0-9A-Fa-f]{4}/m.test(trimmed)) {
-    return parseListeningPorts(trimmed).has(port);
-  }
-  return null;
+  return parseListeningPorts(trimmed).has(port);
 }
 
 /**

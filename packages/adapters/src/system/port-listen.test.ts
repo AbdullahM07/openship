@@ -83,11 +83,14 @@ describe("parsePortProbeOutput", () => {
     expect(parsePortProbeOutput("__LISTEN__\n", 80)).toBe(true);
   });
 
-  test("returns null for __UNAVAILABLE__ or empty/unknown output", () => {
+  test("returns false for empty or header-only procfs dump (no port listening)", () => {
+    expect(parsePortProbeOutput("", 80)).toBe(false);
+    expect(parsePortProbeOutput(HEADER, 80)).toBe(false);
+    expect(parsePortProbeOutput("   \n", 80)).toBe(false);
+  });
+
+  test("returns null for __UNAVAILABLE__", () => {
     expect(parsePortProbeOutput("__UNAVAILABLE__", 80)).toBeNull();
-    expect(parsePortProbeOutput("", 80)).toBeNull();
-    expect(parsePortProbeOutput("   \n", 80)).toBeNull();
-    expect(parsePortProbeOutput("command not found", 80)).toBeNull();
   });
 });
 
