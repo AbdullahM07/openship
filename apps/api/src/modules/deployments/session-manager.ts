@@ -32,6 +32,10 @@ export interface BuildSessionState {
   logs: LogEntry[];
   warningMessage?: string;
   errorMessage?: string;
+  /** A partial-failure deploy is HELD for an explicit keep/reject decision
+   *  (#664). Stored — like warningMessage — so a refresh/reconnect replays the
+   *  modal trigger instead of hiding it until the next REST poll. */
+  decisionPending?: boolean;
   /** Per-service deployment statuses (compose projects only, for replay on reconnect) */
   serviceStatuses: Map<string, ServiceStatusPayload>;
   /** Latest state of each install phase (catalog-app installs). Stored — not just
@@ -123,6 +127,12 @@ export function createSession(
 /** Get an active session */
 export function getSession(sessionId: string): BuildSessionState | null {
   return sessions.get(sessionId);
+}
+
+/** Stop replaying a partial-failure decision after it has been resolved. */
+export function clearDecisionPending(sessionId: string): void {
+  const session = sessions.get(sessionId);
+  if (session) session.decisionPending = undefined;
 }
 
 /** Append a log entry and broadcast to subscribers */
@@ -221,6 +231,9 @@ export function updateStatus(
     errorMessage?: string;
     /** Advisory post-deploy port-check results, forwarded on the `complete` event. */
     portCheck?: PortCheckResult[];
+    /** A partial-failure deploy is being HELD for an explicit keep/reject decision.
+     *  Explicit because nothing else on the event implies it — see setDeploymentStatus. */
+    decisionPending?: boolean;
   },
 ): void {
   // A prompt hold is independent of the SSE session's subscriber set. Always
@@ -234,6 +247,7 @@ export function updateStatus(
   session.status = status;
   session.warningMessage = meta?.warningMessage;
   session.errorMessage = meta?.errorMessage;
+  session.decisionPending = meta?.decisionPending;
 
   // Broadcast typed events matching frontend expectations
   if (status === "ready") {
@@ -241,6 +255,7 @@ export function updateStatus(
       type: "complete",
       success: true,
       ...(session.warningMessage ? { warningMessage: session.warningMessage } : {}),
+      ...(session.decisionPending ? { decisionPending: true } : {}),
       ...(meta?.portCheck && meta.portCheck.length > 0 ? { portCheck: meta.portCheck } : {}),
     });
     for (const writer of session.subscribers) {
@@ -370,6 +385,7 @@ export function subscribe(
         type: "complete",
         success: true,
         ...(session.warningMessage ? { warningMessage: session.warningMessage } : {}),
+        ...(session.decisionPending ? { decisionPending: true } : {}),
       }));
     } else if (session.status === "failed") {
       const lastError = [...session.logs].reverse().find((l) => l.level === "error");

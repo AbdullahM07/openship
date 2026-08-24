@@ -530,6 +530,8 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
       ? routeIssuesWarning(composeResult.routeWarnings ?? [], composeResult.tlsPendingDomains ?? [])
       : undefined;
   const successWarning = routingWarning ?? composeResult.warning;
+  const decisionPending =
+    composeResult.summary.failed > 0 && composeResult.summary.successful > 0;
   sessionManager.broadcastInstallPhase(dep.id, { id: "ready", status: "done" });
 
   // Every service was carried forward: this row owns no container and no image, so
@@ -550,6 +552,7 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
     url: composeResult.publicUrl,
     durationMs: composeBuild.durationMs,
     warningMessage: successWarning,
+    decisionPending,
     metaPatch: {
       composeDeployment: {
         totalServices: composeResult.summary.total,
@@ -557,6 +560,7 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
         failedServices: composeResult.summary.failed,
         failedServiceNames: composeResult.summary.failedServices,
         warningMessage: composeResult.warning,
+        ...(decisionPending ? { decision: "pending" } : {}),
       },
       ...(routingWarning ? { edgeUnsynced: true, deployWarning: routingWarning } : {}),
       ...(composeResult.portChecks && composeResult.portChecks.length > 0
