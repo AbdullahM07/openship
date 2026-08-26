@@ -134,6 +134,7 @@ export {
   type NewBackupRestore,
   type BackupRunStatus,
   type BackupRestoreStatus,
+  type PolicyLastRunSummary,
   type DockerMigrationRun,
   type NewDockerMigrationRun,
   type DockerMigrationStatus,

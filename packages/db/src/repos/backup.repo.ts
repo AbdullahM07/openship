@@ -8,7 +8,7 @@
  *   restore      — restore history (sibling of run)
  */
 
-import { and, desc, eq, inArray, isNotNull, isNull, lt, notInArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Database } from "../client";
 import { backupDestination, backupPolicy, backupRestore, backupRun } from "../schema";
 import { detailOf } from "./storable-detail";
@@ -35,6 +35,14 @@ export type BackupRunStatus =
   | "failed"
   | "cancelled"
   | "server_error";
+
+export interface PolicyLastRunSummary {
+  id: string;
+  status: string;
+  startedAt: Date;
+  finishedAt: Date | null;
+  bytesTransferred: number | null;
+}
 
 /** Result of atomically admitting one queued backup worker. */
 export type BackupRunExecutionClaim = "claimed" | "project_unavailable" | "state_changed";
@@ -267,6 +275,8 @@ export function createBackupDestinationRepo(db: Database) {
   };
 }
 
+export type BackupDestinationRepo = ReturnType<typeof createBackupDestinationRepo>;
+
 // ─── Policy repo ─────────────────────────────────────────────────────────────
 
 export function createBackupPolicyRepo(db: Database) {
@@ -475,6 +485,8 @@ export function createBackupPolicyRepo(db: Database) {
   };
 }
 
+export type BackupPolicyRepo = ReturnType<typeof createBackupPolicyRepo>;
+
 // ─── Run repo ────────────────────────────────────────────────────────────────
 
 export function createBackupRunRepo(db: Database) {
@@ -515,13 +527,94 @@ export function createBackupRunRepo(db: Database) {
       });
     },
 
-    /** Most recent run for a policy (any status), newest first. Used by the
-     *  read-only backup-schedule view in the Jobs tab to show last-run state. */
-    async latestByPolicy(policyId: string): Promise<BackupRun | undefined> {
-      return db.query.backupRun.findFirst({
+    /**
+     * Most recent run (or aggregated batch summary for multi-service project policies)
+     * for a policy, newest first. Used by the read-only backup-schedule view in the Jobs tab
+     * and the Destination detail page to show last-run state.
+     *
+     * When a policy targets an entire project, triggering it fans out into multiple child
+     * runs spawned concurrently within the same execution batch. This method finds the newest
+     * run, gathers all sibling runs in the same execution batch (within a 60-second window),
+     * and returns a consolidated summary with total transferred bytes and batch status.
+     */
+    async latestByPolicy(policyId: string): Promise<PolicyLastRunSummary | undefined> {
+      const latest = await db.query.backupRun.findFirst({
         where: and(eq(backupRun.policyId, policyId), isNull(backupRun.deletedAt)),
         orderBy: (t, { desc }) => [desc(t.startedAt)],
       });
+      if (!latest) return undefined;
+
+      const windowMs = 60 * 1000;
+      const batchStartCutoff = new Date(latest.startedAt.getTime() - windowMs);
+      const batchEndCutoff = new Date(latest.startedAt.getTime() + windowMs);
+
+      const batchRuns = await db.query.backupRun.findMany({
+        where: and(
+          eq(backupRun.policyId, policyId),
+          isNull(backupRun.deletedAt),
+          gte(backupRun.startedAt, batchStartCutoff),
+          lte(backupRun.startedAt, batchEndCutoff),
+        ),
+        orderBy: (t, { desc }) => [desc(t.startedAt)],
+      });
+
+      if (batchRuns.length <= 1) {
+        return {
+          id: latest.id,
+          status: latest.status,
+          startedAt: latest.startedAt,
+          finishedAt: latest.finishedAt,
+          bytesTransferred: latest.bytesTransferred,
+        };
+      }
+
+      const earliestStartedAt = new Date(
+        Math.min(...batchRuns.map((r) => r.startedAt.getTime())),
+      );
+
+      const hasInFlight = batchRuns.some((r) =>
+        IN_FLIGHT_RUN_STATUSES.includes(r.status as BackupRunStatus) || !r.finishedAt,
+      );
+
+      const latestFinishedAt = hasInFlight
+        ? null
+        : new Date(
+            Math.max(...batchRuns.map((r) => r.finishedAt?.getTime() ?? 0)),
+          );
+
+      let batchStatus: string;
+      const inFlightRun = batchRuns.find((r) =>
+        IN_FLIGHT_RUN_STATUSES.includes(r.status as BackupRunStatus),
+      );
+      if (inFlightRun) {
+        batchStatus = inFlightRun.status;
+      } else if (
+        batchRuns.some((r) =>
+          ["failed", "server_error", "cancelled"].includes(r.status),
+        )
+      ) {
+        batchStatus =
+          batchRuns.find((r) =>
+            ["failed", "server_error", "cancelled"].includes(r.status),
+          )?.status ?? "failed";
+      } else if (batchRuns.every((r) => r.status === "succeeded")) {
+        batchStatus = "succeeded";
+      } else {
+        batchStatus = latest.status;
+      }
+
+      const totalBytes = batchRuns.reduce(
+        (sum, r) => sum + (r.bytesTransferred ? Number(r.bytesTransferred) : 0),
+        0,
+      );
+
+      return {
+        id: latest.id,
+        status: batchStatus,
+        startedAt: earliestStartedAt,
+        finishedAt: latestFinishedAt,
+        bytesTransferred: totalBytes > 0 ? totalBytes : latest.bytesTransferred,
+      };
     },
 
     /** Storage rollup per destination for one org: bytes actually stored
@@ -921,6 +1014,8 @@ export function createBackupRunRepo(db: Database) {
   };
 }
 
+export type BackupRunRepo = ReturnType<typeof createBackupRunRepo>;
+
 // ─── Restore repo ────────────────────────────────────────────────────────────
 
 export function createBackupRestoreRepo(db: Database) {
@@ -987,6 +1082,7 @@ export function createBackupRestoreRepo(db: Database) {
      * match against the stored value and the route rejects an empty one before it gets
      * that far, so the row is prepared and unappliable. The update is conditional on
      * the column still being null, so a concurrent prepare cannot swap the token out
+
      * from under a client already holding one — hence the read-back for the losing
      * caller, which needs the winner's value, not its own.
      */
@@ -1116,3 +1212,5 @@ export function createBackupRestoreRepo(db: Database) {
     },
   };
 }
+
+export type BackupRestoreRepo = ReturnType<typeof createBackupRestoreRepo>;
