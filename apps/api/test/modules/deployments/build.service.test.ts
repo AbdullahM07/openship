@@ -7,6 +7,7 @@ const {
   assertGitHubRepoAccess,
   getCommitByRef,
   getForwardGitToServer,
+  getLatestCommit,
   kickoffBuild,
   repos,
   resolveProjectInfo,
@@ -20,6 +21,7 @@ const {
   assertGitHubRepoAccess: vi.fn(),
   getCommitByRef: vi.fn(),
   getForwardGitToServer: vi.fn(),
+  getLatestCommit: vi.fn(),
   kickoffBuild: vi.fn(),
   repos: {
     project: {
@@ -46,6 +48,10 @@ const {
     },
     serviceDeployment: {
       latestByProject: vi.fn(),
+    },
+    updateStatus: {
+      upsert: vi.fn(async () => {}),
+      deleteByProject: vi.fn(async () => {}),
     },
   },
   resolveProjectInfo: vi.fn(),
@@ -89,7 +95,7 @@ vi.mock("../../../src/modules/github/github-access", () => ({
 
 vi.mock("../../../src/modules/github/github.service", () => ({
   getCommitByRef,
-  getLatestCommit: vi.fn(),
+  getLatestCommit,
   getRepository: vi.fn(),
 }));
 
@@ -955,6 +961,34 @@ describe("redeployBuildSession environment snapshot", () => {
     expect(repos.project.getEnvMap).toHaveBeenCalledWith("project-1", "production", null);
     expect(repos.deployment.create).toHaveBeenCalledWith(
       expect.objectContaining({ envVars: { MANUAL_ENV: "keep-me" } }),
+    );
+  });
+
+  it("updates update_status cache when resolving a new commit on redeploy", async () => {
+    const project = baseProject({
+      id: "project-1",
+      activeDeploymentId: "dep-old",
+      gitOwner: "oblien",
+      gitRepo: "openship",
+      gitBranch: "main",
+    });
+    repos.project.findById.mockResolvedValue(project);
+    getLatestCommit.mockResolvedValue({
+      sha: "new-sha-123456789012345678901234567890",
+      message: "feat: new commit",
+    });
+
+    await redeployBuildSession(ctx, "dep-old");
+
+    expect(repos.updateStatus.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectId: project.id,
+        kind: "commit",
+        detail: expect.objectContaining({
+          latestSha: "new-sha-123456789012345678901234567890",
+          latestMessage: "feat: new commit",
+        }),
+      }),
     );
   });
 });

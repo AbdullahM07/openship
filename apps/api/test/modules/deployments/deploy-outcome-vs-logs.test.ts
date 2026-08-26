@@ -42,6 +42,7 @@ const h = vi.hoisted(() => ({
   sessionStatuses: [] as Array<{ id: string; status: string; detail?: Record<string, unknown> }>,
   activePointer: [] as string[],
   notifications: [] as string[],
+  deletedUpdateStatuses: [] as string[],
 }));
 
 vi.mock("@repo/db", () => ({
@@ -75,6 +76,11 @@ vi.mock("@repo/db", () => ({
       setCloudWorkspaceId: async () => {},
     },
     service: { listByDeployment: async () => [] },
+    updateStatus: {
+      deleteByProject: async (projectId: string) => {
+        h.deletedUpdateStatuses.push(projectId);
+      },
+    },
   },
 }));
 
@@ -148,6 +154,7 @@ beforeEach(() => {
   h.sessionStatuses = [];
   h.activePointer = [];
   h.notifications = [];
+  h.deletedUpdateStatuses = [];
 });
 
 describe("lifecycle: a rejected log payload cannot invert the outcome", () => {
@@ -308,6 +315,12 @@ describe("lifecycle: no write before settlement may tear down a live deploy", ()
 
     expect(statusPairs()).toEqual(["dep_1:ready"]);
     expect(ctx.settled).toBe("ready");
+  });
+
+  it("onSuccess invalidates cached update_status for the project", async () => {
+    const ctx = ctxFor();
+    await expect(onSuccess(ctx, { containerId: "c1", durationMs: 1 })).resolves.toBeUndefined();
+    expect(h.deletedUpdateStatuses).toEqual(["prj_1"]);
   });
 });
 

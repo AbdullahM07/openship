@@ -88,6 +88,7 @@ import {
   resolveReleaseVersion,
   ReleaseVersionUnavailableError,
 } from "../../lib/release-resolver";
+import { commitSourceKey, projectBranch } from "../projects/project-crud.service";
 import { env } from "../../config";
 
 function throwPreflightFailure(preflight: PreflightResult): never {
@@ -528,6 +529,21 @@ async function resolveLatestCommitInfo(ctx: RequestContext, project: Project, br
   }
 
   const head = await getLatestCommit(ctx, project.gitOwner, project.gitRepo, branch);
+  if (head?.sha && branch === projectBranch(project)) {
+    await Promise.resolve(
+      repos.updateStatus?.upsert?.({
+        organizationId: project.organizationId,
+        projectId: project.id,
+        kind: "commit",
+        checkedAt: new Date(),
+        detail: {
+          key: commitSourceKey(project),
+          latestSha: head.sha,
+          latestMessage: head.message ?? null,
+        },
+      }),
+    ).catch(() => {});
+  }
   return head ? { commitSha: head.sha, commitMessage: head.message } : {};
 }
 

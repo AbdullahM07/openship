@@ -110,11 +110,7 @@ const upstream = (p: Project, latestSha: string | null): UpstreamDrift => ({
 });
 
 /** A cache row as `updates:scan` would have written it. */
-const cachedRow = (over: {
-  key: string;
-  latestSha: string | null;
-  ageMs: number;
-}): UpdateStatus =>
+const cachedRow = (over: { key: string; latestSha: string | null; ageMs: number }): UpdateStatus =>
   ({
     id: "ups_1",
     organizationId: "org_1",
@@ -221,6 +217,19 @@ describe("when the cached row is allowed to answer", () => {
 
     const items = await listOrganizationUpdates(ctx, { behindOnly: true });
 
+    expect(items).toEqual([]);
+  });
+
+  it("polls fresh upstream when cache row was cleared by deployment success", async () => {
+    const p = project();
+    // Cache was invalidated on deploy, so no cached row exists for this project:
+    setup([p], []);
+    resolveUpstreamDrift.mockResolvedValue(upstream(p, NEWER));
+    deploymentRepo.findById.mockResolvedValue({ id: "dep_live", commitSha: NEWER });
+
+    const items = await listOrganizationUpdates(ctx, { behindOnly: true });
+
+    expect(resolveUpstreamDrift).toHaveBeenCalledTimes(1);
     expect(items).toEqual([]);
   });
 
