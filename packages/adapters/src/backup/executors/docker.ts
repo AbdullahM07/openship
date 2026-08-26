@@ -14,6 +14,7 @@
 
 import type Dockerode from "dockerode";
 import { PassThrough, Readable } from "node:stream";
+import { existsSync, statSync } from "node:fs";
 import { withTimeout, shellQuote } from "@repo/core";
 import { DockerRuntime, resolveExecExitCode } from "../../runtime/docker";
 import { demuxDockerStream } from "../../runtime/docker-demux";
@@ -182,6 +183,28 @@ function parseVolumeSpec(
   return { source, target, type };
 }
 
+/**
+ * Test whether a mount source is backupable as a directory volume.
+ *
+ * Sockets (e.g. `/var/run/docker.sock`), FIFOs, and regular single files cannot
+ * be mounted onto `/mnt` in the Alpine helper container without runc failing with
+ * "not a directory". Only directory bind mounts and named volumes are backupable.
+ */
+function isBackupableSource(sourcePath: string, type: BackupSource["type"]): boolean {
+  if (type === "volume") return true;
+  if (type === "bind" && sourcePath) {
+    try {
+      if (existsSync(sourcePath)) {
+        return statSync(sourcePath).isDirectory();
+      }
+    } catch {
+      return true;
+    }
+    return true;
+  }
+  return false;
+}
+
 export class DockerBackupExecutor implements BackupExecutor {
   readonly runtimeName = "docker" as const;
 
@@ -234,7 +257,7 @@ export class DockerBackupExecutor implements BackupExecutor {
           Destination?: string;
         }>;
         return mounts
-          .filter((m) => m.Type === "volume" || m.Type === "bind")
+          .filter((m) => (m.Type === "volume" || m.Type === "bind") && isBackupableSource(m.Source ?? "", (m.Type as BackupSource["type"]) ?? "volume"))
           .map(
             (m, i): BackupSource => ({
               id: m.Name ?? m.Source ?? `mount-${i}`,
@@ -251,7 +274,7 @@ export class DockerBackupExecutor implements BackupExecutor {
     return service.volumes
       .map((spec, i): BackupSource | null => {
         const parsed = parseVolumeSpec(spec);
-        if (!parsed || !parsed.source) return null;
+        if (!parsed || !parsed.source || !isBackupableSource(parsed.source, parsed.type)) return null;
         // Named volumes are project-scoped at deploy time; resolve the SAME
         // name here so the fallback mounts the real volume (not an empty one
         // docker would auto-create). Bind mounts and grandfathered services

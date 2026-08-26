@@ -12,6 +12,9 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { writeFileSync, mkdirSync, unlinkSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DockerBackupExecutor } from "./docker";
 import type { ServiceHandle } from "../types";
 
@@ -74,5 +77,81 @@ describe("DockerBackupExecutor.listSources DB fallback", () => {
     expect(sources.map((s) => s.source)).toEqual([
       "openship-clincai-openship-other-pgdata",
     ]);
+  });
+
+  it("excludes non-directory bind mounts (files and sockets) from live container inspection", async () => {
+    const tmpDir = join(tmpdir(), `openship-test-dir-${Date.now()}`);
+    const tmpFile = join(tmpdir(), `openship-test-file-${Date.now()}.key`);
+    mkdirSync(tmpDir, { recursive: true });
+    writeFileSync(tmpFile, "secret");
+
+    try {
+      const inspectExecutor = new DockerBackupExecutor({
+        docker: {
+          getContainer() {
+            return {
+              inspect: async () => ({
+                Mounts: [
+                  {
+                    Type: "bind",
+                    Source: tmpFile,
+                    Destination: "/run/secrets/key",
+                  },
+                  {
+                    Type: "bind",
+                    Source: tmpDir,
+                    Destination: "/var/lib/data",
+                  },
+                  {
+                    Type: "volume",
+                    Name: "pgdata",
+                    Destination: "/var/lib/postgresql/data",
+                  },
+                ],
+              }),
+            };
+          },
+        },
+      } as never);
+
+      const sources = await inspectExecutor.listSources(
+        handle([], { containerId: "cnt_123" }),
+      );
+
+      expect(sources).toEqual([
+        {
+          id: tmpDir,
+          source: tmpDir,
+          target: "/var/lib/data",
+          type: "bind",
+        },
+        {
+          id: "pgdata",
+          source: "pgdata",
+          target: "/var/lib/postgresql/data",
+          type: "volume",
+        },
+      ]);
+    } finally {
+      unlinkSync(tmpFile);
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("excludes non-directory bind mounts from DB fallback", async () => {
+    const tmpFile = join(tmpdir(), `openship-test-file-fallback-${Date.now()}.conf`);
+    const tmpDir = join(tmpdir(), `openship-test-dir-fallback-${Date.now()}`);
+    mkdirSync(tmpDir, { recursive: true });
+    writeFileSync(tmpFile, "config");
+
+    try {
+      const sources = await executor.listSources(
+        handle([`${tmpFile}:/etc/config`, `${tmpDir}:/data`]),
+      );
+      expect(sources.map((s) => s.source)).toEqual([tmpDir]);
+    } finally {
+      unlinkSync(tmpFile);
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
