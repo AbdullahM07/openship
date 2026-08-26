@@ -244,6 +244,10 @@ function routeRowsToPublicEndpoints(
         return left.isPrimary ? -1 : 1;
       }
 
+      if (left.domainType !== right.domainType) {
+        return left.domainType === "custom" ? -1 : 1;
+      }
+
       return left.hostname.localeCompare(right.hostname);
     })
     .map(routeDomainRowToPublicEndpoint)
@@ -932,6 +936,7 @@ export function serviceDomainRowsToPublicEndpoints(
     .filter((domain) => domain.serviceId === serviceId)
     .sort((left, right) => {
       if (left.isPrimary !== right.isPrimary) return left.isPrimary ? -1 : 1;
+      if (left.domainType !== right.domainType) return left.domainType === "custom" ? -1 : 1;
       return left.hostname.localeCompare(right.hostname);
     })
     .map(routeDomainRowToPublicEndpoint)

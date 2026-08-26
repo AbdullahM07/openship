@@ -64,6 +64,7 @@ vi.mock("../../../src/lib/managed-edge-proxy", () => ({
 import {
   deriveEnvironmentPublicEndpoints,
   deriveNextProjectRouteState,
+  deriveProjectRouteState,
   reapplyProjectLiveRoutes,
   shouldRefuseLoopbackRoute,
 } from "../../../src/modules/domains/project-route.service";
@@ -115,6 +116,37 @@ describe("deriveEnvironmentPublicEndpoints", () => {
 
   it("returns no endpoints when the base project has no explicit destination", () => {
     expect(deriveEnvironmentPublicEndpoints([], "preview-app")).toEqual([]);
+  });
+});
+
+describe("normalizeProjectRouteRows domain-type tie-breaker", () => {
+  it("sorts custom domains ahead of free subdomains when isPrimary status is equal", () => {
+    const state = deriveProjectRouteState(
+      { slug: "app" },
+      {
+        projectDomains: [
+          {
+            id: "dom-free",
+            hostname: "app.opsh.io",
+            isPrimary: false,
+            domainType: "free",
+            serviceId: null,
+            targetPort: 3000,
+          } as any,
+          {
+            id: "dom-custom",
+            hostname: "app.rschl.de",
+            isPrimary: false,
+            domainType: "custom",
+            serviceId: null,
+            targetPort: 3000,
+          } as any,
+        ],
+      },
+    );
+
+    expect(state.primaryDomainType).toBe("custom");
+    expect(state.primaryCustomDomain).toBe("app.rschl.de");
   });
 });
 

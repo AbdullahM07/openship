@@ -95,6 +95,10 @@ function normalizeProjectRouteRows(projectDomains: Domain[]): Domain[] {
         return left.isPrimary ? -1 : 1;
       }
 
+      if (left.domainType !== right.domainType) {
+        return left.domainType === "custom" ? -1 : 1;
+      }
+
       return left.hostname.localeCompare(right.hostname);
     });
 }

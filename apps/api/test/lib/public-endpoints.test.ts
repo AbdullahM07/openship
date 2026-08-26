@@ -102,6 +102,35 @@ describe("public endpoint helpers", () => {
     expect(endpoints).toEqual([]);
   });
 
+  it("sorts custom domains ahead of free subdomains when isPrimary status is equal", () => {
+    const endpoints = resolveStoredPublicEndpoints({
+      slug: "app",
+      projectDomains: [
+        {
+          hostname: "app.opsh.io",
+          isPrimary: false,
+          verified: true,
+          serviceId: null,
+          targetPort: 3000,
+          domainType: "free",
+        },
+        {
+          hostname: "app.rschl.de",
+          isPrimary: false,
+          verified: true,
+          serviceId: null,
+          targetPort: 3000,
+          domainType: "custom",
+        },
+      ] as any,
+    });
+
+    expect(endpoints[0]).toMatchObject({
+      customDomain: "app.rschl.de",
+      domainType: "custom",
+    });
+  });
+
   it("creates a default managed route when a target path is provided", () => {
     const endpoints = resolveStoredPublicEndpoints({
       slug: "my-app",
