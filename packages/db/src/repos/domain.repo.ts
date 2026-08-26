@@ -277,6 +277,12 @@ export function createDomainRepo(db: Database) {
     },
 
     async update(id: string, data: Partial<NewDomain>) {
+      if (data.isPrimary) {
+        const row = await db.query.domain.findFirst({ where: eq(domain.id, id) });
+        if (row?.projectId) {
+          await promotePrimary(row.projectId, id);
+        }
+      }
       await db
         .update(domain)
         .set({ ...data, updatedAt: new Date() })

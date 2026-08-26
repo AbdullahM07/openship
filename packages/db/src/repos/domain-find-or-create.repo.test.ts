@@ -77,4 +77,28 @@ describe("domain.findOrCreateWithStatus", () => {
       }),
     ).resolves.toMatchObject({ hostname: "reserved.example.com" });
   });
+
+  it("demotes other project domains when domain.update sets isPrimary to true", async () => {
+    const first = await repo.create({
+      projectId: "proj_primary_test",
+      hostname: "primary-first.example.com",
+      domainType: "free",
+      isPrimary: true,
+    });
+
+    const second = await repo.create({
+      projectId: "proj_primary_test",
+      hostname: "primary-second.example.com",
+      domainType: "custom",
+      isPrimary: false,
+    });
+
+    await repo.update(second.id, { isPrimary: true });
+
+    const firstUpdated = await repo.findById(first.id);
+    const secondUpdated = await repo.findById(second.id);
+
+    expect(secondUpdated?.isPrimary).toBe(true);
+    expect(firstUpdated?.isPrimary).toBe(false);
+  });
 });
