@@ -4418,6 +4418,181 @@
           "defaultMode": "domain"
         }
       ]
+    },
+    {
+      "$schema": "https://openship.io/app.schema.json",
+      "available": true,
+      "verified": true,
+      "minEngine": "0.6.9",
+      "id": "pocketbase",
+      "name": "PocketBase",
+      "description": "Self-hosted PocketBase with auth, a realtime SQLite database, file storage, and an admin dashboard in one small service.",
+      "repository": "https://github.com/pocketbase/pocketbase",
+      "kind": "template",
+      "logo": "pocketbase",
+      "category": "backend",
+      "tags": [
+        "auth",
+        "database",
+        "sqlite",
+        "realtime"
+      ],
+      "framework": "docker-compose",
+      "services": [
+        {
+          "name": "pocketbase",
+          "build": {
+            "dockerfile": "FROM alpine:3.22\nARG PB_VERSION=0.40.1\nRUN apk add --no-cache ca-certificates su-exec unzip wget \\\n    && wget -q https://github.com/pocketbase/pocketbase/releases/download/v${PB_VERSION}/pocketbase_${PB_VERSION}_linux_amd64.zip -O /tmp/pocketbase.zip \\\n    && unzip /tmp/pocketbase.zip -d /pb \\\n    && rm /tmp/pocketbase.zip \\\n    && addgroup -S pocketbase \\\n    && adduser -S -G pocketbase -h /pb pocketbase \\\n    && chown -R pocketbase:pocketbase /pb\nCOPY pocketbase/entrypoint.sh /pb/entrypoint.sh\nRUN chmod 755 /pb/entrypoint.sh\nWORKDIR /pb\nEXPOSE 8090\nENTRYPOINT [\"/pb/entrypoint.sh\"]\nCMD [\"/pb/pocketbase\", \"serve\", \"--http=0.0.0.0:8090\", \"--encryptionEnv=PB_ENCRYPTION_KEY\"]\n",
+            "files": [
+              {
+                "path": "entrypoint.sh",
+                "content": "#!/bin/sh\nset -eu\nmkdir -p /pb/pb_data\nchown -R pocketbase:pocketbase /pb/pb_data\nexport PB_ENCRYPTION_KEY=\"$(printf '%.32s' \"$PB_ENCRYPTION_SEED\")\"\nexec su-exec pocketbase \"$@\"\n"
+              }
+            ]
+          },
+          "environment": {
+            "GOMEMLIMIT": "512MiB"
+          },
+          "secretEnv": [
+            "PB_ENCRYPTION_SEED",
+            "POCKETBASE_SUPERUSER_PASSWORD"
+          ],
+          "ports": [
+            "8090:8090"
+          ],
+          "exposedPort": 8090,
+          "exposed": true,
+          "volumes": [
+            "pocketbase_data:/pb/pb_data"
+          ],
+          "healthcheck": {
+            "test": [
+              "CMD",
+              "wget",
+              "-qO-",
+              "http://127.0.0.1:8090/api/health"
+            ],
+            "interval": "5s",
+            "timeout": "3s",
+            "retries": 20,
+            "startPeriod": "10s"
+          },
+          "stopGracePeriod": "30s",
+          "restart": "unless-stopped"
+        }
+      ],
+      "configFields": [
+        {
+          "key": "PB_ENCRYPTION_SEED",
+          "service": "pocketbase",
+          "label": "Settings encryption seed",
+          "help": "Derives the stable 32-character key that encrypts PocketBase settings in the data volume.",
+          "generate": "secret",
+          "secret": true
+        },
+        {
+          "key": "POCKETBASE_SUPERUSER_PASSWORD",
+          "service": "pocketbase",
+          "label": "Superuser password",
+          "help": "Auto-generated during installation and shown in the connection card.",
+          "generate": "secret",
+          "secret": true
+        }
+      ],
+      "management": {
+        "kind": "schema"
+      },
+      "settings": [
+        {
+          "id": "superuser",
+          "label": "Superuser",
+          "description": "Initial PocketBase dashboard account.",
+          "fields": [
+            {
+              "key": "POCKETBASE_SUPERUSER_EMAIL",
+              "service": "pocketbase",
+              "label": "Superuser email",
+              "type": "text",
+              "required": true,
+              "installStep": true,
+              "requiresRedeploy": true
+            }
+          ]
+        }
+      ],
+      "prepare": [
+        {
+          "service": "pocketbase",
+          "title": "Create the superuser",
+          "description": "Creates or updates the PocketBase dashboard account.",
+          "command": "set -e; export PB_ENCRYPTION_KEY=\"$(printf '%.32s' \"$PB_ENCRYPTION_SEED\")\"; /pb/pocketbase superuser upsert \"$POCKETBASE_SUPERUSER_EMAIL\" \"$POCKETBASE_SUPERUSER_PASSWORD\" --dir=/pb/pb_data --encryptionEnv=PB_ENCRYPTION_KEY >/dev/null; echo ready",
+          "capture": "superuser",
+          "phase": "post-ready",
+          "mustSucceed": true,
+          "readiness": {
+            "test": "wget -qO- http://127.0.0.1:8090/api/health",
+            "interval": 1000,
+            "retries": 30
+          }
+        }
+      ],
+      "connection": {
+        "title": "Connect to PocketBase",
+        "description": "Use the public URL from browsers and other projects. The admin dashboard is available at /_/.",
+        "guide": {
+          "intro": "PocketBase stores auth, records, and files in one persistent SQLite-backed volume.",
+          "useHint": "Create scoped credentials for automation, configure off-host backups, and point each app at this URL.",
+          "defaultMode": "public"
+        },
+        "outputs": [
+          {
+            "id": "url",
+            "label": "PocketBase URL",
+            "source": "publicUrl:pocketbase",
+            "service": "pocketbase",
+            "kind": "url",
+            "envKey": "POCKETBASE_URL",
+            "recommended": true
+          },
+          {
+            "id": "email",
+            "label": "Superuser email",
+            "source": "env:pocketbase:POCKETBASE_SUPERUSER_EMAIL",
+            "service": "pocketbase",
+            "envKey": "POCKETBASE_SUPERUSER_EMAIL"
+          },
+          {
+            "id": "password",
+            "label": "Superuser password",
+            "source": "env:pocketbase:POCKETBASE_SUPERUSER_PASSWORD",
+            "service": "pocketbase",
+            "envKey": "POCKETBASE_SUPERUSER_PASSWORD",
+            "secret": true
+          }
+        ]
+      },
+      "provides": [
+        {
+          "id": "pocketbase",
+          "outputRefs": [
+            "url"
+          ],
+          "category": "database"
+        }
+      ],
+      "endpoints": [
+        {
+          "service": "pocketbase",
+          "port": 8090,
+          "label": "PocketBase API and dashboard",
+          "kind": "http",
+          "defaultMode": "domain",
+          "allowedModes": [
+            "domain",
+            "port"
+          ]
+        }
+      ]
     }
   ]
 }
