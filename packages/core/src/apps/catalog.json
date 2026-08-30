@@ -4445,7 +4445,7 @@
             "files": [
               {
                 "path": "entrypoint.sh",
-                "content": "#!/bin/sh\nset -eu\nmkdir -p /pb/pb_data\nchown pocketbase:pocketbase /pb/pb_data\nexport PB_ENCRYPTION_KEY=\"$(printf '%.32s' \"$PB_ENCRYPTION_SEED\")\"\nif [ ! -e /pb/pb_data/.openship-superuser ]; then\n  su-exec pocketbase /pb/pocketbase superuser create \"$POCKETBASE_SUPERUSER_EMAIL\" \"$POCKETBASE_SUPERUSER_PASSWORD\" --dir=/pb/pb_data --encryptionEnv=PB_ENCRYPTION_KEY >/dev/null\n  su-exec pocketbase touch /pb/pb_data/.openship-superuser\nfi\nexec su-exec pocketbase \"$@\"\n"
+                "content": "#!/bin/sh\nset -eu\nmkdir -p /pb/pb_data\nchown pocketbase:pocketbase /pb/pb_data\nexport PB_ENCRYPTION_KEY=\"$(printf '%.32s' \"$PB_ENCRYPTION_SEED\")\"\nif [ ! -e /pb/pb_data/.openship-superuser ]; then\n  su-exec pocketbase /pb/pocketbase superuser upsert \"$POCKETBASE_SUPERUSER_EMAIL\" \"$POCKETBASE_SUPERUSER_PASSWORD\" --dir=/pb/pb_data --encryptionEnv=PB_ENCRYPTION_KEY >/dev/null\n  su-exec pocketbase touch /pb/pb_data/.openship-superuser\nfi\nexec su-exec pocketbase \"$@\"\n"
               }
             ]
           },
