@@ -46,6 +46,11 @@ import { COMPOSE_SENTINEL } from "../../../lib/container-ref";
 import { safeErrorMessage } from "@repo/core";
 import * as sessionManager from "../session-manager";
 import type { HostPortTargetIdentity } from "../../../lib/host-port-target";
+import {
+  deploymentCancellationKeepsProvisioned,
+  raceDeploymentCancellation,
+  throwIfDeploymentCancelled,
+} from "../deployment-cancellation";
 
 export interface ComposePipelineOpts {
   project: Project;
@@ -84,6 +89,8 @@ export interface ComposePipelineOpts {
   /** Clone each service's source on the remote build host instead of cloning on
    *  the orchestrator and transferring the context. */
   cloneOnServer?: boolean;
+  /** Outer deployment cancellation signal. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -118,6 +125,8 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
     cloneOnServer,
   } = opts;
 
+  throwIfDeploymentCancelled(opts.signal);
+
   // Smart (partial) redeploy: when the snapshot carries a target subset and
   // this isn't a forceAll deploy, build + recreate ONLY those services and
   // leave the rest running (carried forward in the deploy step). forceAll or
@@ -141,6 +150,8 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
     !dep.forceAll &&
     !!targetServiceIds &&
     Boolean((snapshot as { strictServiceScope?: boolean }).strictServiceScope);
+  const keepProvisionedOnCancel = () =>
+    deploymentCancellationKeepsProvisioned(opts.signal);
 
   const composeBuild = await buildComposeImages({
     project,
@@ -163,17 +174,21 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
   // Cancelled during the image phase: stop here. setDeploymentStatus below has no
   // terminal-state guard, so without this the cancelled row would be flipped back
   // to "deploying" and the services the user cancelled would start anyway.
-  if (composeBuild.cancelled) {
-    for (const [serviceId, imageRef] of composeBuild.builtImageRefs) {
-      await cleanupBuildArtifact(runtime, imageRef).catch((err) => {
-        const detail = safeErrorMessage(err);
-        logger.log(
-          `Warning: failed to clean up built service image ${serviceId}: ${detail}\n`,
-          "warn",
-        );
-      });
+  if (composeBuild.cancelled || opts.signal?.aborted) {
+    if (!keepProvisionedOnCancel()) {
+      for (const [serviceId, imageRef] of composeBuild.builtImageRefs) {
+        await cleanupBuildArtifact(runtime, imageRef).catch((err) => {
+          const detail = safeErrorMessage(err);
+          logger.log(
+            `Warning: failed to clean up built service image ${serviceId}: ${detail}\n`,
+            "warn",
+          );
+        });
+      }
     }
-    await onCancelled(ctx, composeBuild.durationMs);
+    await onCancelled(ctx, composeBuild.durationMs, {
+      keepProvisioned: keepProvisionedOnCancel(),
+    });
     return;
   }
 
@@ -190,29 +205,62 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
   });
   sessionManager.broadcastInstallPhase(dep.id, { id: "services", status: "active" });
 
-  const composeResult = await deployComposeServices(project, dep, runtime, logger, {
-    builtImages: composeBuild.imageRefs,
-    buildFailures: composeBuild.buildFailures,
-    resources: runtimeResources,
-    buildSessionId,
-    routing,
-    ssl,
-    system,
-    executor,
-    localHost,
-    hostPortTarget,
-    promptUser: (prompt) => sessionManager.promptUser(dep.id, prompt),
-    usesManagedRouting,
-    serverId: snapshot.serverId,
-    targetServiceIds,
-    strictScope,
-    routeOptions: project.webhookDomain
-      ? {
-          webhookDomain: project.webhookDomain,
-          webhookProxy: webhookProxyTarget,
+  let composeResult;
+  try {
+    composeResult = await deployComposeServices(project, dep, runtime, logger, {
+      builtImages: composeBuild.imageRefs,
+      buildFailures: composeBuild.buildFailures,
+      resources: runtimeResources,
+      buildSessionId,
+      routing,
+      ssl,
+      system,
+      executor,
+      localHost,
+      hostPortTarget,
+      promptUser: (prompt) =>
+        raceDeploymentCancellation(sessionManager.promptUser(dep.id, prompt), opts.signal),
+      usesManagedRouting,
+      serverId: snapshot.serverId,
+      targetServiceIds,
+      strictScope,
+      routeOptions: project.webhookDomain
+        ? {
+            webhookDomain: project.webhookDomain,
+            webhookProxy: webhookProxyTarget,
+          }
+        : undefined,
+      signal: opts.signal,
+    });
+  } catch (err) {
+    if (opts.signal?.aborted) {
+      // The cancel endpoint may have raced this service call. The parent owns
+      // the terminal transition and cleanup; do it here once and return so the
+      // outer worker can acknowledge its lease instead of reporting a failure.
+      if (!keepProvisionedOnCancel()) {
+        for (const [, imageRef] of composeBuild.builtImageRefs) {
+          await cleanupBuildArtifact(runtime, imageRef).catch(() => {});
         }
-      : undefined,
-  });
+      }
+      await onCancelled(ctx, composeBuild.durationMs, {
+        keepProvisioned: keepProvisionedOnCancel(),
+      });
+      return;
+    }
+    throw err;
+  }
+
+  if (opts.signal?.aborted) {
+    if (!keepProvisionedOnCancel()) {
+      for (const [, imageRef] of composeBuild.builtImageRefs) {
+        await cleanupBuildArtifact(runtime, imageRef).catch(() => {});
+      }
+    }
+    await onCancelled(ctx, composeBuild.durationMs, {
+      keepProvisioned: keepProvisionedOnCancel(),
+    });
+    return;
+  }
 
   // RECONCILING: the connection dropped after some containers started, so the
   // outcome is unknown. Must be handled BEFORE the `failed` branch and must NOT

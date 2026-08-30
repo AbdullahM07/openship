@@ -283,6 +283,7 @@
     "you": "(du)",
     "removeMember": "Mitglied entfernen",
     "pendingInvitations": "Ausstehende Einladungen ({count})",
+    "copyInviteLink": "Einladungslink kopieren",
     "invitedAs": "Eingeladen als {role} – läuft ab am {date}",
     "roles": {
       "owner": "Eigentümer",
@@ -326,6 +327,7 @@
       "updateRoleFailed": "Rolle konnte nicht aktualisiert werden",
       "removeFailed": "Entfernen fehlgeschlagen",
       "cancelFailed": "Abbrechen fehlgeschlagen",
+      "copyInviteFailed": "Einladungslink konnte nicht kopiert werden",
       "accessUpdated": "Zugriff aktualisiert",
       "loadGrantsFailed": "Berechtigungen konnten nicht geladen werden",
       "deleteFailed": "Arbeitsbereich konnte nicht gelöscht werden",
@@ -356,9 +358,11 @@
     "pickerTitle": "Anfänglicher Ressourcenzugriff",
     "pickerDesc": "Eingeschränkte Mitglieder starten ohne Zugriff. Wähle aus, was diese Einladung nach der Annahme freischaltet — später kannst du über die Zeile des Mitglieds mehr gewähren.",
     "sendInvite": "Einladung senden",
+    "createInviteLink": "Einladungslink erstellen",
     "toast": {
       "failedSend": "Einladung konnte nicht gesendet werden",
       "invitationSent": "Einladung an {email} gesendet",
+      "invitationLinkCreated": "Einladungslink erstellt — unter ausstehenden Einladungen kopieren",
       "personalOrgBlocked": "In persönlichen Arbeitsbereichen können keine Mitglieder eingeladen werden. Erstelle zuerst eine Team-Organisation und sende dann Einladungen.",
       "updateMailSourceFailed": "Mailquelle konnte nicht aktualisiert werden"
     }

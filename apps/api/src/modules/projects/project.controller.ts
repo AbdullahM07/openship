@@ -997,13 +997,68 @@ export async function importLocal(c: Context) {
     return c.json({ error: "Directory not found" }, 404);
   }
 
+  // Resolve BEFORE writing the project, then carry the scanner's real (unmasked)
+  // compose services through the existing ensure funnel. The dashboard already
+  // calls /scan before this endpoint, but the CLI does not; trusting the client to
+  // replay scan output is what made `project create --local-path --type services`
+  // create a compose-shaped project with zero service rows (#751).
+  //
+  // There is intentionally no parser in the CLI and no second persistence path:
+  // resolveProjectInfo is the same GitHub/local parser used by deploy-time drift,
+  // and createProject/ensureProject share one compose persistence helper.
+  const info = await prepareService.resolveProjectInfo({
+    source: "local",
+    path: body.localPath,
+    composePath: body.composePath,
+  });
   const project = await projectService.createProject(
     {
       ...body,
+      localPath: body.localPath,
       gitProvider: "local",
+      framework: body.framework ?? info.stack,
+      packageManager: body.packageManager ?? info.packageManager,
+      installCommand: body.installCommand ?? info.installCommand,
+      buildCommand: body.buildCommand ?? info.buildCommand,
+      outputDirectory: body.outputDirectory ?? info.outputDirectory,
+      productionPaths: body.productionPaths ?? info.productionPaths.join(", "),
+      volumes: body.volumes ?? info.volumes,
+      rootDirectory: body.rootDirectory ?? info.rootDirectory,
+      composePath: body.composePath ?? info.composePath,
+      startCommand: body.startCommand ?? info.startCommand,
+      buildImage: body.buildImage ?? info.buildImage,
+      productionMode: body.productionMode ?? info.productionMode,
+      workloadType: body.workloadType ?? info.workloadType,
+      port: body.port ?? info.port,
+      hasBuild:
+        body.hasBuild ??
+        Boolean(info.buildCommand || info.services?.some((service) => Boolean(service.build))),
+      hasServer:
+        body.hasServer ??
+        (info.workloadType
+          ? info.workloadType === "web"
+          : info.projectType === "services" || Boolean(info.startCommand)),
+      projectType: body.projectType ?? info.projectType,
+      publicEndpoints: body.publicEndpoints ?? info.publicEndpoints,
+      routingConfig: body.routingConfig ?? info.routing,
+      readiness: body.readiness ?? info.readiness,
+      monorepoApps: body.monorepoApps ?? info.monorepoApps,
+      monorepoWorkspace: body.monorepoWorkspace ?? info.monorepoWorkspace,
+      services: info.services,
     },
     organizationId,
   );
+
+  audit.recordAsync(auditContextFrom(c, organizationId, userId), {
+    eventType: "project.created",
+    resourceType: "project",
+    resourceId: project.id,
+    after: {
+      source: "local",
+      localPath: body.localPath,
+      serviceCount: info.services?.length ?? 0,
+    },
+  });
 
   return c.json({ data: project }, 201);
 }

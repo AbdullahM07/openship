@@ -334,6 +334,7 @@
     "you": "(siz)",
     "removeMember": "Üyeyi kaldır",
     "pendingInvitations": "Bekleyen davetler ({count})",
+    "copyInviteLink": "Davet bağlantısını kopyala",
     "invitedAs": "{role} olarak davet edildi — süresi {date} tarihinde dolar",
     "roles": {
       "owner": "Sahip (Owner)",
@@ -393,6 +394,7 @@
       "updateRoleFailed": "Rol güncellenemedi",
       "removeFailed": "Kaldırma işlemi başarısız oldu",
       "cancelFailed": "İptal işlemi başarısız oldu",
+      "copyInviteFailed": "Davet bağlantısı kopyalanamadı",
       "accessUpdated": "Erişim güncellendi",
       "loadGrantsFailed": "Yetkiler yüklenemedi",
       "deleteFailed": "Çalışma alanı silinemedi",
@@ -431,9 +433,11 @@
     "pickerTitle": "Başlangıç kaynak erişimi",
     "pickerDesc": "Kısıtlı üyeler erişim olmadan başlar. Davet kabul edildiğinde hangi kaynakların kilidinin açılacağını seçin — daha sonra üyenin satırından daha fazla yetki verebilirsiniz.",
     "sendInvite": "Davet gönder",
+    "createInviteLink": "Davet bağlantısı oluştur",
     "toast": {
       "failedSend": "Davet gönderilemedi",
       "invitationSent": "Davet {email} adresine gönderildi",
+      "invitationLinkCreated": "Davet bağlantısı oluşturuldu — Bekleyen davetlerden kopyalayın",
       "personalOrgBlocked": "Kişisel çalışma alanları üye davet edemez. Önce bir ekip organizasyonu oluşturun, ardından davet gönderin.",
       "updateMailSourceFailed": "E-posta kaynağı güncellenemedi"
     }

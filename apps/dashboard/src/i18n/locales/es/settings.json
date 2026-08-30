@@ -283,6 +283,7 @@
     "you": "(tú)",
     "removeMember": "Eliminar miembro",
     "pendingInvitations": "Invitaciones pendientes ({count})",
+    "copyInviteLink": "Copiar enlace de invitación",
     "invitedAs": "Invitado como {role} - caduca {date}",
     "roles": {
       "owner": "Propietario",
@@ -326,6 +327,7 @@
       "updateRoleFailed": "No se pudo actualizar el rol",
       "removeFailed": "No se pudo eliminar",
       "cancelFailed": "No se pudo cancelar",
+      "copyInviteFailed": "No se pudo copiar el enlace de invitación",
       "accessUpdated": "Acceso actualizado",
       "loadGrantsFailed": "No se pudieron cargar las concesiones",
       "deleteFailed": "No se pudo eliminar el espacio de trabajo",
@@ -356,9 +358,11 @@
     "pickerTitle": "Acceso inicial a recursos",
     "pickerDesc": "Los miembros restringidos empiezan sin acceso. Elige qué desbloquea esta invitación una vez aceptada — puedes otorgar más adelante desde la fila del miembro.",
     "sendInvite": "Enviar invitación",
+    "createInviteLink": "Crear enlace de invitación",
     "toast": {
       "failedSend": "No se pudo enviar la invitación",
       "invitationSent": "Invitación enviada a {email}",
+      "invitationLinkCreated": "Enlace de invitación creado — cópialo desde Invitaciones pendientes",
       "personalOrgBlocked": "Los espacios de trabajo personales no pueden invitar a miembros. Crea primero una organización de equipo y luego envía invitaciones.",
       "updateMailSourceFailed": "No se pudo actualizar la fuente de correo"
     }

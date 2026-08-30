@@ -88,4 +88,29 @@ describe("createProvisionLock", () => {
     const result = await lock.run(async () => "ok");
     expect(result).toBe("ok");
   });
+
+  it("lets a queued deployment cancel without entering the critical section", async () => {
+    const lock = createProvisionLock("scope-cancel");
+    let releaseFirst!: () => void;
+    const first = lock.run(
+      () => new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      }),
+    );
+    const controller = new AbortController();
+    let entered = false;
+    const second = lock.run(
+      async () => {
+        entered = true;
+      },
+      controller.signal,
+    );
+
+    controller.abort();
+    await expect(second).rejects.toThrow("cancelled");
+    expect(entered).toBe(false);
+
+    releaseFirst();
+    await first;
+  });
 });

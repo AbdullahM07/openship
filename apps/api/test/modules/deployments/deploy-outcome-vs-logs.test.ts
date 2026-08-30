@@ -42,6 +42,7 @@ const h = vi.hoisted(() => ({
   sessionStatuses: [] as Array<{ id: string; status: string; detail?: Record<string, unknown> }>,
   activePointer: [] as string[],
   notifications: [] as string[],
+  finishedLogs: [] as unknown[][],
 }));
 
 vi.mock("@repo/db", () => ({
@@ -64,8 +65,14 @@ vi.mock("@repo/db", () => ({
         if (rejection) throw new Error(rejection);
       },
       supersedePendingDecisions: async () => {},
-      finishBuildSession: async () => {
+      finishBuildSession: async (
+        _id: string,
+        _status: string,
+        _durationMs: number,
+        logs?: unknown[],
+      ) => {
         if (h.finishError) throw h.finishError;
+        h.finishedLogs.push(logs ?? []);
       },
     },
     project: {
@@ -148,6 +155,7 @@ beforeEach(() => {
   h.sessionStatuses = [];
   h.activePointer = [];
   h.notifications = [];
+  h.finishedLogs = [];
 });
 
 describe("lifecycle: a rejected log payload cannot invert the outcome", () => {
@@ -178,6 +186,48 @@ describe("lifecycle: a rejected log payload cannot invert the outcome", () => {
     expect(h.sessionStatuses.map((s) => s.status)).toEqual(["failed"]);
     expect(h.notifications).toEqual(["deployment.failed"]);
     expect(ctx.settled).toBe("failed");
+  });
+
+  it("writes a direct pipeline failure into the persisted terminal log exactly once (#751)", async () => {
+    const ctx = ctxFor();
+    const { lines, logger } = loggerSpy();
+    ctx.logger = logger;
+    ctx.persistLogs = () =>
+      lines.map((line) => ({
+        timestamp: "2026-08-31T00:00:00.000Z",
+        message: line.message,
+        level: line.level as "error" | "info" | "warn" | undefined,
+      }));
+
+    await onFailure(ctx, "No services were found for this project", 99);
+
+    expect(lines).toEqual([
+      { message: "Error: No services were found for this project", level: "error" },
+    ]);
+    expect(h.finishedLogs.at(-1)).toEqual([
+      expect.objectContaining({
+        message: "Error: No services were found for this project",
+        level: "error",
+      }),
+    ]);
+  });
+
+  it("does not duplicate a terminal reason already emitted by a lower layer", async () => {
+    const ctx = ctxFor();
+    const { lines, logger } = loggerSpy();
+    logger.log("Error: docker build failed", "error");
+    ctx.logger = logger;
+    ctx.persistLogs = () =>
+      lines.map((line) => ({
+        timestamp: "2026-08-31T00:00:00.000Z",
+        message: line.message,
+        level: line.level as "error" | "info" | "warn" | undefined,
+      }));
+
+    await onFailure(ctx, "docker build failed", 99);
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.message).toBe("Error: docker build failed");
   });
 
   it("sanitizes the writes that land BEFORE the outcome (text + jsonb)", async () => {

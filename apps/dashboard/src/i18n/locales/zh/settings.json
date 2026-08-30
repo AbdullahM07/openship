@@ -283,6 +283,7 @@
     "you": "（你）",
     "removeMember": "移除成员",
     "pendingInvitations": "待处理的邀请（{count}）",
+    "copyInviteLink": "复制邀请链接",
     "invitedAs": "以 {role} 身份受邀 —— 于 {date} 过期",
     "roles": {
       "owner": "所有者",
@@ -326,6 +327,7 @@
       "updateRoleFailed": "更新角色失败",
       "removeFailed": "移除失败",
       "cancelFailed": "取消失败",
+      "copyInviteFailed": "无法复制邀请链接",
       "accessUpdated": "访问权限已更新",
       "loadGrantsFailed": "加载授权失败",
       "deleteFailed": "无法删除工作区",
@@ -356,9 +358,11 @@
     "pickerTitle": "初始资源访问权限",
     "pickerDesc": "受限成员起初没有任何访问权限。选择此邀请在被接受后解锁的内容 —— 之后你可以从该成员的行中授予更多权限。",
     "sendInvite": "发送邀请",
+    "createInviteLink": "创建邀请链接",
     "toast": {
       "failedSend": "发送邀请失败",
       "invitationSent": "邀请已发送至 {email}",
+      "invitationLinkCreated": "邀请链接已创建 — 请从待处理邀请中复制",
       "personalOrgBlocked": "个人工作区无法邀请成员。请先创建团队组织，然后再发送邀请。",
       "updateMailSourceFailed": "更新邮件来源失败"
     }

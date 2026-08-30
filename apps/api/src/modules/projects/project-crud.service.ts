@@ -86,6 +86,7 @@ import type {
 import { UpdateProjectBody } from "./project.schema";
 import { readDeployMeta, resolveProjectDeployTarget } from "./project-deploy-target";
 import { withLiveProjectRuntimeMutation } from "../../lib/project-runtime-lock";
+import { requireOrgServer } from "../../lib/server-target";
 export { resolveProjectDeployTarget } from "./project-deploy-target";
 
 /**
@@ -664,6 +665,7 @@ function buildProductionProjectInput(
   return {
     organizationId,
     groupId,
+    serverId: data.serverId ?? null,
     name: data.name,
     slug,
     environmentName: "Production",
@@ -856,6 +858,14 @@ async function createProductionProject(
   slug: string,
   organizationId: string,
 ) {
+  // A server id is a host-root capability, not an arbitrary foreign key. Verify
+  // it through the same org-scoped repository used by deployment preflight,
+  // and do it before ensureProjectApp writes anything so a rejected binding is
+  // atomic (no orphan project-group row).
+  if (data.serverId) {
+    await requireOrgServer(data.serverId, organizationId);
+  }
+
   // Multi-tenant SaaS: never trust a client-supplied installationId. It binds the
   // project to a GitHub App installation, and the push-webhook fan-out deploys by
   // matching project.installationId to the DELIVERY's installation (webhook-push.ts
@@ -1563,7 +1573,7 @@ export async function getProject(projectId: string, organizationId: string) {
 // ─── Create project ──────────────────────────────────────────────────────────
 
 /** @scope org — only reads organizationId as a DB key. */
-export async function createProject(data: TCreateProjectBody, organizationId: string) {
+export async function createProject(data: EnsureProjectBody, organizationId: string) {
   const slug = slugify(data.name);
 
   await assertProjectQuota(organizationId);
@@ -1574,6 +1584,10 @@ export async function createProject(data: TCreateProjectBody, organizationId: st
   // installationId is resolved server-side inside createProductionProject, which
   // both creating entry points share — see the comment there.
   const p = await createProductionProject(data, slug, organizationId);
+  // Keep create and ensure on the same compose persistence helper. Most create
+  // callers carry no services and this is a no-op; scanner-backed local imports
+  // carry the canonical unmasked rows and must materialize them immediately.
+  await persistComposeServices(p.id, organizationId, data);
 
   return enrichProject(p);
 }

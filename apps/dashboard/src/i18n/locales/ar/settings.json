@@ -283,6 +283,7 @@
     "you": "(أنت)",
     "removeMember": "إزالة العضو",
     "pendingInvitations": "الدعوات المعلّقة ({count})",
+    "copyInviteLink": "نسخ رابط الدعوة",
     "invitedAs": "مدعوّ بصفة {role} - تنتهي {date}",
     "roles": {
       "owner": "مالك",
@@ -326,6 +327,7 @@
       "updateRoleFailed": "تعذّر تحديث الدور",
       "removeFailed": "تعذّرت الإزالة",
       "cancelFailed": "تعذّر الإلغاء",
+      "copyInviteFailed": "تعذّر نسخ رابط الدعوة",
       "accessUpdated": "تم تحديث الوصول",
       "loadGrantsFailed": "تعذّر تحميل المنح",
       "deleteFailed": "تعذّر حذف مساحة العمل",
@@ -356,9 +358,11 @@
     "pickerTitle": "وصول الموارد الأولي",
     "pickerDesc": "يبدأ الأعضاء المقيّدون بلا وصول. اختر ما تتيحه هذه الدعوة بمجرد قبولها — يمكنك منح المزيد لاحقًا من صف العضو.",
     "sendInvite": "إرسال الدعوة",
+    "createInviteLink": "إنشاء رابط دعوة",
     "toast": {
       "failedSend": "تعذّر إرسال الدعوة",
       "invitationSent": "تم إرسال الدعوة إلى {email}",
+      "invitationLinkCreated": "تم إنشاء رابط الدعوة — انسخه من الدعوات المعلّقة",
       "personalOrgBlocked": "لا يمكن دعوة الأعضاء من مساحة العمل الشخصية. أنشئ مؤسسة فريق أولاً، ثم أرسل الدعوات.",
       "updateMailSourceFailed": "تعذّر تحديث مصدر البريد"
     }

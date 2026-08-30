@@ -402,6 +402,8 @@ export const endpoints = {
       mailboxes: (serverId: string) => `mail/admin/${encodeURIComponent(serverId)}/mailboxes`,
       mailbox: (serverId: string, email: string) =>
         `mail/admin/${encodeURIComponent(serverId)}/mailboxes/${encodeURIComponent(email)}`,
+      rotatePlatformMailbox: (serverId: string) =>
+        `mail/admin/${encodeURIComponent(serverId)}/platform-mailbox/rotate`,
       aliases: (serverId: string) => `mail/admin/${encodeURIComponent(serverId)}/aliases`,
       alias: (serverId: string, id: number) =>
         `mail/admin/${encodeURIComponent(serverId)}/aliases/${id}`,

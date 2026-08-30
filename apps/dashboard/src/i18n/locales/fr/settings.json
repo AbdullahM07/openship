@@ -283,6 +283,7 @@
     "you": "(vous)",
     "removeMember": "Supprimer le membre",
     "pendingInvitations": "Invitations en attente ({count})",
+    "copyInviteLink": "Copier le lien d'invitation",
     "invitedAs": "Invité en tant que {role} - expire le {date}",
     "roles": {
       "owner": "Propriétaire",
@@ -350,6 +351,7 @@
       "updateRoleFailed": "Échec de la mise à jour du rôle",
       "removeFailed": "Échec de la suppression",
       "cancelFailed": "Échec de l'annulation",
+      "copyInviteFailed": "Impossible de copier le lien d'invitation",
       "accessUpdated": "Accès mis à jour",
       "loadGrantsFailed": "Échec du chargement des octrois",
       "deleteFailed": "Échec de la suppression de l'espace de travail",
@@ -380,9 +382,11 @@
     "pickerTitle": "Accès initial aux ressources",
     "pickerDesc": "Les membres restreints commencent sans aucun accès. Choisissez ce que cette invitation déverrouille une fois acceptée — vous pourrez en accorder davantage plus tard depuis la ligne du membre.",
     "sendInvite": "Envoyer l'invitation",
+    "createInviteLink": "Créer un lien d'invitation",
     "toast": {
       "failedSend": "Échec de l'envoi de l'invitation",
       "invitationSent": "Invitation envoyée à {email}",
+      "invitationLinkCreated": "Lien d'invitation créé — copiez-le depuis les invitations en attente",
       "personalOrgBlocked": "Les espaces de travail personnels ne peuvent pas inviter de membres. Créez d'abord une organisation d'équipe, puis envoyez des invitations.",
       "updateMailSourceFailed": "Échec de la mise à jour de la source de messagerie"
     }

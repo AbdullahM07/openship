@@ -283,6 +283,7 @@
     "you": "(você)",
     "removeMember": "Remover membro",
     "pendingInvitations": "Convites pendentes ({count})",
+    "copyInviteLink": "Copiar link do convite",
     "invitedAs": "Convidado como {role} - expira {date}",
     "roles": {
       "owner": "Proprietário",
@@ -326,6 +327,7 @@
       "updateRoleFailed": "Falha ao atualizar o perfil",
       "removeFailed": "Falha ao remover",
       "cancelFailed": "Falha ao cancelar",
+      "copyInviteFailed": "Não foi possível copiar o link do convite",
       "accessUpdated": "Acesso atualizado",
       "loadGrantsFailed": "Falha ao carregar as concessões",
       "deleteFailed": "Não foi possível excluir o espaço de trabalho",
@@ -356,9 +358,11 @@
     "pickerTitle": "Acesso inicial a recursos",
     "pickerDesc": "Membros restritos começam sem acesso. Escolha o que este convite libera assim que for aceito — você pode conceder mais depois pela linha do membro.",
     "sendInvite": "Enviar convite",
+    "createInviteLink": "Criar link de convite",
     "toast": {
       "failedSend": "Falha ao enviar o convite",
       "invitationSent": "Convite enviado para {email}",
+      "invitationLinkCreated": "Link de convite criado — copie-o em Convites pendentes",
       "personalOrgBlocked": "Espaços de trabalho pessoais não podem convidar membros. Crie primeiro uma organização de equipe e depois envie os convites.",
       "updateMailSourceFailed": "Falha ao atualizar a fonte de e-mail"
     }

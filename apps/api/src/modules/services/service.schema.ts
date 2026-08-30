@@ -307,6 +307,12 @@ export const SyncServicesBody = Type.Object({
         ),
         dependsOn: Type.Optional(Type.Array(Type.String())),
         environment: Type.Optional(Type.Record(Type.String(), Type.String())),
+        environmentTemplates: Type.Optional(
+          Type.Record(Type.String(), Type.String(), {
+            description:
+              "Original Compose expressions keyed by environment name. Optional: when omitted, Openship derives them from `$` expressions in `environment` using the same parser as repository imports.",
+          }),
+        ),
         volumes: Type.Optional(Type.Array(Type.String())),
         command: Type.Optional(
           Type.String({

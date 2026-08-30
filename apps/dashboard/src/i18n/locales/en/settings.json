@@ -417,6 +417,7 @@
     "you": "(you)",
     "removeMember": "Remove member",
     "pendingInvitations": "Pending invitations ({count})",
+    "copyInviteLink": "Copy invitation link",
     "invitedAs": "Invited as {role} - expires {date}",
     "roles": {
       "owner": "Owner",
@@ -484,6 +485,7 @@
       "updateRoleFailed": "Failed to update role",
       "removeFailed": "Failed to remove",
       "cancelFailed": "Failed to cancel",
+      "copyInviteFailed": "Couldn't copy the invitation link",
       "accessUpdated": "Access updated",
       "loadGrantsFailed": "Failed to load grants",
       "deleteFailed": "Couldn't delete workspace",
@@ -522,9 +524,11 @@
     "pickerTitle": "Initial resource access",
     "pickerDesc": "Restricted members start with no access. Pick what this invite unlocks once accepted — you can grant more later from the member's row.",
     "sendInvite": "Send invite",
+    "createInviteLink": "Create invite link",
     "toast": {
       "failedSend": "Failed to send invite",
       "invitationSent": "Invitation sent to {email}",
+      "invitationLinkCreated": "Invitation link created — copy it from Pending invitations",
       "personalOrgBlocked": "Personal workspaces can't invite members. Create a team organization first, then send invitations.",
       "updateMailSourceFailed": "Failed to update mail source"
     }

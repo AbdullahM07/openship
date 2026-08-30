@@ -105,6 +105,7 @@ import {
   findOwnedPinnedHostPort,
   prepareTargetPinnedHostPorts,
   reserveTargetPinnedHostPort,
+  releaseNewPinnedHostPortClaims,
   withHostPortTargetLock,
   type AllocatedPinnedHostPort,
 } from "./pinned-host-ports";
@@ -143,6 +144,13 @@ import { serviceKind, type DeployableService } from "../../lib/deployable-servic
 import { resolveProjectRouteState } from "../domains/project-route.service";
 import { type DeploymentConfigSnapshot } from "./build.service";
 import * as settingsService from "../settings/settings.service";
+import {
+  registerDeploymentExecution,
+  raceDeploymentCancellation,
+  deploymentCancellationKeepsProvisioned,
+  releaseDeploymentExecution,
+  throwIfDeploymentCancelled,
+} from "./deployment-cancellation";
 
 // Build env = CI/telemetry defaults (BUILD_ENV_VARS) + the customer's own env
 // vars. NODE_ENV is deliberately NOT set or overridden here: it's the customer's
@@ -259,10 +267,11 @@ export async function kickoffBuild(project: Project, dep: Deployment): Promise<s
   dep.status = "building";
 
   sessionManager.createSession(dep.id, project.id);
+  const cancellationSignal = registerDeploymentExecution(dep.id);
 
   void (async () => {
     try {
-      await executeBuildAndDeploy(project, dep, buildSession.id);
+      await executeBuildAndDeploy(project, dep, buildSession.id, cancellationSignal);
     } catch (err) {
       console.error(`[DEPLOY] Fatal error for ${dep.id}:`, err);
       // executeBuildAndDeploy's inner try/catch only arms onFailure() after
@@ -282,6 +291,7 @@ export async function kickoffBuild(project: Project, dep: Deployment): Promise<s
         .catch((err) =>
           console.error(`[DEPLOY] Failed to acknowledge worker completion for ${dep.id}:`, err),
         );
+      releaseDeploymentExecution(dep.id, cancellationSignal);
     }
   })();
 
@@ -565,8 +575,14 @@ export async function finalizeComposeDeploy(opts: {
   }
 }
 
-async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSessionId: string) {
+async function executeBuildAndDeploy(
+  project: Project,
+  dep: Deployment,
+  buildSessionId: string,
+  cancellationSignal?: AbortSignal,
+) {
   const plat = platform();
+  throwIfDeploymentCancelled(cancellationSignal);
   let { runtime, routing, ssl, system } = plat;
   // Every transport THIS deploy opens, released in the `finally` at the bottom.
   // `plat`'s own runtime is the process-wide singleton and is deliberately never
@@ -607,6 +623,7 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
     dep,
     buildSessionId,
     persistLogs,
+    logger,
     provisioned,
   };
 
@@ -1034,6 +1051,7 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       // every service buildConfig, and close it once the pipeline settles.
       const composeRelay = await openRelayIfNeeded();
       try {
+        throwIfDeploymentCancelled(cancellationSignal);
         await executeComposePipeline({
           project,
           dep,
@@ -1057,6 +1075,7 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
           gitSsh: gitCred.ssh,
           gitAmbient: effectiveCloneOnTarget ? gitCred.ambient : undefined,
           cloneOnServer: effectiveCloneOnTarget,
+          signal: cancellationSignal,
         });
       } finally {
         if (composeRelay) await composeRelay.close().catch(() => {});
@@ -1168,6 +1187,19 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       provisioned.imageRef = buildResult.imageRef;
     }
 
+    // The adapter's build abort controller ends when it returns an image. The
+    // outer deployment signal remains live through preflight/activate/routing,
+    // so a cancel that landed at the image boundary cannot fall through into a
+    // deploy just because Docker finished a few milliseconds earlier. The
+    // ownership record above is deliberately established first so cancellation
+    // also reclaims an image that finished at that boundary.
+    if (cancellationSignal?.aborted) {
+      await onCancelled(ctx, buildResult.durationMs, {
+        keepProvisioned: deploymentCancellationKeepsProvisioned(cancellationSignal),
+      });
+      return;
+    }
+
     // A reused STATIC release is a directory whose doc-root offset was decided when
     // its files were extracted, so it is read back from that release instead of
     // re-derived from today's runtime resolution — see `reusedReleaseRouting`.
@@ -1178,7 +1210,9 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       : deployRouting;
 
     if (buildResult.status === "cancelled") {
-      await onCancelled(ctx, buildResult.durationMs);
+      await onCancelled(ctx, buildResult.durationMs, {
+        keepProvisioned: deploymentCancellationKeepsProvisioned(cancellationSignal),
+      });
       return;
     }
 
@@ -1232,6 +1266,7 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       logger,
       deployRouting: servedRouting,
       transports,
+      cancellationSignal,
     };
 
     // deployMode is derived from runtime.name === "cloud", so the cast is sound.
@@ -1242,10 +1277,27 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
         throw new Error("Cannot allocate a routed host port without a physical target identity");
       }
       await (hostPortTargetLockHeld
-        ? withHostPortTargetLock(phase.hostPortTarget!, () => executeServerDeploy(phase))
+        ? withHostPortTargetLock(
+            phase.hostPortTarget!,
+            () => executeServerDeploy(phase),
+            cancellationSignal,
+          )
         : executeServerDeploy(phase));
     }
   } catch (err) {
+    // Cancellation is a normal terminal outcome, not a pipeline failure. This
+    // catches cancellation during setup/compose orchestration as well as the
+    // explicit post-build guards; the hook is idempotent at the DB outcome
+    // layer, and the settled check avoids duplicate cleanup when a child path
+    // already handled it.
+    if (cancellationSignal?.aborted && !ctx.settled) {
+      await onCancelled(ctx, undefined, {
+        keepProvisioned: deploymentCancellationKeepsProvisioned(cancellationSignal),
+      }).catch((cancelErr) =>
+        console.error(`[DEPLOY] Cancel cleanup failed for ${dep.id}:`, cancelErr),
+      );
+      return;
+    }
     const message = err instanceof Error ? err.message : "Unknown error";
     if (process.env.OPENSHIP_DEBUG_PIPELINE) console.error("[pipeline]", err);
     // Only an UNSETTLED error is a deploy failure. An error thrown after the
@@ -1284,6 +1336,8 @@ interface DeployPhaseInputs {
   hostPortTarget: HostPortTargetIdentity | null;
   /** Whether executeServerDeploy is already inside the physical-target lock. */
   hostPortTargetLockHeld: boolean;
+  /** Cancellation for the outer build → deploy worker. */
+  cancellationSignal?: AbortSignal;
   usesManagedRouting: boolean;
   routeState: Awaited<ReturnType<typeof resolveProjectRouteState>>;
   buildResult: BuildResult;
@@ -1522,6 +1576,7 @@ function buildDeployEnvironment(
               logger.log(`${entry.message}\n`, entry.level);
             };
 
+            throwIfDeploymentCancelled(phase.cancellationSignal);
             await serve.ensureRuntimeReady();
             // Domains are OPTIONAL — edge/routing/SSL toolchain setup is
             // best-effort and must NEVER fail the deploy. If OpenResty/certbot
@@ -1579,6 +1634,7 @@ function buildDeployEnvironment(
             }
           }
 
+          throwIfDeploymentCancelled(phase.cancellationSignal);
           // This is deliberately outside the best-effort routing catch. A route
           // may be optional, but reusing a port that an unreadable/stale vhost
           // still targets is not: it can serve one project's container through
@@ -1586,6 +1642,7 @@ function buildDeployEnvironment(
           // observed ports into durable claims or aborts before the old workload
           // is stopped and before the new one binds.
           await deps.prepareHostPorts?.(cfg);
+          throwIfDeploymentCancelled(phase.cancellationSignal);
           await serve.ensurePorts(cfg, promptUser);
         }
       : undefined,
@@ -2220,10 +2277,55 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
           logger.log(`vercel.json rule not applied — ${note}\n`, "warn"),
         ),
       },
-      promptUser: (prompt) => sessionManager.promptUser(dep.id, prompt),
+      promptUser: (prompt) =>
+        raceDeploymentCancellation(
+          sessionManager.promptUser(dep.id, prompt),
+          phase.cancellationSignal,
+        ),
+      signal: phase.cancellationSignal,
+      keepProvisionedOnCancel: deploymentCancellationKeepsProvisioned(
+        phase.cancellationSignal,
+      ),
     },
     logger,
   );
+
+  if (deployResult.status === "cancelled") {
+    // A cancellation can land after preflight reserved a host port or created a
+    // generated domain, but before the pipeline reaches its normal success/fail
+    // convergence. Reclaim only claims this attempt newly owns; an existing
+    // exact claim remains protected for the live release.
+    if (phase.hostPortTarget && attemptedHostPortAllocations.length > 0) {
+      await releaseNewPinnedHostPortClaims(
+        phase.hostPortTarget,
+        attemptedHostPortAllocations,
+      ).catch((err) =>
+        logger.log(
+          `Warning: failed to release cancelled host-port reservations: ${safeErrorMessage(err)}\n`,
+          "warn",
+        ),
+      );
+    }
+    for (const id of createdDomainIds) {
+      await repos.domain.remove(id).catch(() => {});
+    }
+    if (
+      !deploymentCancellationKeepsProvisioned(phase.cancellationSignal) &&
+      deployResult.containerId &&
+      !isStaticFileServe
+    ) {
+      await runtime.destroy(deployResult.containerId).catch((err) =>
+        logger.log(
+          `Warning: failed to clean up cancelled container: ${safeErrorMessage(err)}\n`,
+          "warn",
+        ),
+      );
+    }
+    await onCancelled(ctx, buildResult.durationMs, {
+      keepProvisioned: deploymentCancellationKeepsProvisioned(phase.cancellationSignal),
+    });
+    return;
+  }
 
   if (deployResult.status === "failed") {
     // Reap the container this deploy STARTED if it failed during/after routing.
