@@ -2,7 +2,6 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { buildCatalog } from "../../scripts/gen-catalog";
-import { compareSemver } from "../updates/semver";
 import { isValidAppTemplate, parseAppTemplate, templateEngineOk } from "./schema";
 import { APP_TEMPLATES } from "../app-templates";
 
@@ -44,7 +43,7 @@ describe("app catalog (JSON)", () => {
           `${app.id}/${service.name} uses a post-0.6.6 serviceSpec field but entry has no minEngine — engine gate cannot refuse pre-0.6.6 installs`,
         ).toBeDefined();
         expect(
-          compareSemver(app.minEngine!, MIN_ENGINE) >= 0,
+          templateEngineOk(app.minEngine, MIN_ENGINE),
           `${app.id}/${service.name} declares minEngine=${app.minEngine}, must be >= ${MIN_ENGINE}`,
         ).toBe(true);
       }
