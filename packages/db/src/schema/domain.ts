@@ -1,4 +1,13 @@
-import { pgTable, text, timestamp, boolean, integer, index } from "drizzle-orm/pg-core";
+import {
+  pgTable,
+  text,
+  timestamp,
+  boolean,
+  integer,
+  index,
+  uniqueIndex,
+} from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 import { project } from "./project";
 import { service } from "./service";
 import { webhookSource } from "./webhook-source";
@@ -127,6 +136,12 @@ export const domain = pgTable(
     updatedAt: timestamp("updated_at").notNull().defaultNow(),
   },
   (t) => [
+    // A primary is a project-wide routing choice, including service-scoped
+    // domain rows. NULL project ids belong to webhook/mail owners and are not
+    // part of this invariant.
+    uniqueIndex("uq_domain_project_primary")
+      .on(t.projectId)
+      .where(sql`${t.isPrimary} = true AND ${t.projectId} IS NOT NULL`),
     // Routing hot path — every request that resolves a hostname hits this.
     index("idx_domain_project").on(t.projectId),
     index("idx_domain_project_hostname").on(t.projectId, t.hostname),
