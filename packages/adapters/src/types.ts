@@ -532,10 +532,12 @@ export interface ResourceUsage {
   networkTxBytes: number;
 }
 
-/** An extra path-prefix location that reverse-proxies to another target. */
+/** An extra literal-path location that reverse-proxies to another target. */
 export interface RouteProxyLocation {
-  /** nginx location prefix, e.g. "/api/". */
+  /** nginx location path, e.g. "/api/". */
   pathPrefix: string;
+  /** true -> `location = <path>`; unset/false -> `location ^~ <path>`. */
+  exact?: boolean;
   /** Proxy target, e.g. "http://10.0.0.5:3000". When `upstreamPath` is set this is
    *  the ORIGIN only (no path) — the path comes from the template instead. */
   targetUrl: string;

@@ -2181,7 +2181,10 @@ class MigrationOrchestratorImpl {
         [...entries].sort(
           (a, b) => (a.spec.targetPath ?? "/").length - (b.spec.targetPath ?? "/").length,
         )[0];
-      const extras = entries.filter((e) => e !== root && e.spec.targetPath);
+      // If an exact route is the only match for a domain it also has to seed the
+      // mandatory root upstream, but retain it as an explicit location so the
+      // exact-match bit survives persistence and every later re-render.
+      const extras = entries.filter((e) => e.spec.targetPath && (e !== root || e.spec.exact));
 
       // Root mints the domain row + exposes.
       try {
@@ -2216,7 +2219,11 @@ class MigrationOrchestratorImpl {
           hostname: domain,
           isCustomDomain: root.spec.domainType === "custom",
           rootServiceId: root.svcId,
-          locations: extras.map((e) => ({ pathPrefix: e.spec.targetPath!, serviceId: e.svcId })),
+          locations: extras.map((e) => ({
+            pathPrefix: e.spec.targetPath!,
+            serviceId: e.svcId,
+            ...(e.spec.exact ? { exact: true } : {}),
+          })),
         });
       }
     }
