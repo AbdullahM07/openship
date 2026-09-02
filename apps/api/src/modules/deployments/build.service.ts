@@ -387,7 +387,7 @@ function toRuntimeMode(value: string | null | undefined): "bare" | "docker" | un
 /** Build a config snapshot from the project - pure pass-through, no fallbacks.
  *  All values must be set by prepare / ensureProject before this is called. */
 export function buildConfigSnapshot(project: Project, branch?: string): DeploymentConfigSnapshot {
-  const runtimeImage = resolveRuntimeImage(project);
+  const deploymentClass = projectToClass(project);
 
   return {
     // Owning org — needed by every downstream that does an org-scoped
@@ -402,7 +402,7 @@ export function buildConfigSnapshot(project: Project, branch?: string): Deployme
     branch: branch || project.gitBranch || (project.localPath ? "main" : ""),
     framework: project.framework!,
     buildImage: project.buildImage!,
-    runtimeImage,
+    runtimeImage: resolveRuntimeImage(project),
     packageManager: project.packageManager!,
     installCommand: project.installCommand!,
     buildCommand: project.buildCommand!,
@@ -420,8 +420,8 @@ export function buildConfigSnapshot(project: Project, branch?: string): Deployme
     // it via snapshotToClass and never re-derives — a redeploy of THIS release
     // classifies as it did the day it was built, even after the project's flags
     // change.
-    ...projectToClass(project),
-    localPath: project.localPath || undefined,
+    ...deploymentClass,
+    localPath: deploymentClass.source === "upload" ? project.localPath || undefined : undefined,
     // Per packages/db/src/schema/project.ts:231 — `cloudWorkspaceId IS
     // NOT NULL` is THE canonical "is this a cloud project?" test.
     // Default the snapshot's deployTarget from that so preflight,
