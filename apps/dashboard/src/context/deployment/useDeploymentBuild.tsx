@@ -318,6 +318,7 @@ export function useDeploymentBuild(
         deploymentSuccess: true,
         deploymentFailed: false,
         deploymentCanceled: false,
+        cancellationPending: false,
         currentProgress: 100,
         currentStepIndex: 5,
         isDeploying: false,
@@ -437,6 +438,7 @@ export function useDeploymentBuild(
       setState((prev) => ({
         ...prev,
         deploymentCanceled: true,
+        cancellationPending: true,
         deploymentFailed: false,
         deploymentSuccess: false,
         isDeploying: false,
@@ -673,6 +675,7 @@ export function useDeploymentBuild(
         deploymentSuccess: false,
         deploymentFailed: false,
         deploymentCanceled: false,
+        cancellationPending: false,
         failureMessage: "",
         warningMessage: "",
         decisionPending: false,
@@ -1016,7 +1019,8 @@ export function useDeploymentBuild(
       !state.deploymentSuccess &&
       !state.deploymentFailed &&
       !state.deploymentCanceled;
-    if (!deploymentId || !active || buildStream.isConnected) return;
+    const waitingCancellation = state.deploymentCanceled && state.cancellationPending;
+    if (!deploymentId || (!active && !waitingCancellation) || buildStream.isConnected) return;
 
     let cancelled = false;
     const tick = async () => {
@@ -1047,6 +1051,7 @@ export function useDeploymentBuild(
           deploymentSuccess: !isActive && status === "ready",
           deploymentFailed: !isActive && status === "failed",
           deploymentCanceled: !isActive && status === "cancelled",
+          cancellationPending: !!data.cancellationPending,
           ...(mapped.length ? { serviceStatuses: mapped } : {}),
           ...(polledLogs.length > prev.buildLogs.length ? { buildLogs: polledLogs } : {}),
           ...(!isActive
@@ -1086,6 +1091,7 @@ export function useDeploymentBuild(
     state.deploymentSuccess,
     state.deploymentFailed,
     state.deploymentCanceled,
+    state.cancellationPending,
     buildStream.isConnected,
     buildStream.disconnect,
   ]);
@@ -1251,6 +1257,7 @@ export function useDeploymentBuild(
           deploymentSuccess: !isActive && status === "ready",
           deploymentFailed: !isActive && status === "failed",
           deploymentCanceled: !isActive && status === "cancelled",
+          cancellationPending: !!data.cancellationPending,
           isDeploying: isLive,
           screenshots: !isActive ? (data.screenshots || []) : [],
           failureMessage: !isActive ? (data.failureMessage || "") : "",
@@ -1354,11 +1361,18 @@ export function useDeploymentBuild(
 
     try {
       const response = await deployApi.cancel(state.deploymentId);
-      if (response.success) {
+      if (response.success || response.pending) {
         buildStream.disconnect();
         canStreamContainer.current = false;
         handleCanceled(response.message);
-        showToast(response.message || "Deployment cancelled", "success", "Cancelled");
+        if (response.pending) {
+          showToast(response.message, "info", "Cancellation pending");
+        } else {
+          // The API only returns this branch after build_session.finishedAt is
+          // durable, so no follow-up poll is required to prove quiescence.
+          setState((prev) => ({ ...prev, cancellationPending: false }));
+          showToast(response.message || "Deployment cancelled", "success", "Cancelled");
+        }
       } else {
         showToast(response.error || "Failed to stop deployment", "error", "Error");
       }
@@ -1408,6 +1422,7 @@ export function useDeploymentBuild(
           deploymentSuccess: false,
           deploymentFailed: false,
           deploymentCanceled: false,
+          cancellationPending: false,
           failureMessage: "",
           warningMessage: "",
           decisionPending: false,

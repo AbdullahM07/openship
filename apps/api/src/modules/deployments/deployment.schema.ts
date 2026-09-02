@@ -24,6 +24,12 @@ export const ListDeploymentsQuery = Type.Object({
 
 export const TriggerDeployBody = Type.Object({
   projectId: Type.String({ minLength: 1 }),
+  serverId: Type.Optional(
+    Type.String({
+      minLength: 1,
+      description: "Registered server to target for this deployment.",
+    }),
+  ),
   branch: Type.Optional(Type.String({ default: "main" })),
   commitSha: Type.Optional(Type.String()),
   environment: Type.Optional(Type.Union([Type.Literal("production"), Type.Literal("preview")])),
@@ -163,12 +169,6 @@ export const BuildAccessBody = Type.Object({
   refreshServiceIds: Type.Optional(
     Type.Array(Type.String(), {
       description: "Subset of serviceIds to recreate WITHOUT rebuilding (env-only refresh).",
-    }),
-  ),
-  handoverImages: Type.Optional(
-    Type.Record(Type.String(), Type.String(), {
-      description:
-        "ONE-TIME migration image handover: serviceName → an already-present image ref. Those services deploy from that image with no build/pull; used only on a migration's first deploy.",
     }),
   ),
   cloudResourceTier: Type.Optional(CloudResourceTierEnum()),

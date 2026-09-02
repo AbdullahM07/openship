@@ -146,6 +146,11 @@ export class BackupOrchestrator {
     // no project, so they always fall through to the destination's org.
     const policyProject = policy.projectId ? await repos.project.findById(policy.projectId) : null;
     const organizationId = policyProject?.organizationId ?? destination.organizationId ?? null;
+    // One call to enqueue is one logical backup attempt. Project-default
+    // policies fan out below, so every child needs a durable identity that
+    // cannot be confused with another trigger that happened nearby in time.
+    const batchId = `bkb_${crypto.randomUUID()}`;
+    const batchStartedAt = new Date();
 
     // Resolve which SOURCE(s) this trigger backs up:
     //  - explicit serviceId (a fan-out child call) → that one service
@@ -159,6 +164,8 @@ export class BackupOrchestrator {
         policy,
         destination,
         organizationId,
+        batchId,
+        batchStartedAt,
         { serviceId: input.serviceId },
         input.trigger,
       );
@@ -169,6 +176,8 @@ export class BackupOrchestrator {
         policy,
         destination,
         organizationId,
+        batchId,
+        batchStartedAt,
         { mailServerId: policy.mailServerId ?? null },
         input.trigger,
       );
@@ -179,6 +188,8 @@ export class BackupOrchestrator {
         policy,
         destination,
         organizationId,
+        batchId,
+        batchStartedAt,
         { serviceId: policy.serviceId },
         input.trigger,
       );
@@ -201,6 +212,8 @@ export class BackupOrchestrator {
             policy,
             destination,
             organizationId,
+            batchId,
+            batchStartedAt,
             { serviceId: svc.id },
             input.trigger,
           ),
@@ -228,12 +241,15 @@ export class BackupOrchestrator {
     policy: BackupPolicy,
     destination: BackupDestination,
     organizationId: string,
+    batchId: string,
+    batchStartedAt: Date,
     target: { serviceId: string } | { mailServerId: string | null },
     trigger: BackupTrigger,
   ): Promise<string> {
     const runId = `bkr_${crypto.randomUUID()}`;
     await repos.backupRun.create({
       id: runId,
+      batchId,
       policyId: policy.id,
       destinationId: destination.id,
       sourceKind: policy.sourceKind,
@@ -246,6 +262,7 @@ export class BackupOrchestrator {
       triggeredByUserId:
         trigger.source === "manual" || trigger.source === "webhook" ? trigger.userId : null,
       clientIp: trigger.clientIp ?? null,
+      startedAt: batchStartedAt,
     });
 
     try {

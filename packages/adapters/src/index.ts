@@ -387,6 +387,10 @@ export {
 } from "./system/modules";
 export { SYSTEM_COMPONENTS, getSystemComponentDefinition } from "./system/components";
 export {
+  REMOTE_SERVER_REQUIRED_COMPONENTS,
+  resolveSystemComponentInstallPlan,
+} from "./system/requirements";
+export {
   isRemoteConnectionError,
   isRetryableRemoteConnectionError,
   isSshAuthError,

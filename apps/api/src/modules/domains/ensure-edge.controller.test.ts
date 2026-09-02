@@ -4,6 +4,7 @@ const h = vi.hoisted(() => ({
   findProject: vi.fn(),
   findDeployment: vi.fn(),
   getServerInOrganization: vi.fn(),
+  findLocalServer: vi.fn(),
 }));
 
 vi.mock("@repo/db", async (importOriginal) => {
@@ -28,6 +29,10 @@ vi.mock("@repo/db", async (importOriginal) => {
   };
 });
 
+vi.mock("../../lib/startup/self-server", () => ({
+  findLocalServer: () => h.findLocalServer(),
+}));
+
 import { resolveProjectServer } from "./ensure-edge.controller";
 
 const project = {
@@ -48,6 +53,7 @@ describe("resolveProjectServer", () => {
       meta: { serverId: "server-live" },
     });
     h.getServerInOrganization.mockReset().mockResolvedValue({ id: "server-live" });
+    h.findLocalServer.mockReset().mockResolvedValue(null);
   });
 
   it("targets the active deployment snapshot before the mutable project binding", async () => {
@@ -83,16 +89,58 @@ describe("resolveProjectServer", () => {
     });
   });
 
-  it("does not install an edge on a future server when the active release is explicitly local", async () => {
+  it("uses the local server instead of a future server when the active release is explicitly local", async () => {
     h.findDeployment.mockResolvedValue({
       id: "deployment-1",
       meta: { deployTarget: "local" },
     });
+    h.findLocalServer.mockResolvedValue({ id: "server-local", isLocal: true });
+    h.getServerInOrganization.mockResolvedValue({ id: "server-local", isLocal: true });
+
+    await expect(resolveProjectServer("project-1", "org-1")).resolves.toMatchObject({
+      serverId: "server-local",
+      isLocal: true,
+    });
+    expect(h.getServerInOrganization).toHaveBeenCalledWith("server-local", "org-1");
+    expect(h.getServerInOrganization).not.toHaveBeenCalledWith("server-next", "org-1");
+  });
+
+  it("falls back to local server when serverId is null on local projects", async () => {
+    h.findProject.mockResolvedValue({
+      ...project,
+      serverId: null,
+    });
+    h.findDeployment.mockResolvedValue({
+      id: "deployment-1",
+      meta: {},
+    });
+    h.findLocalServer.mockResolvedValue({ id: "server-local", isLocal: true });
+    h.getServerInOrganization.mockResolvedValue({ id: "server-local", isLocal: true });
+
+    const result = await resolveProjectServer("project-1", "org-1");
+
+    expect(result).toMatchObject({
+      serverId: "server-local",
+      isLocal: true,
+    });
+  });
+
+  it("does not redirect a server deployment with a missing server id to the local host", async () => {
+    h.findProject.mockResolvedValue({
+      ...project,
+      serverId: null,
+    });
+    h.findDeployment.mockResolvedValue({
+      id: "deployment-1",
+      meta: { deployTarget: "server" },
+    });
+    h.findLocalServer.mockResolvedValue({ id: "server-local", isLocal: true });
 
     await expect(resolveProjectServer("project-1", "org-1")).resolves.toEqual({
       error: "Project is not deployed to a server",
       status: 400,
     });
+    expect(h.findLocalServer).not.toHaveBeenCalled();
     expect(h.getServerInOrganization).not.toHaveBeenCalled();
   });
 });

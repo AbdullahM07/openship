@@ -103,6 +103,23 @@ export const composeSpecsEqual = (a: ComposeServiceSpec, b: ComposeServiceSpec) 
   canonicalSpec(a) === canonicalSpec(b);
 
 /**
+ * Environment keys a repo compose edit would DELETE from the imported
+ * baseline. Values may be credentials or the only copy of legacy configuration,
+ * so deletion is the one compose change that must never auto-apply during a
+ * redeploy. The drift-approval path remains the explicit deletion operation.
+ */
+export function removedComposeEnvironmentKeys(
+  baseInput: ComposeServiceSpec,
+  nextInput: ComposeServiceSpec,
+): string[] {
+  const base = toComposeSpec(baseInput).environment ?? {};
+  const next = toComposeSpec(nextInput).environment ?? {};
+  return Object.keys(base)
+    .filter((key) => !Object.hasOwn(next, key))
+    .sort();
+}
+
+/**
  * A current parser adds provenance metadata that older imported baselines could
  * not contain. That is a representation upgrade, not a repo edit. It used to
  * raise a review banner where the masked environment showed the same keys on
@@ -771,6 +788,7 @@ export function createServiceRepo(db: Database) {
      * values ("ours"):
      *   • repo unchanged             → keep ours (clear any stale drift)
      *   • repo changed, not edited   → auto-apply theirs, advance baseline
+     *   • repo deletes env keys       → keep ours, require explicit approval
      *   • repo changed, edited       → keep ours, set `driftSpec` (needs approval)
      *   • new upstream service       → create (baseline = theirs)
      *   • removed upstream, unedited → remove; edited/unknown baseline → keep
@@ -882,6 +900,20 @@ export function createServiceRepo(db: Database) {
           } else if (ex.driftSpec) {
             await this.update(ex.id, { driftSpec: null });
           }
+          continue;
+        }
+
+        // Environment deletion is deliberately destructive even when the row is
+        // otherwise untouched. Compose env used to be the only storage layer for
+        // many legacy installs (including credentials); silently applying a repo
+        // deletion here can erase the last durable copy BEFORE the deployment
+        // reaches runtime preflight. Keep the current row and route the proposed
+        // deletion through the existing explicit drift-approval UI instead.
+        if (removedComposeEnvironmentKeys(base, theirs).length > 0) {
+          if (!ex.driftSpec || !composeSpecsEqual(ex.driftSpec, theirs)) {
+            await this.update(ex.id, { driftSpec: theirs });
+          }
+          driftedNames.push(p.name);
           continue;
         }
 

@@ -120,6 +120,20 @@ describe("service routing patch", () => {
       ?.removes ?? []).map((r) => r.hostname);
 
   it("persists a scalar custom-domain patch and keeps the sibling route", async () => {
+    const updated = {
+      ...multiRouteService(),
+      domainType: "custom",
+      domain: null,
+      customDomain: "api.example.com",
+      publicEndpoints: [
+        { port: 3210, domainType: "custom", customDomain: "api.example.com" },
+        { port: 3211, domainType: "free", domain: "acme-backend-http" },
+      ],
+    };
+    serviceRepo.findById
+      .mockResolvedValueOnce(multiRouteService())
+      .mockResolvedValueOnce(updated);
+
     await updateService(ctx, project.id, "svc_1", {
       domainType: "custom",
       customDomain: "api.example.com",
@@ -135,6 +149,15 @@ describe("service routing patch", () => {
       { port: 3210, domainType: "custom", customDomain: "api.example.com" },
       { port: 3211, domainType: "free", domain: "acme-backend-http" },
     ]);
+    // Saving a service route materializes the same persisted Domain row used by
+    // project domains. DNS preview/apply therefore stays in domain.service;
+    // updateService neither duplicates nor silently invokes provider writes.
+    expect(domainService.ensurePendingServiceDomain).toHaveBeenCalledWith({
+      projectId: project.id,
+      serviceId: "svc_1",
+      hostname: "api.example.com",
+      targetPort: 3210,
+    });
   });
 
   it("does not gate a custom-domain save on the free routes the row already had", async () => {

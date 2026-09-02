@@ -217,6 +217,9 @@ export const backupRun = pgTable(
   "backup_run",
   {
     id: text("id").primaryKey(),
+    /** One enqueue operation can fan out into several service runs. This
+     *  identifier is shared by those children; legacy rows are NULL. */
+    batchId: text("batch_id"),
 
     // Policy + destination — SET NULL on delete so the run row + its
     // remote artifacts survive their schedule's deletion.
@@ -288,6 +291,9 @@ export const backupRun = pgTable(
     index("idx_backup_run_org_started").on(table.organizationId, table.startedAt),
     index("idx_backup_run_destination_started").on(table.destinationId, table.startedAt),
     index("idx_backup_run_project_started").on(table.projectId, table.startedAt),
+    index("idx_backup_run_policy_batch")
+      .on(table.policyId, table.batchId)
+      .where(sql`${table.batchId} IS NOT NULL AND ${table.deletedAt} IS NULL`),
     index("idx_backup_run_execution_in_flight")
       .on(table.projectId)
       .where(sql`${table.executionStartedAt} IS NOT NULL AND ${table.executionFinishedAt} IS NULL`),

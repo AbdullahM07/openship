@@ -435,6 +435,12 @@ export function mapComposeService(
   ) {
     advanced.buildArgTemplateKeys = [];
   }
+  // Same normalized-output rule for runtime env: Compose has already expanded
+  // `${VAR}` and collapsed `$$` to a literal `$`. The explicit empty marker is
+  // load-bearing — without it the API's raw/manual sync fallback would treat a
+  // normalized `$${VAR}` literal as a fresh `${VAR}` expression and expand it a
+  // second time.
+  if (Object.hasOwn(d, "environment")) advanced.environmentTemplateKeys = [];
   if (Object.keys(advanced).length > 0) svc.advanced = advanced;
 
   return svc;
