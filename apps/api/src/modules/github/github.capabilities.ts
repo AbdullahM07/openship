@@ -37,10 +37,10 @@ import { repos } from "@repo/db";
  * overlap without being the same set, so they stay separate types.
  */
 export type GitHubMethodKind =
-  | "device"      // browser device sign-in (instance-wide git identity)
-  | "token"       // pasted PAT (same slot as `device`)
-  | "app"         // local operator-owned or Openship Cloud App installation
-  | "ssh-key"     // per-server deploy key — clone transport, not a token
+  | "device" // browser device sign-in (instance-wide git identity)
+  | "token" // pasted PAT (same slot as `device`)
+  | "app" // local operator-owned or Openship Cloud App installation
+  | "ssh-key" // per-server deploy key — clone transport, not a token
   | "forwarding"; // desktop SSH relay of the operator's identity
 
 export interface GitHubMethod {
@@ -95,6 +95,9 @@ export async function resolveGitHubCapabilities(
   const settings = await repos.instanceSettings.get().catch(() => null);
   const identityConfigured = Boolean(settings?.ghDeviceTokenEncrypted);
   const identityMethod = settings?.ghDeviceTokenMethod ?? null;
+  const customAppConfigured =
+    platform === "selfhosted" &&
+    (await repos.gitSource.listActiveByOrganization(ctx.organizationId).catch(() => [])).length > 0;
 
   // `gh-cli` in the chain is what carries the instance identity, so its presence
   // there is the real test of whether these two rows can work at all — not a
@@ -129,11 +132,14 @@ export async function resolveGitHubCapabilities(
       available: chainHas(platform, "app-installation"),
       configured:
         platform === "saas" ||
+        customAppConfigured ||
         localGitHubAppConfiguration.configured ||
         opts.cloudConnected,
       // A fully configured operator-owned App is native on self-hosted too.
       requiresCloud:
-        platform === "selfhosted" && !localGitHubAppConfiguration.configured,
+        platform === "selfhosted" &&
+        !customAppConfigured &&
+        !localGitHubAppConfiguration.configured,
     },
     {
       kind: "ssh-key",

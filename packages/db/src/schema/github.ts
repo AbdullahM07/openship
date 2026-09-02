@@ -1,6 +1,16 @@
-import { pgTable, text, timestamp, boolean, integer, uniqueIndex, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import {
+  pgTable,
+  text,
+  timestamp,
+  boolean,
+  integer,
+  uniqueIndex,
+  index,
+} from "drizzle-orm/pg-core";
 import { user } from "./auth";
 import { organization } from "./organization";
+import { gitSource } from "./git-source";
 
 // ─── GitHub App installation tracking ────────────────────────────────────────
 
@@ -20,6 +30,8 @@ export const gitInstallation = pgTable(
     organizationId: text("organization_id")
       .notNull()
       .references(() => organization.id, { onDelete: "cascade" }),
+    /** Null only for the legacy env/Cloud/OAuth installation paths. */
+    sourceId: text("source_id").references(() => gitSource.id, { onDelete: "cascade" }),
     provider: text("provider").notNull().default("github"),
     installationId: integer("installation_id").notNull(),
     owner: text("owner").notNull(),
@@ -37,18 +49,18 @@ export const gitInstallation = pgTable(
     // Including organizationId is load-bearing: one user may connect the
     // same GitHub organization to multiple Openship workspaces, while one
     // workspace must never inherit another workspace's installation row.
-    uniqueIndex("uq_git_installation_provider_owner_org").on(
-      t.provider,
-      t.owner,
-      t.organizationId,
-    ),
+    uniqueIndex("uq_git_installation_provider_owner_org_legacy")
+      .on(t.provider, t.owner, t.organizationId)
+      .where(sql`${t.sourceId} IS NULL`),
+    // The same GitHub owner may be connected through several independently
+    // registered Apps. Within one source it still has exactly one installation.
+    uniqueIndex("uq_git_installation_provider_owner_org_source")
+      .on(t.provider, t.owner, t.organizationId, t.sourceId)
+      .where(sql`${t.sourceId} IS NOT NULL`),
     // Member-onboarding + org-scoped App resolution: every authed
     // request that mints an installation token via the org path hits
     // this. Without it, the table is full-scanned per lookup.
-    index("idx_git_installation_org").on(
-      t.organizationId,
-      t.provider,
-      t.owner,
-    ),
+    index("idx_git_installation_org").on(t.organizationId, t.provider, t.owner),
+    index("idx_git_installation_source").on(t.sourceId, t.installationId),
   ],
 );

@@ -7,6 +7,8 @@ const h = vi.hoisted(() => ({
   findByOrgAndOwner: vi.fn(),
   findByOwner: vi.fn(),
   replaceForUserInOrganization: vi.fn(),
+  sourceFindDefault: vi.fn(),
+  sourceListActive: vi.fn(),
   cacheGet: vi.fn(),
   cacheSet: vi.fn(),
 }));
@@ -30,6 +32,10 @@ vi.mock("@repo/db", () => ({
       findByOrgAndOwner: h.findByOrgAndOwner,
       findByOwner: h.findByOwner,
       replaceForUserInOrganization: h.replaceForUserInOrganization,
+    },
+    gitSource: {
+      findDefault: h.sourceFindDefault,
+      listActiveByOrganization: h.sourceListActive,
     },
   },
   db: {},
@@ -60,7 +66,7 @@ import {
   resolveInstallUrl,
 } from "./github.auth";
 
-const ctx = { userId: "user_1", organizationId: "org_1" } as any;
+const ctx = { userId: "user_1", organizationId: "org_1", role: "owner" } as any;
 
 describe("self-hosted local GitHub App auth", () => {
   beforeEach(() => {
@@ -71,6 +77,8 @@ describe("self-hosted local GitHub App auth", () => {
     h.stateCreate.mockResolvedValue(undefined);
     h.listByOrganization.mockResolvedValue([]);
     h.findByOrgAndOwner.mockResolvedValue(null);
+    h.sourceFindDefault.mockResolvedValue(undefined);
+    h.sourceListActive.mockResolvedValue([]);
   });
 
   it("selects the complete local App in auto mode without a cloud probe", async () => {
@@ -85,20 +93,24 @@ describe("self-hosted local GitHub App auth", () => {
       /^https:\/\/github\.com\/apps\/self-hosted-openship\/installations\/new\?state=/,
     );
     expect(result.state).toHaveLength(32);
-    expect(h.stateCreate).toHaveBeenCalledWith(expect.objectContaining({
-      state: result.state,
-      userId: "user_1",
-      organizationId: "org_1",
-    }));
+    expect(h.stateCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        state: result.state,
+        userId: "user_1",
+        organizationId: "org_1",
+      }),
+    );
   });
 
   it("lists only installations claimed by the active workspace", async () => {
-    h.listByOrganization.mockResolvedValue([{
-      installationId: 42,
-      owner: "acme",
-      ownerType: "Organization",
-      providerOwnerId: "700",
-    }]);
+    h.listByOrganization.mockResolvedValue([
+      {
+        installationId: 42,
+        owner: "acme",
+        ownerType: "Organization",
+        providerOwnerId: "700",
+      },
+    ]);
 
     const rows = await getUserInstallations(ctx);
 

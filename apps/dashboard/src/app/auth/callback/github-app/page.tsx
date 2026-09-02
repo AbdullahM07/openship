@@ -11,35 +11,60 @@ export default function GitHubAppSetupCallback() {
   useEffect(() => {
     async function claim() {
       const query = new URLSearchParams(window.location.search);
+      const flow = query.get("flow");
+      const code = query.get("code");
       const installationId = query.get("installation_id");
       const state = query.get("state");
       const setupAction = query.get("setup_action");
 
-      if (!installationId || !state) {
-        setMessage("GitHub did not return the required installation details. Start again from Settings.");
+      if (!state || (flow === "manifest" ? !code : !installationId)) {
+        setMessage(
+          "GitHub did not return the required installation details. Start again from Settings.",
+        );
         return;
       }
 
       try {
         const base = getApiOrigin(window.location.origin);
-        const response = await fetch(`${base}/api/github/installations/claim`, {
+        const endpoint =
+          flow === "manifest"
+            ? `${base}/api/github/sources/manifest/convert`
+            : `${base}/api/github/installations/claim`;
+        const response = await fetch(endpoint, {
           method: "POST",
           credentials: "include",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ installationId, state, setupAction }),
+          body: JSON.stringify(
+            flow === "manifest" ? { code, state } : { installationId, state, setupAction },
+          ),
         });
         const data = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(data?.message || "Could not verify the installation.");
+
+        if (flow === "manifest") {
+          if (!data?.installUrl)
+            throw new Error("GitHub App was created, but its install URL is missing.");
+          setMessage("GitHub App created. Opening repository access…");
+          window.location.replace(data.installUrl);
+          return;
+        }
 
         if (data?.pendingApproval) {
           setMessage("Installation requested. A GitHub organization owner must approve it.");
           return;
         }
-        setMessage(`${data?.installation?.login || "GitHub"} is connected. You can close this window.`);
+        setMessage(
+          `${data?.installation?.login || "GitHub"} is connected. You can close this window.`,
+        );
         window.setTimeout(() => window.close(), 1200);
       } catch (error) {
-        const detail = error instanceof Error ? error.message : "Could not verify the installation.";
-        try { localStorage.setItem(GITHUB_CONNECT_ERROR_KEY, detail); } catch { /* unavailable */ }
+        const detail =
+          error instanceof Error ? error.message : "Could not verify the installation.";
+        try {
+          localStorage.setItem(GITHUB_CONNECT_ERROR_KEY, detail);
+        } catch {
+          /* unavailable */
+        }
         setMessage(detail);
       }
     }

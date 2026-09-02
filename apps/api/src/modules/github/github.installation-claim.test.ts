@@ -51,6 +51,8 @@ describe("claimLocalGitHubInstallation", () => {
       state: "nonce",
       userId: "user_1",
       organizationId: "org_1",
+      sourceId: null,
+      flow: "install",
     });
     h.ghFetch.mockResolvedValue({ total_count: 1, installations: [installation] });
     h.appFetch.mockResolvedValue(installation);
@@ -71,12 +73,15 @@ describe("claimLocalGitHubInstallation", () => {
       installation: { id: 42, login: "Acme", type: "Organization" },
     });
     expect(h.consume).not.toHaveBeenCalled();
-    expect(h.claim).toHaveBeenCalledWith("nonce", expect.objectContaining({
-      userId: "user_1",
-      organizationId: "org_1",
-      installationId: 42,
-      owner: "acme",
-    }));
+    expect(h.claim).toHaveBeenCalledWith(
+      "nonce",
+      expect.objectContaining({
+        userId: "user_1",
+        organizationId: "org_1",
+        installationId: 42,
+        owner: "acme",
+      }),
+    );
   });
 
   it("rejects a state opened from another active workspace before calling GitHub", async () => {
@@ -84,6 +89,8 @@ describe("claimLocalGitHubInstallation", () => {
       state: "nonce",
       userId: "user_1",
       organizationId: "org_other",
+      sourceId: null,
+      flow: "install",
     });
 
     const result = await claimLocalGitHubInstallation(ctx, {

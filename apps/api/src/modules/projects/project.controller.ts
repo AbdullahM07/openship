@@ -1504,9 +1504,8 @@ export async function getGitInfo(c: Context) {
   const commits = branch
     ? await getRecentCommits(ctx, info.gitOwner, info.gitRepo, branch, 10)
     : [];
-  const installUrl = strategy === "app" && !installationInstalled
-    ? (await resolveInstallUrl(ctx)).url
-    : undefined;
+  const installUrl =
+    strategy === "app" && !installationInstalled ? (await resolveInstallUrl(ctx)).url : undefined;
 
   return c.json({
     success: true,
@@ -1715,7 +1714,7 @@ export async function setAutoDeploy(c: Context) {
       return c.json({ success: false, error: "No repository linked" }, 400);
     }
 
-    const strategy = await resolveWebhookStrategy(project);
+    const strategy = await resolveWebhookStrategy(project, organizationId);
 
     // In "none" mode, auto-deploy can't work - suggest options
     if (strategy === "none" && enabled) {

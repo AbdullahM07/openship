@@ -9,6 +9,9 @@
 
 import { ghFetch } from "./github.http";
 import { appFetch, getUserToken } from "./github.auth";
+import type { GitSource } from "@repo/db";
+import { githubAppFetch } from "./github.app-client";
+import { sourceClientCredentials } from "./github-source.service";
 import type { GitHubInstallation } from "./github.types";
 
 export type GitHubInstallationVerificationResult =
@@ -38,10 +41,7 @@ async function findUserInstallation(
     const batch = data.installations ?? [];
     const match = batch.find((installation) => installation.id === installationId);
     if (match) return match;
-    if (
-      batch.length < perPage ||
-      page * perPage >= data.total_count
-    ) {
+    if (batch.length < perPage || page * perPage >= data.total_count) {
       return null;
     }
   }
@@ -89,4 +89,28 @@ export async function verifyGitHubInstallationForUser(
   }
 
   return { kind: "ok", installation: appInstallation };
+}
+
+/**
+ * Verify an installation for a workspace-owned custom App. The initiating
+ * Openship user is already an authenticated workspace owner and the one-time
+ * state binds the browser round-trip; the source's App JWT independently proves
+ * that the untrusted installation_id belongs to this exact App.
+ */
+export async function verifyGitHubInstallationForSource(
+  source: GitSource,
+  installationId: number,
+): Promise<GitHubInstallationVerificationResult> {
+  const installation = await githubAppFetch<GitHubInstallation>(
+    sourceClientCredentials(source),
+    `/app/installations/${installationId}`,
+  );
+  if (installation.id !== installationId || installation.app_id !== source.appId) {
+    return {
+      kind: "forbidden",
+      reason: "app-mismatch",
+      message: "GitHub installation verification failed.",
+    };
+  }
+  return { kind: "ok", installation };
 }
