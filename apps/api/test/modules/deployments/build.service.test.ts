@@ -559,6 +559,95 @@ describe("triggerDeployment", () => {
     );
   });
 
+  it("persists exact scope and force-pull intent for an incoming multi-service hook", async () => {
+    const targets = ["svc-api", "svc-worker"];
+    repos.service.listByProject.mockResolvedValue([
+      { id: "svc-api", name: "api", enabled: true, advanced: null },
+      { id: "svc-worker", name: "worker", enabled: true, advanced: null },
+      { id: "svc-db", name: "db", enabled: true, advanced: null },
+    ]);
+    resolveSmartRoute.mockResolvedValue({
+      forceAll: false,
+      serviceIds: targets,
+      changedPaths: undefined,
+    });
+
+    await triggerDeployment(ctx, {
+      projectId: "project-1",
+      serviceIds: targets,
+      strictServiceScope: true,
+      forcePullImages: true,
+      trigger: "webhook",
+    });
+
+    expect(repos.deployment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        trigger: "webhook",
+        meta: expect.objectContaining({
+          targetServiceIds: targets,
+          strictServiceScope: true,
+          forcePullImages: true,
+        }),
+      }),
+    );
+  });
+
+  it("persists force-pull intent for a whole-project incoming hook", async () => {
+    await triggerDeployment(ctx, {
+      projectId: "project-1",
+      forcePullImages: true,
+      trigger: "webhook",
+    });
+
+    const meta = repos.deployment.create.mock.calls.at(-1)?.[0]?.meta;
+    expect(meta).toMatchObject({ forcePullImages: true });
+    expect(meta.targetServiceIds).toBeUndefined();
+    expect(meta.strictServiceScope).toBeUndefined();
+  });
+
+  it("rejects a stale exact target after compose reconciliation and queues nothing", async () => {
+    repos.service.listByProject.mockResolvedValue([
+      { id: "svc-api", name: "api", enabled: true, advanced: null },
+    ]);
+
+    await expect(
+      triggerDeployment(ctx, {
+        projectId: "project-1",
+        serviceIds: ["svc-api", "svc-deleted"],
+        strictServiceScope: true,
+        forcePullImages: true,
+        trigger: "webhook",
+      }),
+    ).rejects.toThrow(/svc-deleted/);
+
+    expect(repos.deployment.create).not.toHaveBeenCalled();
+    expect(kickoffBuild).not.toHaveBeenCalled();
+  });
+
+  it("rejects replacing a namespace provider without its dependent", async () => {
+    repos.service.listByProject.mockResolvedValue([
+      { id: "svc-vpn", name: "vpn", enabled: true, advanced: null },
+      {
+        id: "svc-sidecar",
+        name: "sidecar",
+        enabled: true,
+        advanced: { networkMode: "service:vpn" },
+      },
+    ]);
+
+    await expect(
+      triggerDeployment(ctx, {
+        projectId: "project-1",
+        serviceIds: ["svc-vpn"],
+        strictServiceScope: true,
+        forcePullImages: true,
+        trigger: "webhook",
+      }),
+    ).rejects.toThrow(/svc-sidecar/);
+
+    expect(repos.deployment.create).not.toHaveBeenCalled();
+  });
+
   it("uses an explicit CLI server target in preflight and the frozen deployment snapshot", async () => {
     await triggerDeployment(ctx, {
       projectId: "project-1",
@@ -1369,6 +1458,56 @@ describe("requestBuildAccess — folder-upload compose services", () => {
     expect(repos.service.syncFromCompose).toHaveBeenCalledWith("project-1", requested, {
       removeMissing: false,
     });
+  });
+
+  it("accepts migration handover pins only through the internal options", async () => {
+    const uploadSessionId = seedSession();
+
+    await requestBuildAccess(
+      ctx,
+      { projectId: "project-1", uploadSessionId },
+      {
+        handoverImages: { api: "ghcr.io/acme/api:migrated" },
+        handoverAppImage: "ghcr.io/acme/api:migrated",
+      },
+    );
+
+    expect(repos.deployment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        meta: expect.objectContaining({
+          handoverImages: { api: "ghcr.io/acme/api:migrated" },
+          handoverAppImage: "ghcr.io/acme/api:migrated",
+        }),
+      }),
+    );
+  });
+
+  it("ignores handover pins injected into the public request body", async () => {
+    const uploadSessionId = seedSession();
+
+    await requestBuildAccess(ctx, {
+      projectId: "project-1",
+      uploadSessionId,
+      handoverImages: { api: "attacker/image:latest" },
+      handoverAppImage: "attacker/app:latest",
+    } as never);
+
+    const meta = repos.deployment.create.mock.calls.at(-1)?.[0]?.meta;
+    expect(meta.handoverImages).toBeUndefined();
+    expect(meta.handoverAppImage).toBeUndefined();
+  });
+
+  it.each([
+    { missing: "ghcr.io/acme/api:migrated" },
+    { api: "" },
+    { api: "/opt/openship/static/releases/forged" },
+  ])("rejects invalid internal migration handover %o", async (handoverImages) => {
+    const uploadSessionId = seedSession();
+
+    await expect(
+      requestBuildAccess(ctx, { projectId: "project-1", uploadSessionId }, { handoverImages }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(repos.deployment.create).not.toHaveBeenCalled();
   });
 
   // #336: the wizard sees env masked, so a deploy request can echo "••••••••".

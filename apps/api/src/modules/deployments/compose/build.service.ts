@@ -342,8 +342,18 @@ function resolveSubAppOverrides(opts: SubAppOverrideInputs): {
 
 export interface ComposeBuildImagesResult {
   imageRefs: Map<string, string>;
+  /** Exact service/image pairs that are already available on the deploy target
+   * because they were built now or explicitly pinned by an internal workflow. */
+  preparedLocalImages: Map<string, string>;
   /** Image/workspace refs created during this build phase, excluding image-only services. */
   builtImageRefs: Map<string, string>;
+  /** Service id -> trusted host directory produced (or internally pinned) for
+   * a self-hosted static sub-app. Kept separate from imageRefs so an arbitrary
+   * absolute service.image can never be interpreted as a host artifact. */
+  staticArtifactRefs: Map<string, string>;
+  /** Effective static classification after applying project-snapshot fallback.
+   * Needed when a refresh reuses the prior deployment's host artifact. */
+  staticServiceIds: Set<string>;
   buildFailures: Map<string, string>;
   /** Count of image-only (external) services included in imageRefs */
   externalCount: number;
@@ -385,7 +395,14 @@ export async function buildComposeImages(opts: {
   const services = await repos.service.listByProject(opts.project.id);
   const enabled = services.filter((service) => service.enabled);
   const imageRefs = new Map<string, string>();
+  const preparedLocalImages = new Map<string, string>();
   const builtImageRefs = new Map<string, string>();
+  const staticArtifactRefs = new Map<string, string>();
+  const staticServiceIds = new Set(
+    enabled
+      .filter((service) => isStaticService(resolveSubAppRecipe(service, opts.snapshot)))
+      .map((service) => service.id),
+  );
   const buildFailures = new Map<string, string>();
   const cancelledServices = new Set<string>();
   const startedAt = Date.now();
@@ -478,6 +495,10 @@ export async function buildComposeImages(opts: {
       const pinned = pinnedImageForService(opts.snapshot, service.name);
       if (!pinned) continue;
       imageRefs.set(service.id, pinned);
+      preparedLocalImages.set(service.id, pinned);
+      if (pinned.startsWith("/") && staticServiceIds.has(service.id)) {
+        staticArtifactRefs.set(service.id, pinned);
+      }
       sessionManager.broadcastServiceStatus(opts.dep.id, {
         serviceName: service.name,
         serviceId: service.id,
@@ -718,7 +739,11 @@ export async function buildComposeImages(opts: {
       }
 
       imageRefs.set(service.id, buildResult.imageRef);
+      preparedLocalImages.set(service.id, buildResult.imageRef);
       builtImageRefs.set(service.id, buildResult.imageRef);
+      if (buildResult.imageRef.startsWith("/") && staticServiceIds.has(service.id)) {
+        staticArtifactRefs.set(service.id, buildResult.imageRef);
+      }
       opts.logger.log(
         `Compose service "${service.name}" image ready: ${buildResult.imageRef}\n`,
         "info",
@@ -824,7 +849,10 @@ export async function buildComposeImages(opts: {
 
   return {
     imageRefs,
+    preparedLocalImages,
     builtImageRefs,
+    staticArtifactRefs,
+    staticServiceIds,
     buildFailures,
     externalCount: external.length,
     cancelled: cancelledServices.size > 0,

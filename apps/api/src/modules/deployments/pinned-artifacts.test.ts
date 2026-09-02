@@ -35,10 +35,14 @@ describe("pinned artifact lookup", () => {
     expect(hasPinnedArtifacts({ refreshAppDeploymentId: "dep_live" })).toBe(true);
   });
 
-  it("strips both fields and leaves the rest of the snapshot alone", () => {
+  it("strips pinned artifacts and one-deployment execution intent", () => {
     const stripped = withoutPinnedArtifacts({
       ...snapshot,
       refreshAppDeploymentId: "dep_live",
+      targetServiceIds: ["svc-api"],
+      strictServiceScope: true,
+      refreshServiceIds: ["svc-api"],
+      forcePullImages: true,
       hasBuild: true,
     });
     expect(stripped).toEqual({ hasBuild: true });
@@ -128,10 +132,7 @@ describe("snapshotNeedsGitSource — the clone / token / GitHub-access gate", ()
   it("compose: disabled services don't force a clone", () => {
     expect(
       snapshotNeedsGitSource({
-        composeServices: [
-          { name: "web", build: "./web", enabled: false },
-          { name: "db" },
-        ],
+        composeServices: [{ name: "web", build: "./web", enabled: false }, { name: "db" }],
       }),
     ).toBe(false);
   });

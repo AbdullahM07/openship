@@ -171,12 +171,6 @@ export const BuildAccessBody = Type.Object({
       description: "Subset of serviceIds to recreate WITHOUT rebuilding (env-only refresh).",
     }),
   ),
-  handoverImages: Type.Optional(
-    Type.Record(Type.String(), Type.String(), {
-      description:
-        "ONE-TIME migration image handover: serviceName → an already-present image ref. Those services deploy from that image with no build/pull; used only on a migration's first deploy.",
-    }),
-  ),
   cloudResourceTier: Type.Optional(CloudResourceTierEnum()),
   cloudResourceCustom: Type.Optional(
     Type.Object(

@@ -60,6 +60,15 @@ update-experience work accumulated since 0.6.9.
   orders Docker ahead of the container-based Edge across streamed setup,
   `SystemManager`, and direct component installation guards (#767).
 
+### Builds
+
+- **BuildKit builds work from Bun-based self-hosted installations** — Docker's
+  reverse h2c session now bypasses Bun's incompatible `node:http` upgrade path
+  while retaining dockerode's BuildKit session and registry-auth service. Local
+  Compose builds using syntax directives, cache mounts, heredocs, and other
+  BuildKit-only Dockerfile features no longer fail on `/session` before the
+  Dockerfile starts (#745).
+
 ### Updates
 
 - **Update prompts show the product changelog** — dashboard and desktop update

@@ -16,6 +16,11 @@
 
 import { Type, type Static } from "@sinclair/typebox";
 import { EnvironmentScopeSchema } from "../../lib/environment-scope";
+import {
+  MAX_GENERATED_CONFIG_FILES,
+  MAX_GENERATED_CONFIG_FILE_BYTES,
+  MAX_GENERATED_CONFIG_PATH_BYTES,
+} from "../../lib/generated-config-files";
 import { MonorepoSubAppFieldsSchema } from "../projects/project.schema";
 
 export const ServiceIdParam = Type.Object({
@@ -91,6 +96,33 @@ const AdvancedSchema = Type.Object(
             onFailure: Type.Optional(Type.Union([Type.Literal("warn"), Type.Literal("fail")])),
           },
           { additionalProperties: false },
+        ),
+        Type.Null(),
+      ]),
+    ),
+    /** Generated config files written on the deploy host and bind-mounted
+     * read-only into the container. App installs already persist this shape in
+     * the same JSONB field; accepting it here keeps create/update capable of
+     * restoring or editing those files. `null` removes all generated files. */
+    files: Type.Optional(
+      Type.Union([
+        Type.Array(
+          Type.Object(
+            {
+              // Docker bind targets must be absolute. Colons delimit the
+              // source:target:mode tuple; control characters are never useful
+              // in a config path. Normalization/traversal and duplicate checks
+              // also run in the service layer and again at deploy time.
+              path: Type.String({
+                minLength: 2,
+                maxLength: MAX_GENERATED_CONFIG_PATH_BYTES,
+                pattern: "^/[^:\\u0000-\\u001F\\u007F]+$",
+              }),
+              content: Type.String({ maxLength: MAX_GENERATED_CONFIG_FILE_BYTES }),
+            },
+            { additionalProperties: false },
+          ),
+          { maxItems: MAX_GENERATED_CONFIG_FILES },
         ),
         Type.Null(),
       ]),

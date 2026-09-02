@@ -127,6 +127,7 @@ async function run(
   onContext?: (root: string, item: Captured) => void | Promise<void>,
   snapshotOverrides?: Partial<typeof SNAPSHOT>,
   buildEnvVars: Record<string, string> = {},
+  imageRefFor?: (item: Captured) => string,
 ) {
   listByProjectMock.mockResolvedValue(services);
   const captured: Captured[] = [];
@@ -145,7 +146,7 @@ async function run(
         (item.onResult as (r: unknown) => void)({
           sessionId: "s",
           status: "running",
-          imageRef: `img/${entry.serviceName}`,
+          imageRef: imageRefFor?.(entry) ?? `img/${entry.serviceName}`,
         });
       }
     }),
@@ -170,6 +171,46 @@ async function run(
   });
   return { result, captured };
 }
+
+describe("buildComposeImages — static artifact provenance", () => {
+  it("records an inherited static sub-app's exact host artifact", async () => {
+    const artifact = "/opt/openship/static/.builds/sess-svc-static";
+    const { result } = await run(
+      [
+        repoService({
+          id: "svc-static",
+          name: "web",
+          kind: "monorepo",
+          build: null,
+          dockerfile: null,
+          framework: null,
+          buildCommand: null,
+          startCommand: null,
+        }),
+      ],
+      undefined,
+      { framework: "vite", buildCommand: "npm run build", startCommand: "" },
+      {},
+      () => artifact,
+    );
+
+    expect(result.imageRefs.get("svc-static")).toBe(artifact);
+    expect(result.staticArtifactRefs.get("svc-static")).toBe(artifact);
+    expect(result.staticServiceIds.has("svc-static")).toBe(true);
+  });
+
+  it("does not trust an absolute configured image as a static artifact", async () => {
+    const service = {
+      ...repoService({ id: "svc-image", name: "image", build: null, dockerfile: null }),
+      image: "/etc",
+    };
+    const { result } = await run([service]);
+
+    expect(result.imageRefs.get("svc-image")).toBe("/etc");
+    expect(result.staticArtifactRefs.has("svc-image")).toBe(false);
+    expect(result.staticServiceIds.has("svc-image")).toBe(false);
+  });
+});
 
 describe("buildComposeImages — inline catalog build materialization", () => {
   it("materializes the Dockerfile + files under the sanitized service-name subdir and points the build config at the shared root", async () => {
