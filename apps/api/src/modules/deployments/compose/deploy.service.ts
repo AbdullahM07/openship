@@ -51,6 +51,7 @@ import {
   runDeployPipeline,
   sharedMountExecutor,
   type CommandExecutor,
+  type ContainerInfo,
   type DeployConfig,
   type DeployEnvironment,
   type LogEntry,
@@ -102,6 +103,7 @@ import {
   convergeTargetHostPortClaims,
   convergeTargetHostPortClaimsUnlocked,
   prepareTargetPinnedHostPorts,
+  type VerifiedCarriedPinnedHostPort,
   releaseNewPinnedHostPortClaims,
   withHostPortTargetLock,
   type AllocatedPinnedHostPort,
@@ -141,6 +143,10 @@ import {
 } from "../../../lib/upstream-url";
 import { withLoopbackPublishAll, upstreamHostPortFor } from "../../../lib/loopback-publish";
 import { findForeignComposeCollisions } from "./foreign-compose-collision";
+import {
+  deploymentCancellationKeepsProvisioned,
+  throwIfDeploymentCancelled,
+} from "../deployment-cancellation";
 
 export interface ComposeDeployResult {
   /** `reconciling` when at least one service's outcome is UNKNOWN because the
@@ -814,6 +820,8 @@ export interface ComposeDeployOptions {
   /** Interactive edge-conflict hold for a full project deploy. Direct service
    *  starts omit it and fail closed instead of guessing about a foreign proxy. */
   promptUser?: PromptUserFn;
+  /** Outer deployment cancellation signal. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -845,8 +853,10 @@ export async function deployComposeServices(
   if (!target) {
     throw new Error("Cannot deploy loopback-routed services without a physical host identity");
   }
-  return withHostPortTargetLock(target, () =>
-    deployComposeServicesUnlocked(project, dep, runtime, logger, opts),
+  return withHostPortTargetLock(
+    target,
+    () => deployComposeServicesUnlocked(project, dep, runtime, logger, opts),
+    opts?.signal,
   );
 }
 
@@ -1352,12 +1362,88 @@ async function deployComposeServicesUnlocked(
   // same loopback port. Allocations from THIS pass are tracked separately so a
   // carried claim can be released only for its owner without erasing a sibling.
   const hostPortTarget = opts?.hostPortTarget ?? null;
+  /**
+   * Inspect each carried container at most once. Besides avoiding duplicate
+   * SSH/Docker calls in the preflight and carry-forward branches, this cache is
+   * the evidence used to repair a missing canonical host-port claim: a stale
+   * database cache is never enough to move a route.
+   */
+  const carriedContainerInfoById = new Map<string, ContainerInfo | null>();
+  const readCarriedContainerInfo = async (
+    containerId: string,
+  ): Promise<ContainerInfo | null | undefined> => {
+    if (!runtime.supports("containerInfo")) return undefined;
+    if (carriedContainerInfoById.has(containerId)) {
+      return carriedContainerInfoById.get(containerId) ?? null;
+    }
+    const live = await runtime.getContainerInfo(containerId).catch(() => null);
+    carriedContainerInfoById.set(containerId, live);
+    return live;
+  };
+
+  const verifiedCarriedHostPorts: VerifiedCarriedPinnedHostPort[] = [];
+  if (hostPortTarget && lockCarriedHostPorts && runtime.supports("containerInfo")) {
+    const rowsWithContainers = previousServiceDeps.filter(
+      (row) => !!row.containerId && (row.hostPort != null || row.hostPorts != null),
+    );
+    const liveRows = await Promise.all(
+      rowsWithContainers.map(async (row) => ({
+        row,
+        live: await readCarriedContainerInfo(row.containerId!),
+      })),
+    );
+
+    for (const { row, live } of liveRows) {
+      if (!live || live.status !== "running" || !live.hostPortByContainerPort) continue;
+      const persisted = row.hostPorts ?? {};
+      const persistedPorts = Object.keys(persisted)
+        .map((key) => Number(key))
+        .filter((port) => Number.isSafeInteger(port) && port > 0 && port <= 65_535);
+      const demandedPorts = [...(hostLoopbackRoutePortDemands.get(row.serviceId) ?? [])];
+      const candidatePorts = [...new Set([...persistedPorts, ...demandedPorts])];
+      const primaryPort = demandedPorts[0] ?? persistedPorts[0];
+
+      for (const containerPort of candidatePorts) {
+        const mapped = persisted[String(containerPort)];
+        const expectedHostPort =
+          typeof mapped === "number" && mapped > 0
+            ? mapped
+            : containerPort === primaryPort
+              ? row.hostPort ?? undefined
+              : undefined;
+        if (expectedHostPort === undefined) continue;
+        verifiedCarriedHostPorts.push({
+          owner: {
+            projectId: project.id,
+            serviceId: row.serviceId,
+            containerPort,
+          },
+          hostPort: expectedHostPort,
+          liveHostPortByContainerPort: live.hostPortByContainerPort,
+        });
+      }
+    }
+  }
+
   const pinnedHostPortClaims =
     usesHostLoopback && opts?.executor
       ? hostPortTarget
         ? await prepareTargetPinnedHostPorts({
             target: hostPortTarget,
             edgeProxy: edgeProxyFor(opts.executor, "openresty", { ours: true }),
+            verifiedCarriedHostPorts,
+            onCarriedHostPortReconciled: (claim) => {
+              const serviceName =
+                enabled.find((service) => service.id === claim.serviceId)?.name ??
+                claim.serviceId ??
+                "service";
+              logger.log(
+                `Reattached locked host port ${claim.port} to ${serviceName}:${claim.containerPort} ` +
+                  `after the live container confirmed the existing binding.\n`,
+                "info",
+                { serviceName },
+              );
+            },
           })
         : (() => {
             throw new Error(
@@ -1396,6 +1482,7 @@ async function deployComposeServicesUnlocked(
   };
 
   for (const svc of ordered) {
+    throwIfDeploymentCancelled(opts?.signal);
     // Ownership guard - ensure this service actually belongs to the project
     if (svc.projectId !== project.id) continue;
 
@@ -1444,9 +1531,7 @@ async function deployComposeServicesUnlocked(
       // Verify liveness; if it's not up, fall through and redeploy it (from
       // its previous image via the fallback below). When the runtime can't
       // report container status, trust the row (best-effort, prior behavior).
-      const live = runtime.supports("containerInfo")
-        ? await runtime.getContainerInfo(carried.containerId).catch(() => null)
-        : undefined;
+      const live = await readCarriedContainerInfo(carried.containerId);
       const alive = live === undefined || live?.status === "running";
       if (alive) {
         // A network reconnect may have re-assigned the container's IP, so
@@ -2423,9 +2508,18 @@ async function deployComposeServicesUnlocked(
           routing: routeDomains.length ? routeContext?.routing : undefined,
           ssl: routeDomains.length ? routeContext?.trackedSsl : undefined,
           routeOptions: routeDomains.length ? routeContext?.routeOptions : undefined,
+          signal: opts?.signal,
+          keepProvisionedOnCancel: deploymentCancellationKeepsProvisioned(opts?.signal),
         },
         serviceLogger,
       );
+
+      // A cancelled service pipeline is terminal for the parent deployment.
+      // Do not let it fall through the success bookkeeping below (which would
+      // upsert an empty container and mark the service running).
+      if (deployResult.status === "cancelled") {
+        throw new Error("Deployment cancelled");
+      }
 
       // Best-effort routes: a per-domain registration failure is collected, not
       // fatal — the service container is up. Feeds the action-required signal.
@@ -2641,6 +2735,27 @@ async function deployComposeServicesUnlocked(
           : undefined;
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
+
+      // Cancellation belongs to the parent lifecycle. Stop processing this
+      // service immediately instead of converting it into a failed service (or
+      // an indeterminate reconcile) and carrying on with the remaining stack.
+      if (opts?.signal?.aborted) {
+        if (
+          !deploymentCancellationKeepsProvisioned(opts.signal) &&
+          deployedContainerId &&
+          !deployedContainerCleaned
+        ) {
+          await runtime.destroy(deployedContainerId).catch(() => {});
+          deployedContainerCleaned = true;
+        }
+        if (hostPortTarget && serviceHostPortAllocations.length > 0) {
+          await releaseNewPinnedHostPortClaims(
+            hostPortTarget,
+            serviceHostPortAllocations,
+          ).catch(() => {});
+        }
+        throw err;
+      }
 
       // INDETERMINATE: the container STARTED (we have its id) but a post-start
       // step (health / route) lost the connection. Do NOT destroy it — it may

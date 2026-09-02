@@ -45,6 +45,50 @@ function envVarScope(projectId: string, environment?: string, serviceId?: string
  */
 const boundServerId = sql<string>`coalesce(${project.serverId}, ${deployment.meta} ->> 'serverId')`;
 
+/**
+ * Transaction-compatible primitive for moving every existing GitHub source row
+ * in one workspace to the installation currently claimed for its owner.
+ * Exported so the installation-state consume can include this in the SAME DB
+ * transaction as its upsert; createProjectRepo wraps it for ordinary callers.
+ */
+export async function rebindGitHubInstallationRows(
+  db: Database,
+  organizationId: string,
+  owner: string,
+  installationId: number,
+): Promise<{ projects: number; groups: number }> {
+  const ownerKey = owner.toLowerCase();
+  const updatedAt = new Date();
+  const projects = await db
+    .update(project)
+    // The App's global webhook is now authoritative. Clearing legacy
+    // per-repository hook metadata prevents the same push from being accepted a
+    // second time through an old PAT/OAuth hook that may still exist at GitHub.
+    .set({ installationId, webhookId: null, webhookSecret: null, updatedAt })
+    .where(
+      and(
+        eq(project.organizationId, organizationId),
+        eq(project.gitProvider, "github"),
+        sql`lower(${project.gitOwner}) = ${ownerKey}`,
+        isNull(project.deletedAt),
+      ),
+    )
+    .returning();
+  const groups = await db
+    .update(projectGroup)
+    .set({ installationId, updatedAt })
+    .where(
+      and(
+        eq(projectGroup.organizationId, organizationId),
+        eq(projectGroup.gitProvider, "github"),
+        sql`lower(${projectGroup.gitOwner}) = ${ownerKey}`,
+        isNull(projectGroup.deletedAt),
+      ),
+    )
+    .returning();
+  return { projects: projects.length, groups: groups.length };
+}
+
 // ─── Repository ──────────────────────────────────────────────────────────────
 
 export function createProjectRepo(db: Database) {
@@ -466,6 +510,23 @@ export function createProjectRepo(db: Database) {
           .set({ ...groupData, updatedAt })
           .where(and(eq(projectGroup.id, groupId), isNull(projectGroup.deletedAt)));
       });
+    },
+
+    /**
+     * Rebind every existing GitHub project for one owner inside one workspace
+     * after an App install/reinstall. The installation id is part of webhook
+     * tenant isolation, so leaving legacy project rows on the previous/null id
+     * would make valid App pushes get dropped. Projects and their shared
+     * project_app source rows move together in one transaction.
+     */
+    async rebindGitHubInstallation(
+      organizationId: string,
+      owner: string,
+      installationId: number,
+    ): Promise<{ projects: number; groups: number }> {
+      return db.transaction((tx) =>
+        rebindGitHubInstallationRows(tx, organizationId, owner, installationId),
+      );
     },
 
     /** Update favicon cache metadata without touching the user-visible updatedAt field. */

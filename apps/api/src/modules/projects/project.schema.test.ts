@@ -37,6 +37,22 @@ describe("UpdateProjectBody — mass-assignment allow-list", () => {
   });
 });
 
+describe("registered server targeting (#763)", () => {
+  it("accepts serverId on create and ensure, but never on generic update", () => {
+    expect(Value.Check(CreateProjectBody, { name: "my-app", serverId: "srv_remote" })).toBe(true);
+    expect(Value.Check(EnsureProjectBody, { name: "my-app", serverId: "srv_remote" })).toBe(true);
+    expect(
+      Object.keys(
+        (UpdateProjectBody as unknown as { properties: Record<string, unknown> }).properties,
+      ),
+    ).not.toContain("serverId");
+  });
+
+  it("rejects an empty server id", () => {
+    expect(Value.Check(CreateProjectBody, { name: "my-app", serverId: "" })).toBe(false);
+  });
+});
+
 /**
  * `publicEndpoints: []` is the wire value for "no public route": `updateProject`
  * gates route reconciliation on `data.publicEndpoints !== undefined`, so an

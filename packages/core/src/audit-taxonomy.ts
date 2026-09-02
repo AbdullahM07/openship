@@ -820,6 +820,41 @@ export const AUDIT_EVENTS: Record<string, AuditEventDef> = {
     label: "GitHub app installed",
     tone: "info",
   },
+  "github.source.created": {
+    category: "system",
+    action: "registered the GitHub App source",
+    label: "GitHub App source registered",
+    tone: "info",
+    description:
+      "An organization-owned GitHub App was verified and stored. Secret values are never recorded.",
+  },
+  "github.source.updated": {
+    category: "system",
+    action: "updated the GitHub App source",
+    label: "GitHub App source updated",
+    tone: "info",
+    description: "A GitHub App's identity, endpoint, or encrypted credentials changed.",
+  },
+  "github.source.verified": {
+    category: "system",
+    action: "verified the GitHub App source",
+    label: "GitHub App source verified",
+    tone: "info",
+  },
+  "github.source.defaulted": {
+    category: "system",
+    action: "made the default GitHub App source",
+    label: "Default GitHub App source changed",
+    tone: "info",
+  },
+  "github.source.deleted": {
+    category: "system",
+    action: "deleted the GitHub App source",
+    label: "GitHub App source deleted",
+    tone: "warning",
+    description:
+      "The local App credentials and installation bindings were removed; the GitHub App itself was not uninstalled on GitHub.",
+  },
   "github.disconnect": {
     category: "system",
     action: "disconnected GitHub from",

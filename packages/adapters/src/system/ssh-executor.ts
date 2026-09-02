@@ -396,7 +396,7 @@ export class SshExecutor implements CommandExecutor {
     });
   }
 
-  async writeFile(path: string, content: string): Promise<void> {
+  async writeFile(path: string, content: string, opts?: { mode?: number }): Promise<void> {
     const dir = remoteDirname(path);
     try {
       await this.exec(`mkdir -p ${sq(dir)}`);
@@ -406,12 +406,31 @@ export class SshExecutor implements CommandExecutor {
 
     return this.withChannelRetry(async () => {
       const sftp = await this.sftp();
-      return new Promise<void>((resolve, reject) => {
-        sftp.writeFile(path, content, { encoding: "utf-8" }, (err) => {
-          if (err) reject(err);
-          else resolve();
+      const write = (data: string, mode?: number) =>
+        new Promise<void>((resolve, reject) => {
+          sftp.writeFile(path, data, { encoding: "utf-8", mode }, (err) => {
+            if (err) reject(err);
+            else resolve();
+          });
         });
-      });
+      const chmod = (mode: number) =>
+        new Promise<void>((resolve, reject) => {
+          sftp.chmod(path, mode, (err) => {
+            if (err) reject(err);
+            else resolve();
+          });
+        });
+
+      if (opts?.mode !== undefined) {
+        // SFTP's creation mode does not change an existing inode. Truncate it
+        // empty, tighten it, then send the payload so no secret bytes exist
+        // while the old permissive mode is still in force.
+        await write("", opts.mode);
+        await chmod(opts.mode);
+        await write(content);
+      } else {
+        await write(content);
+      }
     });
   }
 

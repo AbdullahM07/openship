@@ -25,6 +25,18 @@ export interface ReusablePinnedHostPort extends PinnedHostPortOwner {
   port: number;
 }
 
+/**
+ * A carried mapping which has been verified against the live container before
+ * host-port inventory runs. This is deliberately stronger than a cached
+ * service_deployment value: the runtime must report the same container-port →
+ * host-port binding on the stable physical target.
+ */
+export interface VerifiedCarriedPinnedHostPort {
+  owner: PinnedHostPortOwner;
+  hostPort: number;
+  liveHostPortByContainerPort: Readonly<Record<number, number>>;
+}
+
 /** One authoritative loopback publish that should remain claimed after reconciliation. */
 export interface DesiredHostPortPublish {
   serviceId: string | null;
@@ -54,8 +66,9 @@ export interface ConvergeTargetHostPortClaimsResult {
 export function withHostPortTargetLock<T>(
   target: HostPortTargetIdentity,
   fn: () => Promise<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
-  return createProvisionLock(`host-port:${target.targetKey}`).run(fn);
+  return createProvisionLock(`host-port:${target.targetKey}`).run(fn, signal);
 }
 
 function targetKeys(target: HostPortTargetIdentity): HostPortTargetKey[] {
@@ -130,10 +143,60 @@ export function reserveTargetPinnedHostPort(
 export async function prepareTargetPinnedHostPorts(input: {
   target: HostPortTargetIdentity;
   edgeProxy: Pick<EdgeProxyApi, "listLoopbackUpstreamPortsStrict">;
+  /**
+   * Optional live proofs for carried mappings whose durable canonical claim is
+   * missing. These are reconciled before orphan edge ports are quarantined, so
+   * a verified owner is never mistaken for an unknown workload.
+   */
+  verifiedCarriedHostPorts?: Iterable<VerifiedCarriedPinnedHostPort>;
+  onCarriedHostPortReconciled?: (claim: HostPortClaim) => void;
 }): Promise<HostPortClaim[]> {
   assertStableTarget(input.target);
   const observedPorts = await input.edgeProxy.listLoopbackUpstreamPortsStrict();
-  const canonicalClaims = await listClaimsByKey(input.target.targetKey);
+  let claims = await listTargetPinnedHostPorts(input.target);
+  const canonicalClaims = claims.filter((claim) => claim.targetKey === input.target.targetKey);
+
+  // Repair only a missing canonical row. A cached port alone is not evidence:
+  // the live daemon must prove the exact binding, and a conflicting claim is
+  // left untouched so the normal allocator/lock gate can fail closed.
+  for (const candidate of input.verifiedCarriedHostPorts ?? []) {
+    assertValidPort(candidate.hostPort, "hostPort");
+    const containerPort = candidate.owner.containerPort;
+    if (typeof containerPort !== "number" || !Number.isSafeInteger(containerPort)) continue;
+    const livePort = candidate.liveHostPortByContainerPort[containerPort];
+    if (livePort !== candidate.hostPort) continue;
+
+    const exactCanonical = canonicalClaims.find(
+      (claim) =>
+        claim.port === candidate.hostPort &&
+        claim.projectId === candidate.owner.projectId &&
+        claim.serviceId === candidate.owner.serviceId &&
+        claim.containerPort === containerPort,
+    );
+    if (exactCanonical) continue;
+
+    const conflictingPortOwner = claims.some(
+      (claim) =>
+        claim.port === candidate.hostPort &&
+        !(
+          claim.projectId === candidate.owner.projectId &&
+          claim.serviceId === candidate.owner.serviceId &&
+          (claim.containerPort === null || claim.containerPort === containerPort)
+        ),
+    );
+    if (conflictingPortOwner) {
+      continue;
+    }
+
+    const claim = await reserveTargetPinnedHostPort(input.target, {
+      ...candidate.owner,
+      port: candidate.hostPort,
+    });
+    claims = [...claims, claim];
+    canonicalClaims.push(claim);
+    input.onCarriedHostPortReconciled?.(claim);
+  }
+
   const canonicalPorts = new Set(canonicalClaims.map((claim) => claim.port));
 
   for (const port of observedPorts) {

@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   onSuccess: vi.fn(async () => {}),
   setDeploymentStatus: vi.fn(async () => {}),
   promptUser: vi.fn(async () => "migrate"),
+  keepProvisioned: false,
 }));
 
 vi.mock("@repo/db", () => ({ repos: {} }));
@@ -32,6 +33,13 @@ vi.mock("../session-manager", () => ({
   broadcastServiceStatus: vi.fn(),
   broadcastInstallPhase: vi.fn(),
   promptUser: mocks.promptUser,
+}));
+vi.mock("../deployment-cancellation", () => ({
+  deploymentCancellationKeepsProvisioned: () => mocks.keepProvisioned,
+  raceDeploymentCancellation: <T>(task: Promise<T>) => task,
+  throwIfDeploymentCancelled: (signal?: AbortSignal) => {
+    if (signal?.aborted) throw new Error("Deployment cancelled");
+  },
 }));
 
 import { executeComposePipeline } from "./pipeline";
@@ -94,6 +102,7 @@ async function run(composeBuild: Record<string, unknown>) {
 describe("executeComposePipeline — cancellation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.keepProvisioned = false;
   });
 
   it("stops before the deploy phase and never re-flips the status", async () => {
@@ -107,7 +116,9 @@ describe("executeComposePipeline — cancellation", () => {
 
     expect(mocks.deployComposeServices).not.toHaveBeenCalled();
     expect(mocks.setDeploymentStatus).not.toHaveBeenCalled();
-    expect(mocks.onCancelled).toHaveBeenCalledWith(expect.anything(), 5);
+    expect(mocks.onCancelled).toHaveBeenCalledWith(expect.anything(), 5, {
+      keepProvisioned: false,
+    });
     // Whatever finished building before the cancel landed is garbage — nothing
     // references it and no deploy will.
     expect(mocks.cleanupBuildArtifact).toHaveBeenCalledWith(expect.anything(), "img/svc-0");
@@ -132,6 +143,23 @@ describe("executeComposePipeline — cancellation", () => {
     expect(mocks.cleanupBuildArtifact).toHaveBeenCalledTimes(2);
     expect(mocks.onCancelled).toHaveBeenCalledTimes(1);
     expect(mocks.deployComposeServices).not.toHaveBeenCalled();
+  });
+
+  it("record-only cancellation leaves built artifacts provisioned", async () => {
+    mocks.keepProvisioned = true;
+
+    await run({
+      cancelled: true,
+      buildFailures: new Map(),
+      imageRefs: new Map(),
+      builtImageRefs: new Map([["svc-0", "img/svc-0"]]),
+      durationMs: 5,
+    });
+
+    expect(mocks.cleanupBuildArtifact).not.toHaveBeenCalled();
+    expect(mocks.onCancelled).toHaveBeenCalledWith(expect.anything(), 5, {
+      keepProvisioned: true,
+    });
   });
 
   // Negative control: without it, a branch that always returned early would pass

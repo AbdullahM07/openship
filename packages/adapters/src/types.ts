@@ -495,7 +495,7 @@ export interface LogEntry {
  * `run`; when no lock is injected, callers fall back to running `fn` directly.
  */
 export interface ProvisionLock {
-  run<T>(fn: () => Promise<T>): Promise<T>;
+  run<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T>;
 }
 
 export interface ContainerInfo {
@@ -847,8 +847,15 @@ export interface CommandExecutor extends ExecOnly {
     opts?: { signal?: AbortSignal },
   ): Promise<{ code: number; output: string }>;
 
-  /** Write content to a file on the target machine. Creates dirs as needed. */
-  writeFile(path: string, content: string): Promise<void>;
+  /**
+   * Write content to a file on the target machine. Creates dirs as needed.
+   *
+   * `mode` is applied before any payload bytes become reachable at `path`. This
+   * matters for credentials: write-then-chmod briefly publishes a secret under
+   * the login user's umask. Callers that need an atomic replacement should write
+   * a unique sibling and rename it after this call.
+   */
+  writeFile(path: string, content: string, opts?: { mode?: number }): Promise<void>;
 
   /** Read a file from the target machine. */
   readFile(path: string): Promise<string>;

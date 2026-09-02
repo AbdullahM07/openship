@@ -74,7 +74,7 @@ import {
   resolveDefaultBranch,
   listBranches as listGitHubBranches,
 } from "../github/github.service";
-import { getInstallUrl } from "../github/github.auth";
+import { resolveInstallUrl } from "../github/github.auth";
 import { ensureSharedWebhook } from "./project-git-webhook";
 import { parseProjectDeleteOptions } from "./project-delete-options";
 import { listProjectRouteRows, resolveProjectRouteState } from "../domains/project-route.service";
@@ -997,13 +997,68 @@ export async function importLocal(c: Context) {
     return c.json({ error: "Directory not found" }, 404);
   }
 
+  // Resolve BEFORE writing the project, then carry the scanner's real (unmasked)
+  // compose services through the existing ensure funnel. The dashboard already
+  // calls /scan before this endpoint, but the CLI does not; trusting the client to
+  // replay scan output is what made `project create --local-path --type services`
+  // create a compose-shaped project with zero service rows (#751).
+  //
+  // There is intentionally no parser in the CLI and no second persistence path:
+  // resolveProjectInfo is the same GitHub/local parser used by deploy-time drift,
+  // and createProject/ensureProject share one compose persistence helper.
+  const info = await prepareService.resolveProjectInfo({
+    source: "local",
+    path: body.localPath,
+    composePath: body.composePath,
+  });
   const project = await projectService.createProject(
     {
       ...body,
+      localPath: body.localPath,
       gitProvider: "local",
+      framework: body.framework ?? info.stack,
+      packageManager: body.packageManager ?? info.packageManager,
+      installCommand: body.installCommand ?? info.installCommand,
+      buildCommand: body.buildCommand ?? info.buildCommand,
+      outputDirectory: body.outputDirectory ?? info.outputDirectory,
+      productionPaths: body.productionPaths ?? info.productionPaths.join(", "),
+      volumes: body.volumes ?? info.volumes,
+      rootDirectory: body.rootDirectory ?? info.rootDirectory,
+      composePath: body.composePath ?? info.composePath,
+      startCommand: body.startCommand ?? info.startCommand,
+      buildImage: body.buildImage ?? info.buildImage,
+      productionMode: body.productionMode ?? info.productionMode,
+      workloadType: body.workloadType ?? info.workloadType,
+      port: body.port ?? info.port,
+      hasBuild:
+        body.hasBuild ??
+        Boolean(info.buildCommand || info.services?.some((service) => Boolean(service.build))),
+      hasServer:
+        body.hasServer ??
+        (info.workloadType
+          ? info.workloadType === "web"
+          : info.projectType === "services" || Boolean(info.startCommand)),
+      projectType: body.projectType ?? info.projectType,
+      publicEndpoints: body.publicEndpoints ?? info.publicEndpoints,
+      routingConfig: body.routingConfig ?? info.routing,
+      readiness: body.readiness ?? info.readiness,
+      monorepoApps: body.monorepoApps ?? info.monorepoApps,
+      monorepoWorkspace: body.monorepoWorkspace ?? info.monorepoWorkspace,
+      services: info.services,
     },
     organizationId,
   );
+
+  audit.recordAsync(auditContextFrom(c, organizationId, userId), {
+    eventType: "project.created",
+    resourceType: "project",
+    resourceId: project.id,
+    after: {
+      source: "local",
+      localPath: body.localPath,
+      serviceCount: info.services?.length ?? 0,
+    },
+  });
 
   return c.json({ data: project }, 201);
 }
@@ -1430,7 +1485,6 @@ export async function getGitInfo(c: Context) {
 
   // Same resolver the project payload (`/info`) uses, so the Source tab and the
   // Overview can't answer "is auto-deploy wired up?" differently.
-  const isCloudProject = info.deployTarget === "cloud";
   const { strategy, webhookActive, installationInstalled } =
     await projectService.resolveProjectWebhookState(organizationId, info);
 
@@ -1450,6 +1504,8 @@ export async function getGitInfo(c: Context) {
   const commits = branch
     ? await getRecentCommits(ctx, info.gitOwner, info.gitRepo, branch, 10)
     : [];
+  const installUrl =
+    strategy === "app" && !installationInstalled ? (await resolveInstallUrl(ctx)).url : undefined;
 
   return c.json({
     success: true,
@@ -1472,7 +1528,7 @@ export async function getGitInfo(c: Context) {
     available_strategies: strategies.available,
     verified_domains: verifiedDomains,
     installation_installed: installationInstalled,
-    install_url: isCloudProject && !installationInstalled ? getInstallUrl() : undefined,
+    install_url: installUrl,
     default_rollback_strategy: info.defaultRollbackStrategy ?? "git",
   });
 }
@@ -1658,7 +1714,7 @@ export async function setAutoDeploy(c: Context) {
       return c.json({ success: false, error: "No repository linked" }, 400);
     }
 
-    const strategy = await resolveWebhookStrategy(project);
+    const strategy = await resolveWebhookStrategy(project, organizationId);
 
     // In "none" mode, auto-deploy can't work - suggest options
     if (strategy === "none" && enabled) {

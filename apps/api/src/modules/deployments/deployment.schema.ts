@@ -24,6 +24,12 @@ export const ListDeploymentsQuery = Type.Object({
 
 export const TriggerDeployBody = Type.Object({
   projectId: Type.String({ minLength: 1 }),
+  serverId: Type.Optional(
+    Type.String({
+      minLength: 1,
+      description: "Registered server to target for this deployment.",
+    }),
+  ),
   branch: Type.Optional(Type.String({ default: "main" })),
   commitSha: Type.Optional(Type.String()),
   environment: Type.Optional(Type.Union([Type.Literal("production"), Type.Literal("preview")])),
