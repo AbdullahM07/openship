@@ -153,10 +153,8 @@ export function GitHubConnection() {
     [ctxDisconnect, loadStatus],
   );
 
-  // Self-hosted needs an active Openship Cloud connection to use the
-  // GitHub App at all — the App private key lives in openship.io and
-  // self-hosted instances proxy through it. PAT + gh CLI escape hatches
-  // don't require cloud.
+  // The backend decides whether the App is operator-owned locally or proxied
+  // through Openship Cloud. The dashboard only follows `requiresCloud`.
   const { connected: cloudConnected, startConnect: startCloudConnect } = useCloud();
   const { showModal, hideModal } = useModal();
   const { selfHosted: isSelfHosted, deployMode } = usePlatform();
@@ -770,8 +768,8 @@ function MethodChooser(props: {
     </button>
   );
 
-  // The App needs Openship Cloud on self-hosted (the private key lives in
-  // openship.io), so the row's action is cloud-connect until that's done.
+  // A cloud-backed App needs the cloud link first; an operator-owned local App
+  // reports requiresCloud=false and goes straight to its install flow.
   const needsCloudFirst = appRequiresCloud && !cloudConnected;
   const appRow = row(
     "app",

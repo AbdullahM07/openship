@@ -4,14 +4,16 @@
  * Composes an optional gh sub-source (GhCliSource, resolved from a LOCAL token
  * read at construction) + a LAZILY-resolved App sub-source (GitHubAppSource),
  * and OWNS the per-capability source order the wrappers used to scatter:
- *   - listing  → gh-FIRST (local, ZERO cloud), else App, else user-token.
+ *   - listing  → configured local App + gh merged; otherwise gh-FIRST
+ *                (local, ZERO cloud), then cloud App, then user-token.
  *   - clone    → App/cloud-first, gh refused for remote (delegated to tokenFor,
  *                whose self-hosted chain already encodes this).
  *   - status   → both sides composed.
  *
  * CRITICAL: the cloud mode-probe (resolveGitHubAuthMode → isCloudConnectedForOrg
- * → /cloud/account) happens ONLY inside `app()`, which gh-first listing never
- * calls. So a plain library browse with gh logged in is 100% local.
+ * → /cloud/account) happens ONLY inside `app()`. A gh-first browse never calls
+ * it; the sole eager App path is a locally configured App, which has no cloud
+ * round-trip and is merged to label App-covered repos correctly.
  *
  * Constructed only in non-CLOUD_MODE (see ./index.ts). The SaaS uses
  * GitHubAppSource directly.
@@ -20,6 +22,7 @@
 import { listUserOwnedRepos } from "../github.service";
 import {
   getGitHubConnectionState,
+  getGitHubAuthMode,
   getInstallationId,
   getInstallationToken,
   getUserInstallations,
@@ -81,6 +84,23 @@ function ghCliState(status: GhCliStatus): GitHubConnectionState["sources"]["ghCl
   };
 }
 
+/** Merge one repo list without duplicating App/CLI-visible repositories. */
+function mergeRepoSources(
+  appRepos: MappedRepository[],
+  cliRepos: MappedRepository[],
+): MappedRepository[] {
+  const merged = new Map<string, MappedRepository>();
+  for (const repo of cliRepos) {
+    merged.set(repo.full_name.toLowerCase(), { ...repo, source: "cli" });
+  }
+  for (const repo of appRepos) {
+    const key = repo.full_name.toLowerCase();
+    const prior = merged.get(key);
+    merged.set(key, { ...repo, source: prior ? "both" : "app" });
+  }
+  return [...merged.values()];
+}
+
 export class LocalGitHubSource implements GitHubSource {
   // Listing-facing label; the App side (cloud-app/app) is resolved lazily and
   // is not reflected here. `mode` is informational — nothing dispatches on it.
@@ -112,6 +132,19 @@ export class LocalGitHubSource implements GitHubSource {
 
   // ── Listing: gh-FIRST → App → user-token ─────────────────────────────────
   async listReposForOwner(owner?: string): Promise<MappedRepository[] | null> {
+    // A deliberately configured local App is authoritative for capability, but
+    // the optional local identity may still reveal additional repos. Merge the
+    // two so an App-covered repo is tagged `both` (remote-deployable) instead of
+    // being mislabeled CLI-only. Cloud-App mode retains its cheap gh-first path
+    // and does not add a SaaS round-trip to ordinary browsing.
+    if (this.gh && getGitHubAuthMode() === "app") {
+      const app = await this.app();
+      const [cliRepos, appRepos] = await Promise.all([
+        this.gh.listReposForOwner(owner),
+        app?.listReposForOwner(owner) ?? Promise.resolve(null),
+      ]);
+      return mergeRepoSources(appRepos ?? [], cliRepos);
+    }
     if (this.gh) return this.gh.listReposForOwner(owner);
     const app = await this.app();
     if (app) return app.listReposForOwner(owner);
@@ -123,6 +156,37 @@ export class LocalGitHubSource implements GitHubSource {
   }
 
   async getHome(): Promise<GitHubHome> {
+    if (this.gh && getGitHubAuthMode() === "app") {
+      const app = await this.app();
+      if (app) {
+        const [appHome, ghStatus, cliRepos, cliAccounts] = await Promise.all([
+          app.getHome(),
+          this.gh.status(),
+          this.gh.listAllRepos(),
+          this.gh.listOwners(),
+        ]);
+        const appAccounts = new Set(appHome.accounts.map((a) => a.login.toLowerCase()));
+        return {
+          state: {
+            sources: {
+              openshipApp: appHome.state.sources.openshipApp,
+              ghCli: ghCliState(ghStatus),
+            },
+            primary: appHome.state.sources.openshipApp.connected
+              ? "openship-app"
+              : ghStatus.available
+                ? "gh-cli"
+                : null,
+          },
+          accounts: [
+            ...appHome.accounts,
+            ...cliAccounts.filter((a) => !appAccounts.has(a.login.toLowerCase())),
+          ],
+          repos: mergeRepoSources(appHome.repos, cliRepos),
+          errors: appHome.errors,
+        };
+      }
+    }
     // gh-FIRST: a LOCAL read, ZERO cloud. We never call app() here — the App's
     // connection status is surfaced separately by the Settings card.
     if (this.gh) {

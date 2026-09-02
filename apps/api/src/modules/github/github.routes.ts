@@ -25,6 +25,7 @@ r.get("/local-status", { tag: "github:read", localOnly: true }, ctrl.getLocalSta
 r.get("/connect/poll", { tag: "github:read", localOnly: true }, ctrl.pollConnect);
 r.get("/home", { tag: "github:read", mcp: { description: "GitHub home: connection state, accounts, and repos in one call." } }, ctrl.getHome);
 r.post("/connect", { tag: "github:write" }, ctrl.connect);
+r.post("/installations/claim", { tag: "github:write", localOnly: true }, ctrl.claimInstallation);
 r.public("get", "/connect/redirect", { reason: "GitHub OAuth callback - no session yet during redirect" }, ctrl.connectRedirect);
 r.post("/disconnect", { tag: "github:admin" }, ctrl.disconnect);
 // Instance-wide git identity from a pasted token — the no-setup path when this
@@ -110,4 +111,3 @@ r.post("/repos/:owner/:repo/webhooks", { tag: "github:write" }, ctrl.registerWeb
 r.delete("/repos/:owner/:repo/webhooks", { tag: "github:admin" }, ctrl.deleteWebhook);
 
 export const githubRoutes = r.hono;
-

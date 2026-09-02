@@ -78,6 +78,7 @@ const METADATA_ROUTES: ReadonlySet<string> = new Set([
   "GET /api/github/connect/redirect",
   "GET /api/github/home",
   "POST /api/github/connect",
+  "POST /api/github/installations/claim",
   "POST /api/github/disconnect",
   "POST /api/github/instance-token",
   // Repo discovery + metadata. `detect` returns DERIVED build config only — it is

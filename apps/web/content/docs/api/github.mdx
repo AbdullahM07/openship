@@ -33,6 +33,7 @@ return 404 on Openship Cloud.
 | `GET /api/github/local-status` | `github:read` | Whether the host has `gh` CLI auth available (self-hosted only). |
 | `GET /api/github/connect/poll` | `github:read` | Poll device-flow login status (self-hosted only). |
 | `POST /api/github/connect` | `github:write` | Start or advance the connection flow. |
+| `POST /api/github/installations/claim` | `github:write` | Verify and bind a self-hosted App setup redirect to the active workspace. |
 | `GET /api/github/connect/redirect` | public | GitHub OAuth callback — browser navigates here, no session yet. |
 | `POST /api/github/disconnect` | `github:admin` | Disconnect one source or all. |
 | `GET /api/github/repos` | `github:list` | List the connected account's repos (optionally `?owner=`). |
@@ -203,6 +204,9 @@ On a self-hosted instance connected to Openship Cloud, GitHub OAuth and App-inst
 through openship.io. If the SaaS is unreachable, `connect` returns 503 rather than a dead install link. Check
 network / the cloud connection in Settings, then retry.
 </Callout>
+
+An instance configured with its [own self-hosted GitHub App](/docs/guides/self-hosted-github-app) does not
+use this cloud proxy; `GITHUB_AUTH_MODE=auto` selects the complete local App configuration first.
 
 <Callout title="404 on a repo route" type="error">
 The `:owner/:repo` isn't visible to the active GitHub source (private, not granted to your member role, or

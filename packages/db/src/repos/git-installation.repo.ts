@@ -1,12 +1,45 @@
-import { eq, and } from "drizzle-orm";
+import { eq, and, isNull, gt } from "drizzle-orm";
 import { randomUUID } from "crypto";
 import type { Database } from "../client";
-import { gitInstallation } from "../schema";
+import { gitInstallation, githubInstallState } from "../schema";
+import { rebindGitHubInstallationRows } from "./project.repo";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export type GitInstallation = typeof gitInstallation.$inferSelect;
 export type NewGitInstallation = typeof gitInstallation.$inferInsert;
+
+async function upsertInstallation(
+  db: Database,
+  data: Omit<NewGitInstallation, "id">,
+): Promise<GitInstallation> {
+  const id = randomUUID();
+  const row = { id, ...data, owner: data.owner.toLowerCase() };
+  const now = new Date();
+  const [returned] = await db
+    .insert(gitInstallation)
+    .values(row)
+    .onConflictDoUpdate({
+      target: [
+        gitInstallation.provider,
+        gitInstallation.owner,
+        gitInstallation.organizationId,
+      ],
+      set: {
+        userId: data.userId,
+        installationId: data.installationId,
+        organizationId: data.organizationId,
+        ownerType: data.ownerType,
+        providerUserId: data.providerUserId ?? null,
+        providerOwnerId: data.providerOwnerId ?? null,
+        isOrg: data.isOrg ?? false,
+        suspendedAt: data.suspendedAt ?? null,
+        updatedAt: now,
+      },
+    })
+    .returning();
+  return returned ?? { ...row, createdAt: now, updatedAt: now };
+}
 
 // ─── Repository ──────────────────────────────────────────────────────────────
 
@@ -19,6 +52,7 @@ export function createGitInstallationRepo(db: Database) {
           eq(gitInstallation.userId, userId),
           eq(gitInstallation.provider, "github"),
           eq(gitInstallation.owner, owner.toLowerCase()),
+          isNull(gitInstallation.suspendedAt),
         ),
       });
     },
@@ -38,6 +72,7 @@ export function createGitInstallationRepo(db: Database) {
           eq(gitInstallation.organizationId, organizationId),
           eq(gitInstallation.provider, "github"),
           eq(gitInstallation.owner, owner.toLowerCase()),
+          isNull(gitInstallation.suspendedAt),
         ),
       });
     },
@@ -48,49 +83,86 @@ export function createGitInstallationRepo(db: Database) {
         where: and(
           eq(gitInstallation.userId, userId),
           eq(gitInstallation.provider, "github"),
+          isNull(gitInstallation.suspendedAt),
+        ),
+      });
+    },
+
+    /** List installations explicitly connected to one Openship workspace. */
+    async listByOrganization(organizationId: string) {
+      return db.query.gitInstallation.findMany({
+        where: and(
+          eq(gitInstallation.organizationId, organizationId),
+          eq(gitInstallation.provider, "github"),
+          isNull(gitInstallation.suspendedAt),
+        ),
+      });
+    },
+
+    /** Find every workspace binding for an App installation id. */
+    async findByInstallationIdForProvider(installationId: number) {
+      return db.query.gitInstallation.findMany({
+        where: and(
+          eq(gitInstallation.provider, "github"),
+          eq(gitInstallation.installationId, installationId),
         ),
       });
     },
 
     /**
-     * Atomic upsert keyed on (provider, owner, userId). Concurrent
-     * webhook redeliveries converge on a single row via the unique
-     * index. Updates installationId + ownership metadata on conflict
-     * so a re-install (new installationId for the same GitHub account)
-     * refreshes the row in place.
+     * Atomic upsert keyed on (provider, owner, organizationId). The workspace
+     * is the security boundary; userId is attribution, not ownership. A
+     * re-install refreshes the row while concurrent callbacks converge.
      */
     async upsert(data: Omit<NewGitInstallation, "id">) {
-      const id = randomUUID();
-      const row = { id, ...data, owner: data.owner.toLowerCase() };
-      const now = new Date();
-      const [returned] = await db
-        .insert(gitInstallation)
-        .values(row)
-        .onConflictDoUpdate({
-          target: [
-            gitInstallation.provider,
-            gitInstallation.owner,
-            gitInstallation.userId,
-          ],
-          set: {
-            installationId: data.installationId,
-            organizationId: data.organizationId,
-            ownerType: data.ownerType,
-            providerUserId: data.providerUserId ?? null,
-            providerOwnerId: data.providerOwnerId ?? null,
-            isOrg: data.isOrg ?? false,
-            updatedAt: now,
-          },
-        })
-        .returning();
-      return returned ?? { ...row, createdAt: now, updatedAt: now };
+      return upsertInstallation(db, data);
     },
 
-    /** Replace all GitHub App installations for a user with a fresh snapshot */
-    async replaceForUser(userId: string, data: Array<Omit<NewGitInstallation, "id" | "userId" | "provider">>) {
+    /**
+     * Consume the verified one-time setup state, upsert the workspace binding,
+     * and reconcile every existing project source in one transaction. A crash
+     * can therefore leave either the whole claim committed or the nonce still
+     * retryable—never a consumed state with a half-bound installation.
+     */
+    async claimWithState(
+      state: string,
+      data: Omit<NewGitInstallation, "id">,
+    ): Promise<GitInstallation | null> {
+      return db.transaction(async (tx) => {
+        const [binding] = await tx
+          .delete(githubInstallState)
+          .where(
+            and(
+              eq(githubInstallState.state, state),
+              eq(githubInstallState.userId, data.userId),
+              eq(githubInstallState.organizationId, data.organizationId),
+              gt(githubInstallState.expiresAt, new Date()),
+            ),
+          )
+          .returning();
+        if (!binding) return null;
+
+        const installation = await upsertInstallation(tx, data);
+        await rebindGitHubInstallationRows(
+          tx,
+          data.organizationId,
+          data.owner,
+          data.installationId,
+        );
+        return installation;
+      });
+    },
+
+    /** Replace one user's OAuth-derived snapshot inside one workspace only. */
+    async replaceForUserInOrganization(
+      userId: string,
+      organizationId: string,
+      data: Array<Omit<NewGitInstallation, "id" | "userId" | "provider" | "organizationId">>,
+    ) {
       const rows = data.map((installation) => ({
         id: randomUUID(),
         userId,
+        organizationId,
         provider: "github",
         ...installation,
         owner: installation.owner.toLowerCase(),
@@ -102,12 +174,31 @@ export function createGitInstallationRepo(db: Database) {
           .where(
             and(
               eq(gitInstallation.userId, userId),
+              eq(gitInstallation.organizationId, organizationId),
               eq(gitInstallation.provider, "github"),
             ),
           );
 
         if (rows.length > 0) {
-          await tx.insert(gitInstallation).values(rows);
+          for (const row of rows) {
+            await tx.insert(gitInstallation).values(row).onConflictDoUpdate({
+              target: [
+                gitInstallation.provider,
+                gitInstallation.owner,
+                gitInstallation.organizationId,
+              ],
+              set: {
+                userId,
+                installationId: row.installationId,
+                ownerType: row.ownerType,
+                providerUserId: row.providerUserId ?? null,
+                providerOwnerId: row.providerOwnerId ?? null,
+                isOrg: row.isOrg ?? false,
+                suspendedAt: row.suspendedAt ?? null,
+                updatedAt: new Date(),
+              },
+            });
+          }
         }
       };
 
@@ -144,6 +235,19 @@ export function createGitInstallationRepo(db: Database) {
     async removeByInstallationIdForProvider(installationId: number) {
       return db
         .delete(gitInstallation)
+        .where(
+          and(
+            eq(gitInstallation.provider, "github"),
+            eq(gitInstallation.installationId, installationId),
+          ),
+        );
+    },
+
+    /** Mark a reversible GitHub suspension without losing workspace ownership. */
+    async suspendByInstallationIdForProvider(installationId: number) {
+      return db
+        .update(gitInstallation)
+        .set({ suspendedAt: new Date(), updatedAt: new Date() })
         .where(
           and(
             eq(gitInstallation.provider, "github"),

@@ -54,9 +54,10 @@ import {
   resolveDefaultBranch,
   listBranches as listGitHubBranches,
   getLatestCommit,
+  getWebhookStrategy,
   resolveWebhookStrategy,
 } from "../github/github.service";
-import { getInstallationIdByOrg, getInstallUrl } from "../github/github.auth";
+import { getInstallationIdByOrg, resolveInstallUrl } from "../github/github.auth";
 import { domainWebhookUrl } from "../../lib/public-url";
 import { ensureSharedWebhook, findSharedWebhookId } from "./project-git-webhook";
 import {
@@ -882,7 +883,7 @@ async function createProductionProject(
   // force-enables autoDeploy. Same shape as every other gate we have had to move:
   // put it where the row is written, not on one of the roads leading there.
   // (linkProjectRepo resolves it server-side on its own path.)
-  if (env.CLOUD_MODE) {
+  if (env.CLOUD_MODE || getWebhookStrategy() === "app") {
     const owner = data.gitOwner?.trim();
     data.installationId = owner
       ? ((await getInstallationIdByOrg(organizationId, owner)) ?? undefined)
@@ -1087,7 +1088,8 @@ export async function linkProjectRepo(
       if (strategy === "app") {
         const resolvedInstId = await getInstallationIdByOrg(organizationId, owner);
         if (!resolvedInstId) {
-          return { ok: false, code: "app_not_installed", owner, installUrl: getInstallUrl() };
+          const install = await resolveInstallUrl(ctx);
+          return { ok: false, code: "app_not_installed", owner, installUrl: install.url };
         }
         gitFields.installationId = resolvedInstId;
         gitFields.autoDeploy = true;
@@ -2476,11 +2478,14 @@ export async function resolveProjectWebhookState(
 ): Promise<ProjectWebhookState> {
   const strategy = await resolveWebhookStrategy(project);
 
-  // The App is installed per (org, owner), and only a cloud project's pushes are
-  // delivered through it — regardless of whether this box is the SaaS or a local
-  // instance connected to it.
+  // A native App strategy delivers pushes for every target through this
+  // instance's App webhook. In cloud-proxy mode (non-App base strategy), only a
+  // cloud-target project receives pushes through the SaaS App.
   let installationInstalled = false;
-  if (project.deployTarget === "cloud" && project.gitOwner) {
+  if (
+    project.gitOwner &&
+    (strategy === "app" || project.deployTarget === "cloud")
+  ) {
     installationInstalled = !!(await getInstallationIdByOrg(organizationId, project.gitOwner));
   }
 

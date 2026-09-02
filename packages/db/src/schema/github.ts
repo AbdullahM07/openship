@@ -5,8 +5,9 @@ import { organization } from "./organization";
 // ─── GitHub App installation tracking ────────────────────────────────────────
 
 /**
- * Tracks GitHub App installations per user.
- * Each row represents one installation (user or org account).
+ * Tracks GitHub App installations per Openship organization.
+ * `userId` records the user who connected/last reconciled the installation;
+ * authorization and token resolution are always scoped by `organizationId`.
  */
 export const gitInstallation = pgTable(
   "git_installation",
@@ -26,17 +27,20 @@ export const gitInstallation = pgTable(
     providerUserId: text("provider_user_id"),
     providerOwnerId: text("provider_owner_id"),
     isOrg: boolean("is_org").notNull().default(false),
+    /** Retained across a reversible GitHub suspension, but excluded from mint/list lookups. */
+    suspendedAt: timestamp("suspended_at"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
     updatedAt: timestamp("updated_at").notNull().defaultNow(),
   },
   (t) => [
-    // One installation row per (provider, owner) per user. Backs the
-    // atomic onConflictDoUpdate in the upsert path so concurrent webhook
-    // redeliveries can't duplicate rows.
-    uniqueIndex("uq_git_installation_provider_owner_user").on(
+    // One installation row per GitHub owner in each Openship workspace.
+    // Including organizationId is load-bearing: one user may connect the
+    // same GitHub organization to multiple Openship workspaces, while one
+    // workspace must never inherit another workspace's installation row.
+    uniqueIndex("uq_git_installation_provider_owner_org").on(
       t.provider,
       t.owner,
-      t.userId,
+      t.organizationId,
     ),
     // Member-onboarding + org-scoped App resolution: every authed
     // request that mints an installation token via the org path hits

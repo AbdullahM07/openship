@@ -20,6 +20,7 @@ import { verifyHmacSha256 } from "../webhooks/webhook.service";
 import { handleInstallation } from "./webhook-installation";
 import { handlePush } from "./webhook-push";
 import { handleCheckRun } from "./webhook-check-run";
+import { getGitHubAuthMode } from "./github.auth";
 import type {
   WebhookProvider,
   WebhookVerifyResult,
@@ -136,7 +137,21 @@ export const githubWebhookProvider: WebhookProvider = {
     // (installation/ping, or a repo Openship doesn't manage). Appending it for a
     // routable delivery that already has a per-project secret would make it a
     // cross-repo skeleton key that validates any managed repo's webhook.
-    if (candidates.length === 0 && env.GITHUB_WEBHOOK_SECRET) {
+    let appDelivery = false;
+    if (getGitHubAuthMode() === "app") {
+      try {
+        const text = Buffer.isBuffer(payload) ? payload.toString("utf8") : payload;
+        const parsed = JSON.parse(text) as { installation?: { id?: unknown } };
+        const installationId = parsed.installation?.id;
+        appDelivery =
+          typeof installationId === "number" &&
+          Number.isSafeInteger(installationId) &&
+          installationId > 0;
+      } catch {
+        appDelivery = false;
+      }
+    }
+    if ((candidates.length === 0 || appDelivery) && env.GITHUB_WEBHOOK_SECRET) {
       candidates.push(env.GITHUB_WEBHOOK_SECRET);
     }
 

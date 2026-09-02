@@ -257,7 +257,14 @@ const authCallbackHtml = `<!DOCTYPE html><html><head><title>Success</title></hea
 
 app.get("/auth/callback/install", (c) => {
   if (githubAuth.getGitHubAuthMode() === "app") {
-    return c.redirect(githubAuth.getInstallUrl());
+    // The setup URL's installation_id is attacker-controlled. A local App
+    // install is usable only when it carries the one-shot user/workspace state
+    // minted before OAuth. Never retain the old stateless fallback here.
+    const state = c.req.query("state")?.trim();
+    if (!state) {
+      return c.text("Missing GitHub installation state. Start again from Settings.", 400);
+    }
+    return c.redirect(`${githubAuth.getInstallUrl()}?state=${encodeURIComponent(state)}`);
   }
   return c.html(authCallbackHtml);
 });

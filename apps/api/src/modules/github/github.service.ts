@@ -878,7 +878,7 @@ export type WebhookStrategy = "app" | "domain" | "repo" | "none";
 /**
  * Determine the base webhook strategy from global config (sync, no user context).
  *
- *  - "app"  → GitHub App handles push events natively (cloud mode).
+ *  - "app"  → GitHub App handles push events natively (SaaS or local App).
  *  - "repo" → Create per-repo webhooks (self-hosted with a public URL).
  *  - "none" → Can't receive webhooks (localhost / private IP).
  */
@@ -898,7 +898,7 @@ export function getWebhookStrategy(): WebhookStrategy {
  * Resolve the effective webhook strategy for a project + user (async).
  *
  * Priority:
- *   1. "app"    - GitHub App (cloud mode)
+ *   1. "app"    - native GitHub App (SaaS or operator-owned self-hosted App)
  *   2. "domain" - project has a webhookDomain set (direct delivery)
  *   3. "repo"   - current API target is public
  *   4. "none"   - no way to receive webhooks

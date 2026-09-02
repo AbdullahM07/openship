@@ -820,6 +820,13 @@
       "when": 1788992507325,
       "tag": "0116_domain_ssl_challenge",
       "breakpoints": true
+    },
+    {
+      "idx": 117,
+      "version": "7",
+      "when": 1789078907325,
+      "tag": "0117_github_installation_workspace_scope",
+      "breakpoints": true
     }
   ]
 }

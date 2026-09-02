@@ -74,7 +74,7 @@ import {
   resolveDefaultBranch,
   listBranches as listGitHubBranches,
 } from "../github/github.service";
-import { getInstallUrl } from "../github/github.auth";
+import { resolveInstallUrl } from "../github/github.auth";
 import { ensureSharedWebhook } from "./project-git-webhook";
 import { parseProjectDeleteOptions } from "./project-delete-options";
 import { listProjectRouteRows, resolveProjectRouteState } from "../domains/project-route.service";
@@ -1485,7 +1485,6 @@ export async function getGitInfo(c: Context) {
 
   // Same resolver the project payload (`/info`) uses, so the Source tab and the
   // Overview can't answer "is auto-deploy wired up?" differently.
-  const isCloudProject = info.deployTarget === "cloud";
   const { strategy, webhookActive, installationInstalled } =
     await projectService.resolveProjectWebhookState(organizationId, info);
 
@@ -1505,6 +1504,9 @@ export async function getGitInfo(c: Context) {
   const commits = branch
     ? await getRecentCommits(ctx, info.gitOwner, info.gitRepo, branch, 10)
     : [];
+  const installUrl = strategy === "app" && !installationInstalled
+    ? (await resolveInstallUrl(ctx)).url
+    : undefined;
 
   return c.json({
     success: true,
@@ -1527,7 +1529,7 @@ export async function getGitInfo(c: Context) {
     available_strategies: strategies.available,
     verified_domains: verifiedDomains,
     installation_installed: installationInstalled,
-    install_url: isCloudProject && !installationInstalled ? getInstallUrl() : undefined,
+    install_url: installUrl,
     default_rollback_strategy: info.defaultRollbackStrategy ?? "git",
   });
 }

@@ -36,6 +36,9 @@ On a self-hosted instance you're never forced through Openship Cloud. The **GitH
 
 - **Openship Cloud GitHub App** — the managed App (short-lived tokens, great for remote-server deploys).
   Optional; it needs an Openship Cloud connection.
+- **Your own self-hosted GitHub App** — configure the App ID, client credentials, private key and webhook
+  secret once, then use installation tokens without Openship Cloud or PATs. See
+  [Self-hosted GitHub App](/docs/guides/self-hosted-github-app).
 - **Manual** — connect with your **own** GitHub identity, no Openship in the middle:
   - **`gh` CLI on the instance** — press **Log in with GitHub**; if the instance has `gh` authenticated
     it's picked up immediately, otherwise run the shown `gh auth login` on the box and the page detects it

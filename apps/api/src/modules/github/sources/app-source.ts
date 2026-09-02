@@ -52,7 +52,8 @@ import type {
 export class GitHubAppSource implements GitHubSource {
   constructor(
     private readonly ctx: RequestContext,
-    /** "app" on the SaaS, "cloud-app" in local+cloud mode. */
+    /** "app" when this process owns the App (SaaS or self-hosted),
+     *  "cloud-app" when a self-host proxies through Openship Cloud. */
     readonly mode: GitHubMode = "app",
   ) {}
 

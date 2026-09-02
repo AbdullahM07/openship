@@ -12,6 +12,22 @@ lossless, completes remote-server setup and CLI targeting, fixes external mail
 health and administration, and ships the invitation, DNS, catalog-routing, and
 update-experience work accumulated since 0.6.9.
 
+### Source control
+
+- **Cloud and self-hosted GitHub App installation is tenant-safe end to end** — cloud uses the
+  canonical Openship GitHub App, while self-hosted operators may configure a complete
+  App ID/client/private-key/webhook setup that is selected automatically,
+  supports installations across multiple GitHub accounts, powers the repository
+  browser, mints short-lived repository-scoped clone tokens, and receives push
+  auto-deploy through the App webhook without duplicate per-repo hooks. Install
+  callbacks now bind a durable one-shot nonce to the initiating user and workspace and
+  verify the reported installation against both the user's GitHub authorization
+  and the configured App before atomically persisting and reconciling it. The cloud
+  callback survives API replicas/restarts, rejects removed workspace members, and
+  cannot bind another tenant's caller-supplied installation id. Installation rows, token caches,
+  project bindings, lifecycle webhooks, and reconnects are workspace-scoped;
+  webhook arrival order never guesses a workspace from membership order (#759).
+
 ### Accounts and teams
 
 - **Self-hosted organization invitations now work for brand-new users** — the

@@ -203,8 +203,9 @@ Openship keeps secrets where they're safest instead of copying them around:
 
 - **PAT secrets** are stored only as a SHA-256 hash; the plaintext exists just once, in your clipboard.
 - **Cloud sessions** are encrypted at rest on the instance and never exposed to the browser.
-- The **GitHub App private key** lives only on Openship Cloud; self-hosted instances mint short-lived App
-  tokens through the cloud rather than holding the key.
+- The managed **Openship GitHub App private key** lives only on Openship Cloud. A self-hosted operator may
+  instead configure their own App key in the API process environment; it never enters the database or a
+  dashboard response. Both paths mint short-lived, repository-scoped installation tokens.
 - Per-project git tokens and environment secrets are encrypted at rest.
 
 ## Revocation
