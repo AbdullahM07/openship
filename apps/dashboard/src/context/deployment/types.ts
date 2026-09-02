@@ -86,6 +86,7 @@ export type RawComposeService = {
   image?: string | null;
   build?: string | null;
   dockerfile?: string | null;
+  buildArgs?: Record<string, string | null> | null;
   ports?: string[] | null;
   dependsOn?: string[] | null;
   environment?: Record<string, string> | null;
@@ -145,6 +146,7 @@ export function normalizeComposeService(raw: RawComposeService): ComposeServiceI
     image: raw.image ?? undefined,
     build: raw.build ?? undefined,
     dockerfile: raw.dockerfile ?? undefined,
+    buildArgs: raw.buildArgs ?? undefined,
     ports: raw.ports ?? [],
     dependsOn: raw.dependsOn ?? [],
     environment: raw.environment ?? {},
@@ -175,6 +177,8 @@ export interface PublicEndpoint {
   id: string;
   port: string;
   targetPath: string;
+  /** Preserve an imported nginx `location = <path>` route during migration. */
+  exact?: boolean;
   domain: string;
   customDomain: string;
   domainType: "free" | "custom";
@@ -415,6 +419,12 @@ export interface DeploymentConfig {
    */
   readiness?: OpenshipReadiness | null;
   /**
+   * What the scan's openship.json parse refused (#641). NOT a user setting — it's
+   * a fresh observation of the repo, so it is never hydrated from the saved
+   * project and never sent back on save.
+   */
+  configDiagnostics?: { errors: string[]; warnings: string[]; wholeFile?: true };
+  /**
    * Resource tier picked for Openship Cloud deploys. Self-hosted servers
    * inherit the host's capacity, so this field is meaningless for them
    * — kept on the config (not nested under cloud) because operators
@@ -558,6 +568,7 @@ export function createPublicEndpoint(
     id: overrides.id ?? randomUUID(),
     port: overrides.port ?? "",
     targetPath: overrides.targetPath ?? "",
+    ...(overrides.exact ? { exact: true } : {}),
     domain: overrides.domain ?? "",
     customDomain: overrides.customDomain ?? "",
     domainType: overrides.domainType ?? "free",
@@ -719,6 +730,12 @@ export interface OutputCheckUI {
   found: boolean;
   hasIndex: boolean;
   checked: boolean;
+  /** Status the edge answered for a real request to this route. Absent = no HTTP
+   *  signal — pre-fix records have none. */
+  status?: number;
+  /** The edge answered and it was not a failure. ABSENT = no signal: test
+   *  `served === false`, never `!served`, or every older record reads as broken. */
+  served?: boolean;
   skippedReason?: string;
 }
 
@@ -729,6 +746,8 @@ export interface DeploymentState {
   deploymentSuccess: boolean;
   deploymentFailed: boolean;
   deploymentCanceled: boolean;
+  /** A cancelled row whose worker lease has not acknowledged completion yet. */
+  cancellationPending: boolean;
   failureMessage: string;
   warningMessage: string;
   /**
@@ -799,6 +818,7 @@ export const INITIAL_STATE: DeploymentState = {
   deploymentSuccess: false,
   deploymentFailed: false,
   deploymentCanceled: false,
+  cancellationPending: false,
   failureMessage: "",
   warningMessage: "",
   decisionPending: false,

@@ -19,7 +19,7 @@ vi.mock("../session-manager", () => ({
   broadcastInstallPhase: vi.fn(),
 }));
 
-import { buildComposeImages } from "./build.service";
+import { buildComposeImages, resolveComposeBuildArgs } from "./build.service";
 
 /**
  * These pin the AUTHOR-FACING contract of an inline catalog build (`advanced.build`):
@@ -74,6 +74,41 @@ function inlineService(name: string, build: InlineBuild, id = name) {
   };
 }
 
+/** A compose row that builds from a directory in the linked repo. */
+function repoService(
+  overrides: Partial<{
+    name: string;
+    id: string;
+    kind: string;
+    build: string | null;
+    dockerfile: string | null;
+    buildArgs: Record<string, string | null> | null;
+    rootDirectory: string | null;
+    buildCommand: string | null;
+    startCommand: string | null;
+    framework: string | null;
+    advanced: { buildArgTemplateKeys?: string[] } | null;
+  }> = {},
+) {
+  // Spread, not `??` per field: an explicit `build: null` (a monorepo row) has to
+  // survive, and `??` would restore the default.
+  return {
+    id: "svc-1",
+    name: "dinohash",
+    enabled: true,
+    image: null,
+    advanced: null,
+    kind: "compose",
+    build: "dinohash-service",
+    dockerfile: "Dockerfile",
+    rootDirectory: null,
+    framework: null,
+    buildCommand: null,
+    startCommand: null,
+    ...overrides,
+  };
+}
+
 /** Materialized context roots currently sitting in os.tmpdir() (leak detector). */
 function catalogTempRoots(): string[] {
   return readdirSync(tmpdir()).filter((n) => n.startsWith("openship-catalog-build-"));
@@ -90,6 +125,9 @@ type Captured = { config: BuildConfig; serviceName: string };
 async function run(
   services: unknown[],
   onContext?: (root: string, item: Captured) => void | Promise<void>,
+  snapshotOverrides?: Partial<typeof SNAPSHOT>,
+  buildEnvVars: Record<string, string> = {},
+  imageRefFor?: (item: Captured) => string,
 ) {
   listByProjectMock.mockResolvedValue(services);
   const captured: Captured[] = [];
@@ -108,7 +146,7 @@ async function run(
         (item.onResult as (r: unknown) => void)({
           sessionId: "s",
           status: "running",
-          imageRef: `img/${entry.serviceName}`,
+          imageRef: imageRefFor?.(entry) ?? `img/${entry.serviceName}`,
         });
       }
     }),
@@ -126,13 +164,53 @@ async function run(
     dep: { id: "d1", branch: "main", commitSha: null, trigger: "deploy", meta: null } as never,
     runtime: runtime as never,
     logger: new BuildLogger(() => {}),
-    snapshot: SNAPSHOT as never,
+    snapshot: { ...SNAPSHOT, ...snapshotOverrides } as never,
     buildSessionId: "sess",
-    buildEnvVars: {},
+    buildEnvVars,
     buildResources: DEFAULT_RESOURCE_CONFIG,
   });
   return { result, captured };
 }
+
+describe("buildComposeImages — static artifact provenance", () => {
+  it("records an inherited static sub-app's exact host artifact", async () => {
+    const artifact = "/opt/openship/static/.builds/sess-svc-static";
+    const { result } = await run(
+      [
+        repoService({
+          id: "svc-static",
+          name: "web",
+          kind: "monorepo",
+          build: null,
+          dockerfile: null,
+          framework: null,
+          buildCommand: null,
+          startCommand: null,
+        }),
+      ],
+      undefined,
+      { framework: "vite", buildCommand: "npm run build", startCommand: "" },
+      {},
+      () => artifact,
+    );
+
+    expect(result.imageRefs.get("svc-static")).toBe(artifact);
+    expect(result.staticArtifactRefs.get("svc-static")).toBe(artifact);
+    expect(result.staticServiceIds.has("svc-static")).toBe(true);
+  });
+
+  it("does not trust an absolute configured image as a static artifact", async () => {
+    const service = {
+      ...repoService({ id: "svc-image", name: "image", build: null, dockerfile: null }),
+      image: "/etc",
+    };
+    const { result } = await run([service]);
+
+    expect(result.imageRefs.get("svc-image")).toBe("/etc");
+    expect(result.staticArtifactRefs.has("svc-image")).toBe(false);
+    expect(result.staticServiceIds.has("svc-image")).toBe(false);
+  });
+});
 
 describe("buildComposeImages — inline catalog build materialization", () => {
   it("materializes the Dockerfile + files under the sanitized service-name subdir and points the build config at the shared root", async () => {
@@ -269,5 +347,158 @@ describe("buildComposeImages — inline catalog build materialization", () => {
       },
     );
     expect(existed).toBe(true);
+  });
+});
+
+/**
+ * #634. `build` is a build CONTEXT — the DB column, the wire schema, the docs and the
+ * dashboard label all say so — but the produced BuildConfig only carried it as
+ * `rootDirectory`, which the docker runtime reads as "a subdir inside a whole-repo
+ * context". So the service's own `COPY requirements.txt` resolved at the repo root.
+ * These pin the producer side: which rows get a narrowed context, and which must not.
+ */
+describe("buildComposeImages — declared build context", () => {
+  it("isolates build args for services sharing one context and Dockerfile (#689)", async () => {
+    const shared = {
+      build: "../../",
+      dockerfile: "services/shared/Dockerfile",
+    };
+    const { captured } = await run(
+      [
+        repoService({
+          id: "svc-api",
+          name: "api",
+          ...shared,
+          buildArgs: {
+            APP_PACKAGE: "@myorg/api",
+            SHARED_VERSION: null,
+            CHANNEL: "${RELEASE_CHANNEL:-stable}",
+            VERSIONED: "pkg-${SHARED_VERSION}",
+          },
+          advanced: { buildArgTemplateKeys: ["CHANNEL", "VERSIONED"] },
+        }),
+        repoService({
+          id: "svc-worker",
+          name: "worker",
+          ...shared,
+          buildArgs: { APP_PACKAGE: "@myorg/worker", UNSET: null },
+        }),
+      ],
+      undefined,
+      { rootDirectory: "deploy/docker-compose" },
+      { SHARED_VERSION: "1.2.3" },
+    );
+
+    expect(captured).toHaveLength(2);
+    expect(captured.map(({ config }) => config.buildContextDirectory)).toEqual(["", ""]);
+    expect(captured.map(({ config }) => config.dockerfilePath)).toEqual([
+      "services/shared/Dockerfile",
+      "services/shared/Dockerfile",
+    ]);
+    expect(captured[0].config.buildArgs).toEqual({
+      APP_PACKAGE: "@myorg/api",
+      SHARED_VERSION: "1.2.3",
+      CHANNEL: "stable",
+      VERSIONED: "pkg-1.2.3",
+    });
+    expect(captured[1].config.buildArgs).toEqual({ APP_PACKAGE: "@myorg/worker" });
+  });
+
+  it("reports missing required build-arg variables without values", () => {
+    expect(() =>
+      resolveComposeBuildArgs({ TOKEN: "${BUILD_TOKEN:?set BUILD_TOKEN}" }, {}, ["TOKEN"]),
+    ).toThrow(/BUILD_TOKEN/);
+  });
+
+  it("resolves only raw-parser templates against the invocation environment", () => {
+    expect(
+      resolveComposeBuildArgs(
+        {
+          A: "one",
+          B: "${A:-two}",
+          C: "${HOST}",
+          SELF: "${SELF:-fallback}",
+          CLI_LITERAL: "$HOME",
+          ESCAPED: "$$HOME",
+        },
+        { HOST: "host", SELF: "env-self", HOME: "/private/home" },
+        ["B", "C", "SELF", "ESCAPED"],
+      ),
+    ).toEqual({
+      A: "one",
+      // Compose uses the invocation environment, not sibling build args.
+      B: "two",
+      C: "host",
+      SELF: "env-self",
+      // CLI-normalized/direct values are literal even when they contain `$`.
+      CLI_LITERAL: "$HOME",
+      // Raw Compose `$$` becomes one literal dollar exactly once.
+      ESCAPED: "$HOME",
+    });
+  });
+
+  it("hands the runtime the service's build directory as the docker context", async () => {
+    const { captured } = await run([repoService()]);
+
+    expect(captured).toHaveLength(1);
+    const cfg = captured[0].config;
+    expect(cfg.buildContextDirectory).toBe("dinohash-service");
+    // BOTH, same value: cloud reads `rootDirectory` as its context root, docker reads
+    // the explicit field. Dropping either regresses one target.
+    expect(cfg.rootDirectory).toBe("dinohash-service");
+    // Relative to the context, as compose defines it — not "dinohash-service/Dockerfile".
+    expect(cfg.dockerfilePath).toBe("Dockerfile");
+  });
+
+  it("resolves the context against the compose file's directory", async () => {
+    // Compose semantics: a file in `deploy/docker-compose/` saying `build: ../../api`
+    // means the repo-root `api` directory.
+    const { captured } = await run([repoService({ build: "../../api" })], undefined, {
+      rootDirectory: "deploy/docker-compose",
+    });
+
+    expect(captured[0].config.buildContextDirectory).toBe("api");
+    expect(captured[0].config.rootDirectory).toBe("api");
+  });
+
+  it("keeps the whole repo as the context for `build: .`", async () => {
+    // Byte-identical to before the fix: every pre-existing root-compose project has
+    // this shape, and "" means the source root on every runtime.
+    const { captured } = await run([repoService({ build: "." })]);
+
+    expect(captured[0].config.buildContextDirectory).toBe("");
+    expect(captured[0].config.rootDirectory).toBe("");
+  });
+
+  it("never narrows the context for an inline catalog build", async () => {
+    // Its context IS the materialized root; the per-service subdir rides in the
+    // Dockerfile path so a template author's `COPY <service-name>/<file>` resolves.
+    const { captured } = await run([
+      inlineService("compute", { dockerfile: "FROM alpine\n" }, "svc-inline"),
+    ]);
+
+    expect(captured[0].config.buildContextDirectory).toBeUndefined();
+    expect(captured[0].config.dockerfilePath).toBe("compute/Dockerfile");
+  });
+
+  it("never narrows the context for a monorepo sub-app", async () => {
+    // A generated recipe COPYs the workspace root — a narrowed context cannot satisfy
+    // it, and the runtime refuses the combination outright.
+    const { captured } = await run([
+      repoService({
+        id: "svc-mono",
+        name: "web",
+        kind: "monorepo",
+        build: null,
+        dockerfile: null,
+        rootDirectory: "apps/web",
+        framework: "nextjs",
+        buildCommand: "npm run build",
+        startCommand: "npm start",
+      }),
+    ]);
+
+    expect(captured[0].config.buildContextDirectory).toBeUndefined();
+    expect(captured[0].config.rootDirectory).toBe("apps/web");
   });
 });

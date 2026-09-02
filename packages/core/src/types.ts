@@ -231,7 +231,28 @@ export type ComposeAdvancedPatch = {
 };
 
 export type ComposeAdvanced = {
+  /**
+   * Environment keys whose stored inline value is the original Compose
+   * interpolation expression. Values stay in the masked `environment` column;
+   * this names-only marker lets deploy resolve them against the final env layers
+   * without exposing expressions (which may contain secret defaults) elsewhere.
+   * Internal/compose-owned: API clients do not author this field.
+   */
+  environmentTemplateKeys?: string[];
+  /**
+   * Build-argument keys whose stored value is the original expression from a
+   * raw Compose file. Unlike `buildArgs` received from the CLI (already expanded
+   * by `docker compose config`) or a direct API call, these keys are expanded
+   * once against the deployment's final build environment.
+   *
+   * Names only: values remain in `buildArgs`. Compose-owned and safe to
+   * round-trip through service/deployment responses.
+   */
+  buildArgTemplateKeys?: string[];
   healthcheck?: ComposeHealthcheck;
+  /** False opts this service out of steady-state outage monitoring and Docker
+   * event acceleration. Deployment readiness remains independent. */
+  monitoringEnabled?: boolean;
   /**
    * Per-service deploy-time readiness gate, overriding the project's for THIS
    * service. Absent ⇒ inherit the project's; neither ⇒ off.

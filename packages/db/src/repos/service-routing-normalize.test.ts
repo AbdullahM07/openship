@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { createServiceRepo, normalizeRoutingFields, toComposeSpec } from "./service.repo";
+import {
+  createServiceRepo,
+  isComposeProvenanceUpgrade,
+  normalizeRoutingFields,
+  toComposeSpec,
+} from "./service.repo";
 import type { Database } from "../client";
 
 const multiRoute = [
@@ -90,4 +95,231 @@ describe("reconcileFromCompose keeps the route set", () => {
     expect(writes[0].publicEndpoints).toEqual(multiRoute);
     expect(writes[0].exposed).toBe(true);
   });
+});
+
+describe("reconcileFromCompose bootstraps dynamic env provenance (#673)", () => {
+  it("restores raw expressions without overwriting an operator-edited value", async () => {
+    const writes: Array<Record<string, unknown>> = [];
+    const db = {
+      query: {
+        service: {
+          findMany: async () => [
+            {
+              id: "svc_1",
+              projectId: "proj_1",
+              name: "api",
+              kind: "compose",
+              environment: {
+                POSTGRES_PASSWORD: "manual-secret",
+                DATABASE_URL: "postgresql://user:@db/app",
+              },
+              advanced: { readiness: { enabled: true } },
+              importedSpec: null,
+              driftSpec: null,
+            },
+          ],
+        },
+      },
+      update: () => ({
+        set: (data: Record<string, unknown>) => {
+          writes.push(data);
+          return { where: async () => undefined };
+        },
+      }),
+    } as unknown as Database;
+
+    await createServiceRepo(db).reconcileFromCompose("proj_1", [
+      {
+        name: "api",
+        environment: {
+          POSTGRES_PASSWORD: "",
+          DATABASE_URL: "postgresql://user:@db/app",
+        },
+        environmentTemplates: {
+          POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set it}",
+          DATABASE_URL: "postgresql://user:${POSTGRES_PASSWORD:?set it}@db/app",
+        },
+        advanced: {
+          environmentTemplateKeys: ["POSTGRES_PASSWORD", "DATABASE_URL"],
+        },
+      },
+    ]);
+
+    expect(writes).toHaveLength(1);
+    expect(writes[0].environment).toEqual({
+      // Different from the scan-time empty preview: preserve the user's value.
+      POSTGRES_PASSWORD: "manual-secret",
+      // Still equal to the partial preview: migrate it back to the raw template.
+      DATABASE_URL: "postgresql://user:${POSTGRES_PASSWORD:?set it}@db/app",
+    });
+    expect(writes[0].advanced).toEqual({
+      readiness: { enabled: true },
+      environmentTemplateKeys: ["POSTGRES_PASSWORD", "DATABASE_URL"],
+    });
+  });
+});
+
+describe("legacy compose provenance baselines", () => {
+  const oldBaseline = {
+    name: "api",
+    image: "example/api:1",
+    environment: { PORT: "3000", NODE_ENV: "production" },
+    advanced: { healthcheck: { test: ["CMD", "true"] } },
+  };
+  const parsedNow = {
+    ...oldBaseline,
+    environment: { PORT: "${PORT:-3000}", NODE_ENV: "${NODE_ENV:-production}" },
+    advanced: {
+      ...oldBaseline.advanced,
+      environmentTemplateKeys: ["PORT", "NODE_ENV"],
+      buildArgTemplateKeys: [],
+    },
+  };
+
+  it("recognizes parser metadata as an upgrade instead of a repo edit", () => {
+    expect(isComposeProvenanceUpgrade(oldBaseline, parsedNow)).toBe(true);
+  });
+
+  it("does not hide a real compose change that arrived with the metadata", () => {
+    expect(isComposeProvenanceUpgrade(oldBaseline, { ...parsedNow, image: "example/api:2" })).toBe(
+      false,
+    );
+  });
+
+  it("advances only the baseline and preserves live operator values", async () => {
+    const writes: Array<Record<string, unknown>> = [];
+    const db = {
+      query: {
+        service: {
+          findMany: async () => [
+            {
+              id: "svc_1",
+              projectId: "proj_1",
+              kind: "compose",
+              ...oldBaseline,
+              environment: { PORT: "20011", NODE_ENV: "production" },
+              importedSpec: oldBaseline,
+              driftSpec: { image: "stale" },
+            },
+          ],
+        },
+      },
+      update: () => ({
+        set: (data: Record<string, unknown>) => {
+          writes.push(data);
+          return { where: async () => undefined };
+        },
+      }),
+    } as unknown as Database;
+
+    const result = await createServiceRepo(db).reconcileFromCompose("proj_1", [parsedNow]);
+
+    expect(result.driftedNames).toEqual([]);
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({ importedSpec: toComposeSpec(parsedNow), driftSpec: null });
+    expect(writes[0]).not.toHaveProperty("environment");
+  });
+});
+
+describe("reconcileFromCompose bootstraps legacy build args (#689)", () => {
+  it("normalizes an old baseline once even when the compose file has no args", async () => {
+    const writes: Array<Record<string, unknown>> = [];
+    const row = {
+      id: "svc_1",
+      projectId: "proj_1",
+      name: "api",
+      kind: "compose",
+      image: "example/api:1",
+      buildArgs: {},
+      environment: {},
+      advanced: {},
+      driftSpec: null,
+    };
+    const oldBaseline = toComposeSpec(row) as Record<string, unknown>;
+    delete oldBaseline.buildArgs;
+    const db = {
+      query: { service: { findMany: async () => [{ ...row, importedSpec: oldBaseline }] } },
+      update: () => ({
+        set: (data: Record<string, unknown>) => {
+          writes.push(data);
+          return { where: async () => undefined };
+        },
+      }),
+    } as unknown as Database;
+
+    await createServiceRepo(db).reconcileFromCompose("proj_1", [
+      { name: "api", image: "example/api:1" },
+    ]);
+
+    expect(writes).toHaveLength(1);
+    expect((writes[0].importedSpec as Record<string, unknown>).buildArgs).toEqual({});
+    expect(writes[0].driftSpec).toBeNull();
+  });
+
+  it.each([
+    {
+      label: "adopts repo args for a pre-column empty row",
+      stored: {},
+      expected: { APP_PACKAGE: "@myorg/api" },
+      expectedTemplateKeys: ["APP_PACKAGE"],
+    },
+    {
+      label: "preserves manually stored args",
+      stored: { APP_PACKAGE: "@myorg/manual" },
+      expected: { APP_PACKAGE: "@myorg/manual" },
+      expectedTemplateKeys: [],
+    },
+  ])(
+    "$label before advancing a null baseline",
+    async ({ stored, expected, expectedTemplateKeys }) => {
+      const writes: Array<Record<string, unknown>> = [];
+      const db = {
+        query: {
+          service: {
+            findMany: async () => [
+              {
+                id: "svc_1",
+                projectId: "proj_1",
+                name: "api",
+                kind: "compose",
+                build: ".",
+                dockerfile: "Dockerfile",
+                buildArgs: stored,
+                environment: {},
+                advanced: {},
+                importedSpec: null,
+                driftSpec: null,
+              },
+            ],
+          },
+        },
+        update: () => ({
+          set: (data: Record<string, unknown>) => {
+            writes.push(data);
+            return { where: async () => undefined };
+          },
+        }),
+      } as unknown as Database;
+
+      await createServiceRepo(db).reconcileFromCompose("proj_1", [
+        {
+          name: "api",
+          build: ".",
+          dockerfile: "Dockerfile",
+          buildArgs: { APP_PACKAGE: "@myorg/api" },
+          advanced: { buildArgTemplateKeys: ["APP_PACKAGE"] },
+        },
+      ]);
+
+      expect(writes).toHaveLength(1);
+      expect(writes[0].buildArgs).toEqual(expected);
+      expect(writes[0].advanced).toEqual({
+        environmentTemplateKeys: [],
+        buildArgTemplateKeys: expectedTemplateKeys,
+      });
+      expect((writes[0].importedSpec as Record<string, unknown>).buildArgs).toEqual({
+        APP_PACKAGE: "@myorg/api",
+      });
+    },
+  );
 });

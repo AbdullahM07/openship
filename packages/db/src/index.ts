@@ -22,14 +22,12 @@ export type {
   IncomingWebhookAuthMode,
 } from "./schema/incoming-webhook";
 export { INCIDENT_KINDS, type IncidentKind } from "./schema/service-incident";
-export {
-  RESOURCE_BUCKET_MINUTES,
-  SINGLE_APP_SERVICE_KEY,
-} from "./schema/resource-usage";
+export { RESOURCE_BUCKET_MINUTES, SINGLE_APP_SERVICE_KEY } from "./schema/resource-usage";
 
 // ─── Dump / restore (team-mode migration + project transfer) ─────────────────
 export {
   dumpSubgraph,
+  countInstanceSubgraphTables,
   restoreSubgraph,
   deleteProjectSubgraph,
   dumpDatabase,
@@ -37,11 +35,14 @@ export {
   DUMP_FORMAT_VERSION,
   PkCollisionError,
   ENCRYPTED_COLUMNS,
+  EXCLUDED_TABLES,
+  topoOrderedTables,
   stripEncryptedInPlace,
   type DatabaseDump,
   type DumpOptions,
   type RestoreOptions,
   type SubgraphScope,
+  type TableSpec,
 } from "./dump";
 
 // ─── Repositories (all DB access goes through here) ──────────────────────────
@@ -51,6 +52,7 @@ export {
   createSessionRepo,
   createAccountRepo,
   createGitInstallationRepo,
+  createGitSourceRepo,
   createProjectGroupRepo,
   createProjectRepo,
   createDeploymentRepo,
@@ -76,6 +78,8 @@ export {
   type Account,
   type GitInstallation,
   type NewGitInstallation,
+  type GitSource,
+  type NewGitSource,
   type ProjectGroup,
   type NewProjectGroup,
   type Project,
@@ -133,6 +137,7 @@ export {
   type NewBackupRestore,
   type BackupRunStatus,
   type BackupRestoreStatus,
+  type PolicyLastRunSummary,
   type DockerMigrationRun,
   type NewDockerMigrationRun,
   type DockerMigrationStatus,
@@ -149,6 +154,15 @@ export {
   type NewJob,
   type OrphanedResource,
   type NewOrphanedResource,
+  createHostPortClaimRepo,
+  HostPortClaimConflictError,
+  HOST_PORT_QUARANTINE_OWNER,
+  type HostPortClaim,
+  type NewHostPortClaim,
+  type HostPortTargetKey,
+  type HostPortClaimIdentity,
+  type HostPortClaimOwner,
+  type PruneHostPortClaimsInput,
   type ResourceGrant,
   type Permission,
   type ResourceType,

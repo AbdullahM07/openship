@@ -3,6 +3,7 @@ import {
   buildPortProbeCommand,
   parseListeningPorts,
   parsePortProbeOutput,
+  probePortListeningOnce,
   waitForPortFree,
   waitForPortListening,
   type PortProbeExecutor,
@@ -61,54 +62,47 @@ describe("parseListeningPorts", () => {
   });
 });
 describe("parsePortProbeOutput", () => {
-  test("parses procfs output with matching port", () => {
-    const out = `${HEADER}\n${IPV4_LISTEN_3000}\n`;
-    expect(parsePortProbeOutput(out, 3000)).toBe(true);
-    expect(parsePortProbeOutput(out, 9999)).toBe(false);
+  test("parses only explicit probe results", () => {
+    expect(parsePortProbeOutput("__OPENSHIP_PORT_LISTENING__\n")).toBe(true);
+    expect(parsePortProbeOutput("__OPENSHIP_PORT_FREE__\n")).toBe(false);
+    expect(parsePortProbeOutput("__OPENSHIP_PORT_UNAVAILABLE__\n")).toBeNull();
   });
 
-  test("parses lsof single PID output as listening", () => {
-    expect(parsePortProbeOutput("13917\n", 80)).toBe(true);
-  });
-
-  test("parses lsof multiple PIDs output as listening", () => {
-    expect(parsePortProbeOutput("13917\n13918\n", 80)).toBe(true);
-  });
-
-  test("parses __FREE__ sentinel as not listening", () => {
-    expect(parsePortProbeOutput("__FREE__\n", 80)).toBe(false);
-  });
-
-  test("parses ss __LISTEN__ sentinel as listening", () => {
-    expect(parsePortProbeOutput("__LISTEN__\n", 80)).toBe(true);
-  });
-
-  test("returns false for empty or header-only procfs dump (no port listening)", () => {
-    expect(parsePortProbeOutput("", 80)).toBe(false);
-    expect(parsePortProbeOutput(HEADER, 80)).toBe(false);
-    expect(parsePortProbeOutput("   \n", 80)).toBe(false);
-  });
-
-  test("returns null for __UNAVAILABLE__", () => {
-    expect(parsePortProbeOutput("__UNAVAILABLE__", 80)).toBeNull();
+  test("treats empty or unexpected output as inconclusive", () => {
+    expect(parsePortProbeOutput("")).toBeNull();
+    expect(parsePortProbeOutput("13917\n")).toBeNull();
+    expect(parsePortProbeOutput("permission denied\n")).toBeNull();
   });
 });
 
 describe("buildPortProbeCommand", () => {
-  test("generates probe script referencing procfs, lsof, ss, and unavailable fallback", () => {
+  test("generates a guarded lsof and ss fallback", () => {
     const cmd = buildPortProbeCommand(80);
-    expect(cmd).toContain("/proc/net/tcp");
-    expect(cmd).toContain("lsof -ti \"tcp:80\"");
-    expect(cmd).toContain("ss -tln sport = \":80\"");
-    expect(cmd).toContain("__FREE__");
-    expect(cmd).toContain("__UNAVAILABLE__");
+    expect(cmd).toContain("lsof -nP -t -iTCP:80 -sTCP:LISTEN");
+    expect(cmd).toContain('ss -tln "sport = :80"');
+    expect(cmd).toContain("__OPENSHIP_PORT_FREE__");
+    expect(cmd).toContain("__OPENSHIP_PORT_UNAVAILABLE__");
+  });
+
+  test("rejects values that are not valid TCP ports before shell interpolation", () => {
+    expect(() => buildPortProbeCommand(0)).toThrow(RangeError);
+    expect(() => buildPortProbeCommand(65_536)).toThrow(RangeError);
+    expect(() => buildPortProbeCommand(Number.NaN)).toThrow(RangeError);
   });
 });
-
 
 /** A stub executor whose exec returns a fixed dump (or throws). */
 function stubExecutor(behavior: () => Promise<string>): PortProbeExecutor {
   return { exec: () => behavior() };
+}
+
+function fallbackExecutor(output: string): PortProbeExecutor {
+  return {
+    exec: async (command) => {
+      if (command.startsWith("cat /proc/net/")) throw new Error("procfs unavailable");
+      return output;
+    },
+  };
 }
 
 describe("waitForPortListening", () => {
@@ -139,7 +133,7 @@ describe("waitForPortListening", () => {
     });
   });
   test("handles macOS lsof listening PID output", async () => {
-    const exec = stubExecutor(async () => "13917\n");
+    const exec = fallbackExecutor("__OPENSHIP_PORT_LISTENING__\n");
     expect(await waitForPortListening(exec, 80, { timeoutMs: 150, intervalMs: 50 })).toEqual({
       listening: true,
       checked: true,
@@ -147,7 +141,7 @@ describe("waitForPortListening", () => {
   });
 
   test("handles macOS lsof __FREE__ output", async () => {
-    const exec = stubExecutor(async () => "__FREE__\n");
+    const exec = fallbackExecutor("__OPENSHIP_PORT_FREE__\n");
     expect(await waitForPortListening(exec, 80, { timeoutMs: 150, intervalMs: 50 })).toEqual({
       listening: false,
       checked: true,
@@ -155,7 +149,7 @@ describe("waitForPortListening", () => {
   });
 
   test("treats __UNAVAILABLE__ or missing output as inconclusive", async () => {
-    const exec = stubExecutor(async () => "__UNAVAILABLE__\n");
+    const exec = fallbackExecutor("__OPENSHIP_PORT_UNAVAILABLE__\n");
     expect(await waitForPortListening(exec, 80, { timeoutMs: 150, intervalMs: 50 })).toEqual({
       listening: false,
       checked: false,
@@ -165,7 +159,7 @@ describe("waitForPortListening", () => {
 
 describe("waitForPortFree", () => {
   test("returns {free:true, checked:true} when __FREE__ is returned", async () => {
-    const exec = stubExecutor(async () => "__FREE__\n");
+    const exec = fallbackExecutor("__OPENSHIP_PORT_FREE__\n");
     expect(await waitForPortFree(exec, 80, { timeoutMs: 150, intervalMs: 50 })).toEqual({
       free: true,
       checked: true,
@@ -173,7 +167,7 @@ describe("waitForPortFree", () => {
   });
 
   test("returns {free:false, checked:true} when port remains occupied via lsof PID", async () => {
-    const exec = stubExecutor(async () => "13917\n");
+    const exec = fallbackExecutor("__OPENSHIP_PORT_LISTENING__\n");
     expect(await waitForPortFree(exec, 80, { timeoutMs: 150, intervalMs: 50 })).toEqual({
       free: false,
       checked: true,
@@ -181,10 +175,46 @@ describe("waitForPortFree", () => {
   });
 
   test("returns {free:false, checked:false} when probe is inconclusive", async () => {
-    const exec = stubExecutor(async () => "__UNAVAILABLE__\n");
+    const exec = fallbackExecutor("__OPENSHIP_PORT_UNAVAILABLE__\n");
     expect(await waitForPortFree(exec, 80, { timeoutMs: 150, intervalMs: 50 })).toEqual({
       free: false,
       checked: false,
     });
+  });
+});
+
+describe("probePortListeningOnce", () => {
+  test("is inconclusive when both procfs address-family reads fail", async () => {
+    const executor: PortProbeExecutor = {
+      exec: async () => {
+        throw new Error("permission denied");
+      },
+    };
+
+    await expect(probePortListeningOnce(executor, 443)).resolves.toBeNull();
+  });
+
+  test("uses the readable family when only the other procfs read fails", async () => {
+    const executor: PortProbeExecutor = {
+      exec: async (command) => {
+        if (command.includes("tcp6")) throw new Error("missing");
+        return `${HEADER}\n${IPV4_LISTEN_3000}\n`;
+      },
+    };
+
+    await expect(probePortListeningOnce(executor, 3000)).resolves.toBe(true);
+    await expect(probePortListeningOnce(executor, 9999)).resolves.toBe(false);
+  });
+
+  test("uses the portable fallback when procfs is unavailable", async () => {
+    await expect(
+      probePortListeningOnce(fallbackExecutor("__OPENSHIP_PORT_LISTENING__\n"), 80),
+    ).resolves.toBe(true);
+    await expect(
+      probePortListeningOnce(fallbackExecutor("__OPENSHIP_PORT_FREE__\n"), 80),
+    ).resolves.toBe(false);
+    await expect(
+      probePortListeningOnce(fallbackExecutor("__OPENSHIP_PORT_UNAVAILABLE__\n"), 80),
+    ).resolves.toBeNull();
   });
 });

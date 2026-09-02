@@ -15,6 +15,12 @@
  */
 
 import { Type, type Static } from "@sinclair/typebox";
+import { EnvironmentScopeSchema } from "../../lib/environment-scope";
+import {
+  MAX_GENERATED_CONFIG_FILES,
+  MAX_GENERATED_CONFIG_FILE_BYTES,
+  MAX_GENERATED_CONFIG_PATH_BYTES,
+} from "../../lib/generated-config-files";
 import { MonorepoSubAppFieldsSchema } from "../projects/project.schema";
 
 export const ServiceIdParam = Type.Object({
@@ -67,6 +73,7 @@ const AdvancedSchema = Type.Object(
     // alone" so a partial caller can't wipe the rest of the blob, which makes an
     // explicit `null` the way to say "remove this one".
     healthcheck: Type.Optional(Type.Union([HealthcheckSchema, Type.Null()])),
+    monitoringEnabled: Type.Optional(Type.Union([Type.Boolean(), Type.Null()])),
     /**
      * Per-service DEPLOY-TIME readiness gate, overriding the project's for this
      * service (mirrors OpenshipReadiness in @repo/core). Absent ⇒ inherit the
@@ -86,11 +93,36 @@ const AdvancedSchema = Type.Object(
             timeoutSeconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 600 })),
             stabilization: Type.Optional(Type.Boolean()),
             stabilizationSeconds: Type.Optional(Type.Integer({ minimum: 1, maximum: 600 })),
-            onFailure: Type.Optional(
-              Type.Union([Type.Literal("warn"), Type.Literal("fail")]),
-            ),
+            onFailure: Type.Optional(Type.Union([Type.Literal("warn"), Type.Literal("fail")])),
           },
           { additionalProperties: false },
+        ),
+        Type.Null(),
+      ]),
+    ),
+    /** Generated config files written on the deploy host and bind-mounted
+     * read-only into the container. App installs already persist this shape in
+     * the same JSONB field; accepting it here keeps create/update capable of
+     * restoring or editing those files. `null` removes all generated files. */
+    files: Type.Optional(
+      Type.Union([
+        Type.Array(
+          Type.Object(
+            {
+              // Docker bind targets must be absolute. Colons delimit the
+              // source:target:mode tuple; control characters are never useful
+              // in a config path. Normalization/traversal and duplicate checks
+              // also run in the service layer and again at deploy time.
+              path: Type.String({
+                minLength: 2,
+                maxLength: MAX_GENERATED_CONFIG_PATH_BYTES,
+                pattern: "^/[^:\\u0000-\\u001F\\u007F]+$",
+              }),
+              content: Type.String({ maxLength: MAX_GENERATED_CONFIG_FILE_BYTES }),
+            },
+            { additionalProperties: false },
+          ),
+          { maxItems: MAX_GENERATED_CONFIG_FILES },
         ),
         Type.Null(),
       ]),
@@ -137,10 +169,15 @@ const AdvancedSchema = Type.Object(
      * (back to the image default).
      */
     entrypoint: Type.Optional(
-      Type.Union([
-        Type.Array(Type.String({ maxLength: 2000 }), { maxItems: 100 }),
-        Type.Null(),
-      ]),
+      Type.Union([Type.Array(Type.String({ maxLength: 2000 }), { maxItems: 100 }), Type.Null()]),
+    ),
+    /** Names-only provenance for raw Compose build-arg expressions. It must
+     * round-trip with a service so a read/edit/write cannot turn an escaped
+     * literal `$` into a second interpolation at deploy time. */
+    buildArgTemplateKeys: Type.Optional(
+      Type.Array(Type.String({ pattern: "^[A-Za-z_][A-Za-z0-9_]*$" }), {
+        maxItems: 500,
+      }),
     ),
   },
   { additionalProperties: false },
@@ -155,6 +192,7 @@ const ComposeFieldsBlock = {
   image: Type.Optional(Type.String({ maxLength: 500 })),
   build: Type.Optional(Type.String({ maxLength: 500 })),
   dockerfile: Type.Optional(Type.String({ maxLength: 500 })),
+  buildArgs: Type.Optional(Type.Record(Type.String(), Type.Union([Type.String(), Type.Null()]))),
   ports: Type.Optional(Type.Array(Type.String({ maxLength: 100 }), { maxItems: 50 })),
   dependsOn: Type.Optional(Type.Array(Type.String({ maxLength: 120 }), { maxItems: 50 })),
   environment: Type.Optional(Type.Record(Type.String(), Type.String())),
@@ -293,11 +331,20 @@ export const SyncServicesBody = Type.Object({
           Type.String({ description: "Build context, relative to the compose file." }),
         ),
         dockerfile: Type.Optional(Type.String()),
+        buildArgs: Type.Optional(
+          Type.Record(Type.String(), Type.Union([Type.String(), Type.Null()])),
+        ),
         ports: Type.Optional(
           Type.Array(Type.String(), { description: 'Compose port mappings, e.g. "8080:80".' }),
         ),
         dependsOn: Type.Optional(Type.Array(Type.String())),
         environment: Type.Optional(Type.Record(Type.String(), Type.String())),
+        environmentTemplates: Type.Optional(
+          Type.Record(Type.String(), Type.String(), {
+            description:
+              "Original Compose expressions keyed by environment name. Optional: when omitted, Openship derives them from `$` expressions in `environment` using the same parser as repository imports.",
+          }),
+        ),
         volumes: Type.Optional(Type.Array(Type.String())),
         command: Type.Optional(
           Type.String({
@@ -366,14 +413,11 @@ export const SyncServicesBody = Type.Object({
 
 export const SetServiceEnvVarsBody = Type.Object(
   {
-    environment: Type.Union([
-      Type.Literal("production"),
-      Type.Literal("preview"),
-      Type.Literal("development"),
-    ]),
+    environment: EnvironmentScopeSchema,
     vars: Type.Array(
       Type.Object(
         {
+          sourceId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
           key: Type.String({ minLength: 1, maxLength: 256 }),
           value: Type.String({ maxLength: 10000 }),
           isSecret: Type.Optional(Type.Boolean({ default: false })),

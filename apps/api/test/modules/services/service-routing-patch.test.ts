@@ -53,7 +53,11 @@ vi.mock("../../../src/lib/controller-helpers", async (importOriginal) => {
   return { ...actual, platform: () => ({ runtime: { name: "docker" } }) };
 });
 
-import { createService, updateService } from "../../../src/modules/services/service.service";
+import {
+  acceptServiceDrift,
+  createService,
+  updateService,
+} from "../../../src/modules/services/service.service";
 
 const ctx = { organizationId: "org_1" } as never;
 const project = { id: "proj_1", organizationId: "org_1", slug: "acme" };
@@ -116,6 +120,20 @@ describe("service routing patch", () => {
       ?.removes ?? []).map((r) => r.hostname);
 
   it("persists a scalar custom-domain patch and keeps the sibling route", async () => {
+    const updated = {
+      ...multiRouteService(),
+      domainType: "custom",
+      domain: null,
+      customDomain: "api.example.com",
+      publicEndpoints: [
+        { port: 3210, domainType: "custom", customDomain: "api.example.com" },
+        { port: 3211, domainType: "free", domain: "acme-backend-http" },
+      ],
+    };
+    serviceRepo.findById
+      .mockResolvedValueOnce(multiRouteService())
+      .mockResolvedValueOnce(updated);
+
     await updateService(ctx, project.id, "svc_1", {
       domainType: "custom",
       customDomain: "api.example.com",
@@ -131,6 +149,15 @@ describe("service routing patch", () => {
       { port: 3210, domainType: "custom", customDomain: "api.example.com" },
       { port: 3211, domainType: "free", domain: "acme-backend-http" },
     ]);
+    // Saving a service route materializes the same persisted Domain row used by
+    // project domains. DNS preview/apply therefore stays in domain.service;
+    // updateService neither duplicates nor silently invokes provider writes.
+    expect(domainService.ensurePendingServiceDomain).toHaveBeenCalledWith({
+      projectId: project.id,
+      serviceId: "svc_1",
+      hostname: "api.example.com",
+      targetPort: 3210,
+    });
   });
 
   it("does not gate a custom-domain save on the free routes the row already had", async () => {
@@ -297,6 +324,73 @@ describe("service routing patch", () => {
       { port: 80, customDomain: "web.example.com", domainType: "custom" },
     ]);
     expect(serviceRepo.create).toHaveBeenCalled();
+  });
+
+  it("persists build args when a service is created manually (#689)", async () => {
+    await createService(ctx, project.id, {
+      name: "api",
+      build: ".",
+      dockerfile: "Dockerfile",
+      buildArgs: { APP_PACKAGE: "@myorg/api", FROM_ENV: null },
+    } as never);
+
+    expect(serviceRepo.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        buildArgs: { APP_PACKAGE: "@myorg/api", FROM_ENV: null },
+        advanced: { buildArgTemplateKeys: [] },
+      }),
+    );
+  });
+
+  it("makes a manual build-arg update literal without dropping other advanced config", async () => {
+    serviceRepo.findById.mockResolvedValue({
+      ...multiRouteService(),
+      buildArgs: { HOME_REF: "${HOME}" },
+      advanced: {
+        buildArgTemplateKeys: ["HOME_REF"],
+        readiness: { enabled: true },
+      },
+    });
+
+    await updateService(ctx, project.id, "svc_1", {
+      buildArgs: { HOME_REF: "$HOME" },
+    } as never);
+
+    expect(serviceRepo.update).toHaveBeenCalledWith(
+      "svc_1",
+      expect.objectContaining({
+        buildArgs: { HOME_REF: "$HOME" },
+        advanced: {
+          buildArgTemplateKeys: [],
+          readiness: { enabled: true },
+        },
+      }),
+    );
+  });
+
+  it("applies build args when an upstream drift is accepted (#689)", async () => {
+    const drifted = {
+      ...multiRouteService(),
+      build: ".",
+      dockerfile: "Dockerfile",
+      buildArgs: { APP_PACKAGE: "@myorg/old" },
+      importedSpec: { buildArgs: { APP_PACKAGE: "@myorg/old" } },
+      driftSpec: { buildArgs: { APP_PACKAGE: "@myorg/api" } },
+    };
+    serviceRepo.findById
+      .mockResolvedValueOnce(drifted)
+      .mockResolvedValueOnce({
+        ...drifted,
+        buildArgs: { APP_PACKAGE: "@myorg/api" },
+        driftSpec: null,
+      });
+
+    await acceptServiceDrift(ctx, project.id, "svc_1");
+
+    expect(serviceRepo.update).toHaveBeenCalledWith(
+      "svc_1",
+      expect.objectContaining({ buildArgs: { APP_PACKAGE: "@myorg/api" } }),
+    );
   });
 
   // #424: a container answers to BOTH its name and its custom alias on the
