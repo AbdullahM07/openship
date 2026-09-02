@@ -88,6 +88,7 @@ import {
   syncProjectRouteState,
 } from "../domains/project-route.service";
 import { kickoffBuild, resolveServicePipelineMode } from "./build-pipeline";
+import { assertExactServiceTargets } from "./exact-service-targets";
 import {
   resolveReleaseDist,
   resolveReleaseVersion,
@@ -338,6 +339,10 @@ export interface DeploymentConfigSnapshot {
    * with `status='skipped'` so the fan-out has a complete record.
    */
   targetServiceIds?: string[];
+  /** Force registry-backed images to be pulled even when the same mutable tag
+   * already exists locally. This is deployment intent, not durable project
+   * configuration, and is cleared when a snapshot is reused. */
+  forcePullImages?: boolean;
   /**
    * `targetServiceIds` is an EXCLUSIVE scope, not just a build subset: a service outside
    * it is never deployed, never failed and never reaped.
@@ -1079,11 +1084,17 @@ export async function requestBuildAccess(
   input: BuildAccessInput,
   /**
    * INTERNAL-only options — deliberately a second argument rather than fields on
-   * `BuildAccessInput`, which is the wire body. `strictServiceScope` decides whether a
-   * service OUTSIDE the requested scope may be touched, so a client that could set it
-   * could scope any project's deploy exclusively; only server-side callers get to say it.
+   * `BuildAccessInput`, which is the wire body. These values can change which services
+   * are touched or bypass normal artifact acquisition, so only server-side callers get
+   * to set them.
    */
-  internal?: { strictServiceScope?: boolean },
+  internal?: {
+    strictServiceScope?: boolean;
+    /** One-time migration image pins, keyed by canonical service name. */
+    handoverImages?: Record<string, string>;
+    /** Single-app counterpart to `handoverImages`. */
+    handoverAppImage?: string;
+  },
 ) {
   const {
     projectId,
@@ -1099,7 +1110,6 @@ export async function requestBuildAccess(
     services,
     serviceIds,
     refreshServiceIds,
-    handoverImages,
     cloudResourceTier,
     cloudResourceCustom,
     cloneStrategy,
@@ -1168,6 +1178,40 @@ export async function requestBuildAccess(
   // declared compose file behind the caller's back.
   if (serviceDeploymentMode !== "single") {
     await reconcileComposeSource(ctx, project, resolvedBranch);
+  }
+
+  // Migration handover refs bypass build/pull, so they are both internal-only
+  // and validated before any route or deployment write. The map is
+  // keyed by the canonical service name consumed by pinnedServiceImage; a typo
+  // must fail closed instead of silently rebuilding a transferred image.
+  const handoverImages = internal?.handoverImages;
+  const handoverAppImage = internal?.handoverAppImage?.trim();
+  if (
+    (handoverImages && Object.keys(handoverImages).length > 0) ||
+    internal?.handoverAppImage !== undefined
+  ) {
+    const persistedServices = await listProjectComposeServices(project.id);
+    const knownServiceNames = new Set([
+      ...persistedServices.map((service) => service.name),
+      ...(effectiveServices ?? []).map((service) => service.name),
+    ]);
+    const invalidEntries = Object.entries(handoverImages ?? {}).filter(
+      ([name, ref]) => !knownServiceNames.has(name) || !ref.trim() || ref.trim().startsWith("/"),
+    );
+    if (invalidEntries.length > 0) {
+      throw new AppError(
+        `Invalid migration image handover for service${invalidEntries.length === 1 ? "" : "s"}: ${invalidEntries
+          .map(([name]) => name)
+          .join(", ")}`,
+        400,
+      );
+    }
+    if (
+      internal?.handoverAppImage !== undefined &&
+      (!handoverAppImage || handoverAppImage.startsWith("/"))
+    ) {
+      throw new AppError("Invalid migration application image handover", 400);
+    }
   }
 
   // #336: the wizard sees compose env MASKED, so a deploy request can echo the
@@ -1264,8 +1308,11 @@ export async function requestBuildAccess(
   // transferred/running image with no build/pull. Only ever set by the migration
   // orchestrator's first deploy; a normal deploy leaves it unset → native build/pull.
   if (handoverImages && Object.keys(handoverImages).length > 0) {
-    snapshot.handoverImages = handoverImages;
+    snapshot.handoverImages = Object.fromEntries(
+      Object.entries(handoverImages).map(([name, ref]) => [name, ref.trim()]),
+    );
   }
+  if (handoverAppImage) snapshot.handoverAppImage = handoverAppImage;
   if (requestedServiceMode === "services" && effectiveServices?.length) {
     snapshot.composeServices = effectiveServices;
     // Persist compose services to the canonical service table NOW, at
@@ -1898,6 +1945,14 @@ export async function triggerDeployment(
      * has a complete fan-out record for this deployment.
      */
     serviceIds?: string[];
+    /** Internal deployment intent used by scoped incoming webhooks. Persisted
+     * on this deployment's worker snapshot; deliberately not exposed by the
+     * HTTP deployment controller. */
+    forcePullImages?: boolean;
+    /** Internal exclusive target scope. When true, services outside an
+     * explicit serviceIds set are never started as a fallback when there is no
+     * prior deployment to carry forward. */
+    strictServiceScope?: boolean;
     /**
      * How the rollback artifact for THIS deployment is preserved.
      * `'snapshot'` (default) → archive image + workspace.
@@ -2052,8 +2107,25 @@ export async function triggerDeployment(
   // repo scan when the push didn't touch the compose file. Existing projects
   // reconcile best-effort; a declared compose project with no rows is strict so
   // it cannot silently fall through with an empty service set.
+  if (data.strictServiceScope && !data.serviceIds?.length) {
+    throw new AppError("An exact deployment scope requires at least one service ID", 400);
+  }
+
   if (!data.reuseSnapshot && data.trigger !== "rollback") {
     await reconcileComposeSource(ctx, project, branch, data.changedPaths);
+  }
+
+  // Scoped internal callers (incoming deploy hooks) require an exact target
+  // set. Re-check after compose reconciliation because that step can remove,
+  // replace, or disable service rows after the hook-level validation ran. A
+  // stale ID must fail before a deployment row is queued, never degrade into a
+  // partial or broader deployment.
+  if (data.strictServiceScope && data.serviceIds?.length) {
+    try {
+      assertExactServiceTargets(await repos.service.listByProject(project.id), data.serviceIds);
+    } catch (err) {
+      throw new AppError(safeErrorMessage(err), 400);
+    }
   }
 
   // ATOMIC rollback path: reuse the target deployment's frozen snapshot verbatim
@@ -2063,6 +2135,11 @@ export async function triggerDeployment(
   const snapshot = reuse
     ? ({ ...reuse.meta } as DeploymentConfigSnapshot)
     : buildConfigSnapshot(project, branch);
+  // This is an instruction for THIS run, not release configuration. In
+  // particular, a rollback that reuses a snapshot from an incoming webhook
+  // must not inherit its force-pull behavior.
+  if (data.forcePullImages) snapshot.forcePullImages = true;
+  else delete snapshot.forcePullImages;
   const routeState = await resolveProjectRouteState(project);
 
   // Resolve the snapshot's target (deployTarget + serverId + runtimeMode) from
@@ -2292,6 +2369,7 @@ export async function triggerDeployment(
     forceAll: finalForceAll,
     serviceIds: finalServiceIds,
     refreshServiceIds,
+    strictServiceScope: data.strictServiceScope,
     changedPaths: resolvedChangedPaths ?? null,
   });
 

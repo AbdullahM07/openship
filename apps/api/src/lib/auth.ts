@@ -130,6 +130,16 @@ export const auth = betterAuth({
   // (see resolveAuthBaseUrl). Static runtimeTarget.api otherwise (cloud/dev).
   baseURL: resolveAuthBaseUrl(),
 
+  // Better Auth's production fallback sends browser-flow failures to
+  // `/?error=...`. That lands inside the dashboard/session redirects, where the
+  // query is lost and an MCP client registration failure looks like a blank
+  // login page. Keep OAuth errors on a public, purpose-built dashboard page.
+  // Better Auth forwards the URL-encoded `error` and `error_description` params;
+  // the dashboard bounds them and renders them as text.
+  onAPIError: {
+    errorURL: `${resolveDashboardPublicUrl()}/auth/error`,
+  },
+
   database: drizzleAdapter(db, {
     provider: "pg",
     schema: {

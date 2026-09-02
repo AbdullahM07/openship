@@ -1182,7 +1182,7 @@ async function executeBuildAndDeploy(
           // An explicit update is the one operation that promises to refresh a
           // mutable upstream ref. Versioned release refs are otherwise reused
           // when already present on the target.
-          forcePull: dep.trigger === "update",
+          forcePull: dep.trigger === "update" || snapshot.forcePullImages === true,
         },
         logger,
       );
