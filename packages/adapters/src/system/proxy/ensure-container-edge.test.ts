@@ -53,7 +53,7 @@ interface BoxOpts {
    * Flips the pull gate: present ⇒ no pull, absent (prod) ⇒ pull.
    */
   imagePresent?: boolean;
-  /** Physical path returned by `cd <host> && pwd -P`, keyed by logical host path. */
+  /** Physical path returned by the batched mount-resolve exec, keyed by logical host path. */
   canonicalMounts?: Record<string, string>;
   /** Bind sources reported by Docker for an existing edge, keyed by container path. */
   mountedSources?: Record<string, string>;
@@ -123,9 +123,11 @@ function box(opts: BoxOpts = {}) {
       }).join("\n");
     }
     if (cmd.startsWith("docker inspect")) return "";
-    if (cmd.startsWith("cd ") && cmd.endsWith(" && pwd -P")) {
-      const logical = EDGE_CONTAINER_MOUNTS.find((mount) => cmd.includes(`'${mount.host}'`))?.host;
-      return logical ? (opts.canonicalMounts?.[logical] ?? logical) : "";
+    // The batched mount resolve — one exec answers all four `pwd -P`s (#774).
+    if (cmd.includes("pwd -P")) {
+      return EDGE_CONTAINER_MOUNTS.map(
+        (mount) => `__OPENSHIP_MOUNT__\n${opts.canonicalMounts?.[mount.host] ?? mount.host}\n`,
+      ).join("");
     }
     if (cmd.startsWith("docker logs")) return opts.crashLog ?? "";
     if (cmd.startsWith("docker rm -f") || cmd.startsWith("docker stop")) {
@@ -267,17 +269,21 @@ describe("buildEdgeRunCommand", () => {
 });
 
 describe("resolveEdgeContainerMounts", () => {
+  /** Output of the batched resolve script: one marker line, then that mount's segment. */
+  const batchOutput = (segments: string[]) =>
+    segments.map((s) => `__OPENSHIP_MOUNT__\n${s}\n`).join("");
+
+  const canonical = [
+    "/private/var/lib/openship/edge/sites-enabled",
+    "/private/etc/letsencrypt",
+    "/private/var/lib/openship/edge/acme",
+    "/opt/openship/static",
+  ];
+
   it("canonicalizes on the executor's host, not in the API process (#692)", async () => {
     const exec = vi.fn(async (command: string) => {
-      if (command.includes("'/var/lib/openship/edge/sites-enabled'")) {
-        return "/private/var/lib/openship/edge/sites-enabled\n";
-      }
-      if (command.includes("'/var/lib/openship/edge/acme'")) {
-        return "/private/var/lib/openship/edge/acme\n";
-      }
-      if (command.includes("'/etc/letsencrypt'")) return "/private/etc/letsencrypt\n";
-      if (command.includes("'/opt/openship/static'")) return "/opt/openship/static\n";
-      throw new Error(`unexpected command: ${command}`);
+      if (!command.includes("pwd -P")) throw new Error(`unexpected command: ${command}`);
+      return batchOutput(canonical);
     });
 
     await expect(resolveEdgeContainerMounts({ exec })).resolves.toEqual([
@@ -289,9 +295,52 @@ describe("resolveEdgeContainerMounts", () => {
       { host: "/private/var/lib/openship/edge/acme", container: "/var/www/acme" },
       { host: "/opt/openship/static", container: "/opt/openship/static" },
     ]);
-    expect(exec).toHaveBeenCalledWith(
-      "cd '/var/lib/openship/edge/sites-enabled' && pwd -P",
+  });
+
+  // 4 concurrent execs are 4 concurrent channels on ONE multiplexed SSH
+  // connection, and sshd hardened to `MaxSessions 3` rejects the fourth —
+  // failing edge recovery on any CIS-baseline host.
+  it("resolves every mount through a single exec (#774)", async () => {
+    const exec = vi.fn(async (_command: string) => batchOutput(canonical));
+
+    await resolveEdgeContainerMounts({ exec });
+
+    expect(exec).toHaveBeenCalledTimes(1);
+    const command = exec.mock.calls[0][0];
+    for (const mount of EDGE_CONTAINER_MOUNTS) {
+      expect(command).toContain(`(cd '${mount.host}' && pwd -P) 2>&1`);
+    }
+  });
+
+  it("names the failing mount and carries the shell's own words", async () => {
+    const exec = vi.fn(async () =>
+      batchOutput([
+        canonical[0],
+        canonical[1],
+        "sh: 1: cd: can't cd to /var/lib/openship/edge/acme",
+        canonical[3],
+      ]),
     );
+
+    await expect(resolveEdgeContainerMounts({ exec })).rejects.toThrow(
+      /source \/var\/lib\/openship\/edge\/acme .*can't cd/,
+    );
+  });
+
+  it("reports a transport failure without inventing a per-mount cause", async () => {
+    const exec = vi.fn(async () => {
+      throw new Error("(SSH) Channel open failure: open failed");
+    });
+
+    await expect(resolveEdgeContainerMounts({ exec })).rejects.toThrow(
+      /bind-mount sources on the target host: .*Channel open failure/,
+    );
+  });
+
+  it("rejects a garbled batch instead of mismapping paths to mounts", async () => {
+    const exec = vi.fn(async () => batchOutput(canonical.slice(0, 2)));
+
+    await expect(resolveEdgeContainerMounts({ exec })).rejects.toThrow(/expected 4 paths/);
   });
 });
 
