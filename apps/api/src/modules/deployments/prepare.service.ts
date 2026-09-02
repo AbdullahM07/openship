@@ -822,9 +822,9 @@ export async function resolveFromReader(
 
   // Also logged server-side, because the response field only reaches a caller
   // that asked for a scan. A push-to-deploy asks for none: the pipeline runs off
-  // a frozen snapshot and only re-resolves here via reconcileComposeDrift, which
-  // returns early for anything that isn't a GitHub-source COMPOSE project. So a
-  // pushed single-app deploy still gets no signal at all — see #641's discussion
+  // a frozen snapshot and only re-resolves here via reconcileComposeSource, which
+  // returns early for anything that isn't a local/Git-backed COMPOSE project. So
+  // a pushed single-app deploy still gets no signal at all — see #641's discussion
   // of why replaying onto the BuildLogger would have to be stale or re-fetch.
   if (openship.diagnostics) {
     console.warn(

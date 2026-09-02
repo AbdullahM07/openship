@@ -209,8 +209,9 @@ async function writeEnvFile(
       // whole rest of the line verbatim as the value.
       .map(([k, v]) => `${k}=${v}`)
       .join("\n") + "\n";
-  await executor.writeFile(path, body);
-  await executor.exec(`chmod 600 ${sq(path)}`).catch(() => {});
+  // Born private, not tightened after publication. The privileged executor's
+  // private staging path carries this mode through its root-owned rename.
+  await executor.writeFile(path, body, { mode: 0o600 });
 }
 
 const ENGINE_ENV_FILE = `${MAIL_HOST_STATE_DIR}/engine.env`;
@@ -223,7 +224,7 @@ const DB_ENV_FILE = `${MAIL_HOST_STATE_DIR}/db.env`;
  * process, before it ever reaches the daemon socket — so it has to be readable by whoever
  * invokes docker, and being in the `docker` group grants the socket, not the file. The
  * elevated write publishes these root:root (`writeFile` chowns 0:0 so the `mv` cannot leave
- * the file writable by the login user) and `writeEnvFile` chmods 600, which on a non-root
+ * the file writable by the login user) and `writeEnvFile` creates it as 0600, which on a non-root
  * login is exactly unreadable. Setting up mail died with `docker: --env-file: open
  * /var/lib/openship/mail/db.env: permission denied`, surfaced as the unrelated-sounding
  * "the mail database container failed to become ready".

@@ -26,6 +26,7 @@ import { describe, expect, it } from "vitest";
 const src = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
 
 const buildService = src("../build.service.ts");
+const buildConfig = src("../build-config.ts");
 const pipeline = src("./pipeline.ts");
 const deployService = src("./deploy.service.ts");
 const orchestrator = src("../../migration/migration.orchestrator.ts");
@@ -41,12 +42,13 @@ describe("strictScope reaches the compose deploy from the snapshot", () => {
 
   it("is INTERNAL-only — never a field of the wire body", () => {
     // A client that could set it could scope any project's deploy exclusively.
-    expect(buildService).toContain("internal?: { strictServiceScope?: boolean }");
+    expect(buildService).toMatch(/internal\?:\s*\{[\s\S]{0,200}strictServiceScope\?: boolean/);
     expect(buildService).toContain("strictServiceScope: internal?.strictServiceScope");
   });
 
   it("is read off the snapshot and passed into the deploy", () => {
-    expect(pipeline).toContain("strictServiceScope?: boolean");
+    expect(buildConfig).toContain("strictServiceScope?: boolean");
+    expect(pipeline).toContain('import type { BuildConfigSnapshotLike } from "../build-config"');
     expect(pipeline).toMatch(/const strictScope =[\s\S]{0,200}strictServiceScope/);
     expect(pipeline).toContain("strictScope,");
   });
@@ -66,7 +68,10 @@ describe("strictScope reaches the compose deploy from the snapshot", () => {
   });
 
   it("the migration asks for it, so its reuse set is untouchable", () => {
-    expect(orchestrator).toContain("{ strictServiceScope: true }");
+    const handover = orchestrator.indexOf("handoverImages: adopt.handover");
+    const strictScope = orchestrator.lastIndexOf("strictServiceScope: true", handover);
+    expect(strictScope).toBeGreaterThan(-1);
+    expect(handover - strictScope).toBeLessThan(2_000);
     // And still refuses an empty scope, which requestBuildAccess would drop → deploy all.
     expect(orchestrator).toContain("if (deployRowIds.length === 0)");
   });

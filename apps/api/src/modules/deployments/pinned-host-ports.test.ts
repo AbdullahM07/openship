@@ -157,6 +157,65 @@ describe("pinnedHostPortsToAvoid", () => {
     });
   });
 
+  it("repairs a missing canonical claim only when the live binding proves the carried port", async () => {
+    const canonicalClaims: Array<ReturnType<typeof storedClaim>> = [];
+    claimRepo.list.mockImplementation(async (targetKey: string) =>
+      targetKey === remoteTarget.targetKey ? canonicalClaims : [],
+    );
+    claimRepo.reserve.mockImplementation(async (input) => {
+      const claim = storedClaim("reconciled", input.targetKey, input);
+      canonicalClaims.push(claim);
+      return claim;
+    });
+
+    const result = await prepareTargetPinnedHostPorts({
+      target: remoteTarget,
+      edgeProxy: { listLoopbackUpstreamPortsStrict: async () => new Set([20008]) },
+      verifiedCarriedHostPorts: [
+        {
+          owner: { projectId: "compose", serviceId: "api", containerPort: 4000 },
+          hostPort: 20008,
+          liveHostPortByContainerPort: { 4000: 20008 },
+        },
+      ],
+    });
+
+    expect(claimRepo.reserve).toHaveBeenCalledWith({
+      targetKey: remoteTarget.targetKey,
+      projectId: "compose",
+      serviceId: "api",
+      containerPort: 4000,
+      port: 20008,
+    });
+    expect(claimRepo.quarantine).not.toHaveBeenCalled();
+    expect(result).toEqual(expect.arrayContaining([expect.objectContaining({ port: 20008 })]));
+  });
+
+  it("does not repair a cached port when the live binding disagrees", async () => {
+    const canonicalClaims: Array<ReturnType<typeof storedClaim>> = [];
+    claimRepo.list.mockImplementation(async (targetKey: string) =>
+      targetKey === remoteTarget.targetKey ? canonicalClaims : [],
+    );
+
+    await prepareTargetPinnedHostPorts({
+      target: remoteTarget,
+      edgeProxy: { listLoopbackUpstreamPortsStrict: async () => new Set([20008]) },
+      verifiedCarriedHostPorts: [
+        {
+          owner: { projectId: "compose", serviceId: "api", containerPort: 4000 },
+          hostPort: 20008,
+          liveHostPortByContainerPort: { 4000: 20000 },
+        },
+      ],
+    });
+
+    expect(claimRepo.reserve).not.toHaveBeenCalled();
+    expect(claimRepo.quarantine).toHaveBeenCalledWith({
+      targetKey: remoteTarget.targetKey,
+      port: 20008,
+    });
+  });
+
   it("blocks allocation preparation when edge inventory is inconclusive", async () => {
     const failure = new Error("edge config unreadable");
     await expect(
@@ -373,6 +432,35 @@ describe("pinnedHostPortsToAvoid", () => {
     expect(result.port).toBe(20002);
     expect(claimRepo.reserve).toHaveBeenCalledWith(
       expect.objectContaining({ targetKey: remoteTarget.targetKey, ...owner, port: 20002 }),
+    );
+  });
+
+  it("rejects a same-target legacy-cache renumber before reserving a new claim", async () => {
+    await expect(
+      allocateAndReservePinnedHostPort({
+        target: localTarget,
+        claims: [],
+        owner: { projectId: "legacy", serviceId: "api", containerPort: 3000 },
+        cachedPreferred: 20011,
+        lockPreferred: { ownerLabel: "api" },
+        allocate: async () => ({ port: 20012, scanned: true }),
+      }),
+    ).rejects.toThrow(/locked host port.*20011.*20012/);
+    expect(claimRepo.reserve).not.toHaveBeenCalled();
+  });
+
+  it("permits renumbering when the caller is migrating to another target", async () => {
+    const result = await allocateAndReservePinnedHostPort({
+      target: remoteTarget,
+      claims: [],
+      owner: { projectId: "moving", serviceId: "api", containerPort: 3000 },
+      cachedPreferred: 20011,
+      allocate: async () => ({ port: 20012, scanned: true }),
+    });
+
+    expect(result.port).toBe(20012);
+    expect(claimRepo.reserve).toHaveBeenCalledWith(
+      expect.objectContaining({ targetKey: remoteTarget.targetKey, port: 20012 }),
     );
   });
 
