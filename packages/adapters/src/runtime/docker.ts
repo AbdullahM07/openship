@@ -145,7 +145,11 @@ import {
   resolveServiceDockerfile,
 } from "./docker-build-context";
 import { BuildKitTraceDecoder } from "./docker-buildkit-trace";
-import { startExecStream, daemonConnectionFrom } from "./docker-exec-stream";
+import {
+  startExecStream,
+  daemonConnectionFrom,
+  installDockerodeBuildKitSessionWorkaround,
+} from "./docker-exec-stream";
 import { resolveComposeCmd, resolveComposeEntrypoint } from "./compose-cmd";
 import {
   dockerBuildContextDirectory,
@@ -1037,6 +1041,13 @@ export class DockerRuntime implements RuntimeAdapter {
   ): Promise<DockerRuntime> {
     const runtime = new DockerRuntime(opts, systemManager, provisionLock);
     runtime._docker = new Dockerode(await runtime.transport.establish());
+    // dockerode opens BuildKit's reverse h2c session through `node:http`; Bun
+    // rejects Docker's 101 response as UnrequestedUpgrade (#745). Keep
+    // dockerode's gRPC session implementation, but carry that one upgrade over
+    // the raw daemon connection just like service exec/attach already do.
+    if ((process.versions as NodeJS.ProcessVersions & { bun?: string }).bun) {
+      installDockerodeBuildKitSessionWorkaround(runtime._docker);
+    }
     return runtime;
   }
 
@@ -4727,6 +4738,64 @@ export class DockerRuntime implements RuntimeAdapter {
     const log = onLog ?? (() => {});
     const containerName = `openship-${config.slug}-${config.serviceName}`;
 
+    // Resolve and validate the complete create payload before any irreversible
+    // action. A malformed later port/volume/health setting must not be discovered
+    // only after the currently-serving container has already been removed.
+    const serviceEnv = splitRuntimeEnv(config.environment);
+    if (serviceEnv.dropped.length > 0) {
+      log({
+        timestamp: new Date().toISOString(),
+        level: "warn",
+        message: `[${config.serviceName}] ${droppedRuntimeEnvMessage(serviceEnv.dropped)}`,
+      });
+    }
+    const env = [
+      ...(config.publicPort && config.environment.PORT === undefined
+        ? [`PORT=${config.publicPort}`]
+        : []),
+      ...serviceEnv.entries.map(([k, v]) => `${k}=${v}`),
+    ];
+    const cmd = resolveComposeCmd(config);
+    const entrypoint = resolveComposeEntrypoint(config.advanced);
+    const sharedNetwork = config.namespaces?.network;
+    const sharesNetns = !!sharedNetwork && sharedNetwork !== "none";
+    const ownsProjectEndpoint = ownsNetworkEndpoint(sharedNetwork);
+    const sharedPid = config.namespaces?.pid;
+    const { exposedPorts, portBindings } = parsePortBindings(config.ports);
+    if (!config.namespaceVolumes) {
+      await this.assertNoForeignNamedVolumeCollision(config);
+    }
+    const scopedBinds = scopeVolumeBinds(config.slug, config.volumes, config.namespaceVolumes);
+    const binds = scopedBinds.length > 0 ? scopedBinds : undefined;
+    const restartPolicy = resolveRestartPolicy(config.restart);
+    const healthcheck = toDockerHealthcheck(config.advanced?.healthcheck);
+    const stopConfig = toStopConfig(config.advanced);
+
+    // Acquire an external image BEFORE touching the running container. This is
+    // especially important for incoming-webhook redeploys of mutable tags: a
+    // registry/auth/network failure must leave the currently-serving workload
+    // intact instead of removing it and then discovering that no replacement
+    // can be prepared.
+    if (!config.imageAlreadyPrepared) {
+      try {
+        log({
+          timestamp: new Date().toISOString(),
+          message: `Pulling image ${config.image}...\n`,
+          level: "info",
+        });
+        // Shared pull path — blocking `docker pull` over SSH so a first-time
+        // pull on a fresh remote server can't hang (followProgress-over-SSH).
+        await this.pullImage(config.image, { force: config.forcePull });
+      } catch (err) {
+        log({
+          timestamp: new Date().toISOString(),
+          message: `Failed to pull ${config.image}: ${err}\n`,
+          level: "error",
+        });
+        throw err;
+      }
+    }
+
     // Stop and remove any existing container with the same name. A container that
     // declared a shutdown grace period (compose stop_grace_period, #388) gets a
     // graceful stop first so a redeploy of e.g. Postgres flushes instead of being
@@ -4749,66 +4818,6 @@ export class DockerRuntime implements RuntimeAdapter {
     // image IS one of ours with node_modules/.bin baked into ENV PATH. The cost is
     // that a compose author who wrote `environment: PATH:` by hand no longer gets
     // `docker compose up` semantics — hence the warning rather than silence.
-    const serviceEnv = splitRuntimeEnv(config.environment);
-    if (serviceEnv.dropped.length > 0) {
-      log({
-        timestamp: new Date().toISOString(),
-        level: "warn",
-        message: `[${config.serviceName}] ${droppedRuntimeEnvMessage(serviceEnv.dropped)}`,
-      });
-    }
-    const env = [
-      ...(config.publicPort && config.environment.PORT === undefined
-        ? [`PORT=${config.publicPort}`]
-        : []),
-      ...serviceEnv.entries.map(([k, v]) => `${k}=${v}`),
-    ];
-
-    // Command (#332): argv Cmd, no implicit `sh -c` (that broke entrypoint+CMD
-    // images). See resolveComposeCmd.
-    const cmd = resolveComposeCmd(config);
-    // Entrypoint (#575) — `undefined` = keep the image's, `[]` = clear it.
-    const entrypoint = resolveComposeEntrypoint(config.advanced);
-
-    // Shared namespaces (compose `network_mode` / `pid`), pre-resolved by the
-    // deploy loop to `container:<id>` / `none`.
-    //
-    // A shared NETWORK namespace is not additive — it replaces this container's
-    // networking wholesale, and Docker refuses the combinations rather than
-    // ignoring them: a port binding, a network endpoint, or an explicit hostname
-    // alongside `NetworkMode: container:…` each fail the create. So they're
-    // dropped here, and the caller is told where the traffic has to land instead.
-    // A shared PID namespace has no such interaction: the container keeps its own
-    // interface, ports, and aliases.
-    const sharedNetwork = config.namespaces?.network;
-    /** Inside ANOTHER container's netns — it owns the interfaces AND the hostname. */
-    const sharesNetns = !!sharedNetwork && sharedNetwork !== "none";
-    /** Any declared network mode replaces the project network, so there is no
-     *  endpoint to attach and nothing a published port could reach. `none` differs
-     *  from `container:` only in that it keeps its own (empty) namespace, and so
-     *  keeps its own hostname. The SAME predicate gates the deploy path's route and
-     *  host-port decisions — see ownsNetworkEndpoint in @repo/core. */
-    const ownsProjectEndpoint = ownsNetworkEndpoint(sharedNetwork);
-    const sharedPid = config.namespaces?.pid;
-
-    // Port bindings
-    const { exposedPorts, portBindings } = parsePortBindings(config.ports);
-
-    // Project-scope NAMED volumes (openship-<slug>-<name>) so two projects can
-    // never share one docker volume; bind mounts / anonymous volumes pass
-    // through. Grandfathered services (namespaceVolumes=false) keep their bare
-    // names — for those, fail fast if a bare name already belongs to another
-    // project (the exact class of bug this change prevents going forward).
-    if (!config.namespaceVolumes) {
-      await this.assertNoForeignNamedVolumeCollision(config);
-    }
-    const scopedBinds = scopeVolumeBinds(config.slug, config.volumes, config.namespaceVolumes);
-    const binds = scopedBinds.length > 0 ? scopedBinds : undefined;
-
-    const restartPolicy = resolveRestartPolicy(config.restart);
-    const healthcheck = toDockerHealthcheck(config.advanced?.healthcheck);
-    const stopConfig = toStopConfig(config.advanced);
-
     log({
       timestamp: new Date().toISOString(),
       message: `Creating service container ${containerName} from ${config.image}...\n`,
@@ -4841,28 +4850,6 @@ export class DockerRuntime implements RuntimeAdapter {
         message: `PID namespace: ${sharedPid}\n`,
         level: "info",
       });
-    }
-
-    // Pull image if not local
-    if (!config.image.startsWith("openship/")) {
-      try {
-        log({
-          timestamp: new Date().toISOString(),
-          message: `Pulling image ${config.image}...\n`,
-          level: "info",
-        });
-        // Shared pull path — blocking `docker pull` over SSH so a first-time
-        // pull on a fresh remote server can't hang (followProgress-over-SSH).
-        // force-pull on the "update" trigger to roll a moved mutable tag forward.
-        await this.pullImage(config.image, { force: config.forcePull });
-      } catch (err) {
-        log({
-          timestamp: new Date().toISOString(),
-          message: `Failed to pull ${config.image}: ${err}\n`,
-          level: "error",
-        });
-        throw err;
-      }
     }
 
     const container = await this.docker.createContainer({

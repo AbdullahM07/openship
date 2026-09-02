@@ -7,6 +7,7 @@ const {
   assertGitHubRepoAccess,
   getCommitByRef,
   getForwardGitToServer,
+  getLatestCommit,
   kickoffBuild,
   repos,
   resolveProjectInfo,
@@ -20,6 +21,7 @@ const {
   assertGitHubRepoAccess: vi.fn(),
   getCommitByRef: vi.fn(),
   getForwardGitToServer: vi.fn(),
+  getLatestCommit: vi.fn(),
   kickoffBuild: vi.fn(),
   repos: {
     project: {
@@ -46,6 +48,12 @@ const {
     },
     serviceDeployment: {
       latestByProject: vi.fn(),
+    },
+    updateStatus: {
+      upsert: vi.fn(async () => {}),
+    },
+    server: {
+      getInOrganization: vi.fn(),
     },
   },
   resolveProjectInfo: vi.fn(),
@@ -89,7 +97,7 @@ vi.mock("../../../src/modules/github/github-access", () => ({
 
 vi.mock("../../../src/modules/github/github.service", () => ({
   getCommitByRef,
-  getLatestCommit: vi.fn(),
+  getLatestCommit,
   getRepository: vi.fn(),
 }));
 
@@ -104,12 +112,14 @@ vi.mock("../../../src/modules/deployments/smart-route", () => ({
 
 import {
   applyReleaseSourceToSnapshot,
+  buildConfigSnapshot,
   redeployBuildSession,
   requestBuildAccess,
   resolveSnapshotTarget,
   triggerDeployment,
   type DeploymentConfigSnapshot,
 } from "../../../src/modules/deployments/build.service";
+import { createServiceRepo, toComposeSpec, type Database } from "@repo/db";
 import type { ReleaseSource } from "@repo/core";
 import {
   newFolderSessionId,
@@ -175,6 +185,64 @@ const composeServices = [
   },
 ];
 
+/**
+ * Put the REAL service repository reconciler behind build.service's mocked DB
+ * seam. The rest of a deployment stays mocked (no clone/build/Docker), while
+ * service writes are stateful and observable across the full trigger boundary.
+ */
+function installStatefulComposeRepo<T extends Record<string, unknown>>(initial: T) {
+  let stored = structuredClone(initial);
+  const writes: Array<Record<string, unknown>> = [];
+  const db = {
+    query: { service: { findMany: async () => [stored] } },
+    update: () => ({
+      set: (data: Record<string, unknown>) => ({
+        where: async () => {
+          writes.push(data);
+          stored = { ...stored, ...data } as T;
+        },
+      }),
+    }),
+  } as unknown as Database;
+  const real = createServiceRepo(db);
+  repos.service.listByProject.mockImplementation(real.listByProject.bind(real));
+  repos.service.reconcileFromCompose.mockImplementation(real.reconcileFromCompose.bind(real));
+  return { stored: () => stored, writes };
+}
+
+const criticalApiEnvironment = {
+  NODE_ENV: "production",
+  PORT: "4000",
+  BETTER_AUTH_SECRET: "must-survive",
+  GITHUB_CLIENT_SECRET: "must-survive-too",
+  SMTP_HOST: "smtp.example.com",
+};
+
+function criticalApiService() {
+  const compose = {
+    image: "example/api:1",
+    ports: ["4000"],
+    environment: criticalApiEnvironment,
+    volumes: ["api_data:/data"],
+  };
+  return {
+    id: "svc-api",
+    projectId: "project-1",
+    name: "api",
+    kind: "compose",
+    enabled: true,
+    exposed: false,
+    exposedPort: null,
+    domain: null,
+    customDomain: null,
+    domainType: "free",
+    publicEndpoints: [],
+    driftSpec: null,
+    ...compose,
+    importedSpec: toComposeSpec(compose),
+  };
+}
+
 function baseSnapshot(): DeploymentConfigSnapshot {
   return {
     organizationId: "org-1",
@@ -228,6 +296,20 @@ function releaseSnapshot(
     ...overrides,
   };
 }
+
+describe("buildConfigSnapshot", () => {
+  it("clones git snapshots instead of packaging their saved checkout path (#748)", () => {
+    const snapshot = buildConfigSnapshot(
+      baseProject({ gitProvider: "github", gitUrl: "https://github.com/acme/app.git" }) as never,
+    );
+
+    expect(snapshot).toMatchObject({ source: "git", localPath: undefined });
+  });
+
+  it("keeps the source path for local folder snapshots", () => {
+    expect(buildConfigSnapshot(baseProject() as never).localPath).toBe("/srv/my-stack");
+  });
+});
 
 describe("applyReleaseSourceToSnapshot", () => {
   it("freezes the normalized version, raw tag, and rendered image without repurposing buildImage", async () => {
@@ -435,6 +517,7 @@ describe("triggerDeployment", () => {
     repos.deployment.createBuildSession.mockResolvedValue(undefined);
     repos.deployment.supersedeReconciling.mockResolvedValue(undefined);
     repos.deployment.supersedePendingDecisions.mockResolvedValue(undefined);
+    repos.server.getInOrganization.mockResolvedValue({ id: "srv_remote" });
 
     assertGitHubRepoAccess.mockResolvedValue(undefined);
     resolveProjectRouteState.mockResolvedValue({
@@ -477,6 +560,138 @@ describe("triggerDeployment", () => {
         composeServices,
       }),
     );
+  });
+
+  it("persists exact scope and force-pull intent for an incoming multi-service hook", async () => {
+    const targets = ["svc-api", "svc-worker"];
+    repos.service.listByProject.mockResolvedValue([
+      { id: "svc-api", name: "api", enabled: true, advanced: null },
+      { id: "svc-worker", name: "worker", enabled: true, advanced: null },
+      { id: "svc-db", name: "db", enabled: true, advanced: null },
+    ]);
+    resolveSmartRoute.mockResolvedValue({
+      forceAll: false,
+      serviceIds: targets,
+      changedPaths: undefined,
+    });
+
+    await triggerDeployment(ctx, {
+      projectId: "project-1",
+      serviceIds: targets,
+      strictServiceScope: true,
+      forcePullImages: true,
+      trigger: "webhook",
+    });
+
+    expect(repos.deployment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        trigger: "webhook",
+        meta: expect.objectContaining({
+          targetServiceIds: targets,
+          strictServiceScope: true,
+          forcePullImages: true,
+        }),
+      }),
+    );
+  });
+
+  it("persists force-pull intent for a whole-project incoming hook", async () => {
+    await triggerDeployment(ctx, {
+      projectId: "project-1",
+      forcePullImages: true,
+      trigger: "webhook",
+    });
+
+    const meta = repos.deployment.create.mock.calls.at(-1)?.[0]?.meta;
+    expect(meta).toMatchObject({ forcePullImages: true });
+    expect(meta.targetServiceIds).toBeUndefined();
+    expect(meta.strictServiceScope).toBeUndefined();
+  });
+
+  it("rejects a stale exact target after compose reconciliation and queues nothing", async () => {
+    repos.service.listByProject.mockResolvedValue([
+      { id: "svc-api", name: "api", enabled: true, advanced: null },
+    ]);
+
+    await expect(
+      triggerDeployment(ctx, {
+        projectId: "project-1",
+        serviceIds: ["svc-api", "svc-deleted"],
+        strictServiceScope: true,
+        forcePullImages: true,
+        trigger: "webhook",
+      }),
+    ).rejects.toThrow(/svc-deleted/);
+
+    expect(repos.deployment.create).not.toHaveBeenCalled();
+    expect(kickoffBuild).not.toHaveBeenCalled();
+  });
+
+  it("rejects replacing a namespace provider without its dependent", async () => {
+    repos.service.listByProject.mockResolvedValue([
+      { id: "svc-vpn", name: "vpn", enabled: true, advanced: null },
+      {
+        id: "svc-sidecar",
+        name: "sidecar",
+        enabled: true,
+        advanced: { networkMode: "service:vpn" },
+      },
+    ]);
+
+    await expect(
+      triggerDeployment(ctx, {
+        projectId: "project-1",
+        serviceIds: ["svc-vpn"],
+        strictServiceScope: true,
+        forcePullImages: true,
+        trigger: "webhook",
+      }),
+    ).rejects.toThrow(/svc-sidecar/);
+
+    expect(repos.deployment.create).not.toHaveBeenCalled();
+  });
+
+  it("uses an explicit CLI server target in preflight and the frozen deployment snapshot", async () => {
+    await triggerDeployment(ctx, {
+      projectId: "project-1",
+      branch: "main",
+      commitSha: "abc123",
+      serverId: "srv_remote",
+    });
+
+    expect(runPreflightChecks).toHaveBeenCalledWith(
+      expect.objectContaining({
+        deployTarget: "server",
+        serverId: "srv_remote",
+      }),
+      expect.any(Object),
+    );
+    expect(repos.server.getInOrganization).toHaveBeenCalledWith("srv_remote", "org-1");
+    expect(repos.deployment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        meta: expect.objectContaining({
+          deployTarget: "server",
+          serverId: "srv_remote",
+        }),
+      }),
+    );
+  });
+
+  it("rejects a foreign explicit target before reconciliation or queue creation", async () => {
+    repos.server.getInOrganization.mockResolvedValue(null);
+
+    await expect(
+      triggerDeployment(ctx, {
+        projectId: "project-1",
+        branch: "main",
+        commitSha: "abc123",
+        serverId: "srv_foreign",
+      }),
+    ).rejects.toMatchObject({ statusCode: 404, code: "SERVER_TARGET_UNAVAILABLE" });
+
+    expect(repos.service.reconcileFromCompose).not.toHaveBeenCalled();
+    expect(repos.deployment.create).not.toHaveBeenCalled();
+    expect(kickoffBuild).not.toHaveBeenCalled();
   });
 
   it("bootstraps a declared composePath even when the first webhook changed another file (#689)", async () => {
@@ -551,6 +766,63 @@ describe("triggerDeployment", () => {
     expect(kickoffBuild).toHaveBeenCalledWith(
       expect.objectContaining({ id: "project-1" }),
       expect.objectContaining({ id: "dep-1" }),
+    );
+  });
+
+  it("bootstraps and reconciles a local-path compose project through the shared parser (#751)", async () => {
+    let storedRows: Record<string, unknown>[] = [];
+    repos.service.listByProject.mockImplementation(async () => storedRows);
+    repos.service.reconcileFromCompose.mockImplementation(async (_projectId, parsed) => {
+      storedRows = parsed.map((service: Record<string, unknown>, index: number) => ({
+        ...service,
+        id: `svc-local-${index}`,
+        projectId: "project-1",
+        kind: "compose",
+        enabled: true,
+      }));
+      return { services: storedRows, driftedNames: [] };
+    });
+    const actualPipeline = await vi.importActual<
+      typeof import("../../../src/modules/deployments/build-pipeline")
+    >("../../../src/modules/deployments/build-pipeline");
+    resolveServicePipelineMode.mockImplementationOnce(actualPipeline.resolveServicePipelineMode);
+    repos.project.findById.mockResolvedValue(
+      baseProject({
+        composePath: "deploy/stack.yml",
+        localPath: "/opt/apps/payments",
+        gitProvider: "local",
+        gitOwner: null,
+        gitRepo: null,
+      }),
+    );
+
+    await triggerDeployment(ctx, {
+      projectId: "project-1",
+      branch: "main",
+      // A GitHub-only optimization must never skip a local filesystem refresh.
+      changedPaths: ["src/index.ts"],
+    });
+
+    expect(resolveProjectInfo).toHaveBeenCalledWith({
+      source: "local",
+      path: "/opt/apps/payments",
+      composePath: "deploy/stack.yml",
+    });
+    expect(repos.service.reconcileFromCompose).toHaveBeenCalledWith("project-1", composeServices);
+    expect(runPreflightChecks).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        multiService: true,
+        composeServices: expect.arrayContaining([expect.objectContaining({ name: "web" })]),
+      }),
+    );
+    expect(repos.deployment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        meta: expect.objectContaining({
+          serviceDeploymentMode: "services",
+          composeServices: expect.arrayContaining([expect.objectContaining({ name: "web" })]),
+        }),
+      }),
     );
   });
 
@@ -655,6 +927,61 @@ describe("triggerDeployment", () => {
     });
 
     expect(repos.service.reconcileFromCompose).not.toHaveBeenCalled();
+    expect(repos.deployment.create).not.toHaveBeenCalled();
+    expect(kickoffBuild).not.toHaveBeenCalled();
+  });
+
+  it("keeps critical env through trigger reconciliation when a later preflight blocks deploy", async () => {
+    const state = installStatefulComposeRepo(criticalApiService());
+    repos.project.findById.mockResolvedValue(
+      baseProject({
+        composePath: "compose.yml",
+        gitProvider: "github",
+        gitUrl: "https://github.com/acme/app.git",
+        gitOwner: "acme",
+        gitRepo: "app",
+        localPath: null,
+      }),
+    );
+    const proposed = {
+      name: "api",
+      image: "example/api:2",
+      ports: ["4000"],
+      // The regression: a repo edit kept only baseline runtime keys and removed
+      // auth/SMTP credentials from the Compose-owned map.
+      environment: { NODE_ENV: "production", PORT: "4000" },
+      volumes: ["api_data:/data"],
+    };
+    resolveProjectInfo.mockResolvedValue({ services: [proposed] });
+    const actualPipeline = await vi.importActual<
+      typeof import("../../../src/modules/deployments/build-pipeline")
+    >("../../../src/modules/deployments/build-pipeline");
+    resolveServicePipelineMode.mockImplementationOnce(actualPipeline.resolveServicePipelineMode);
+    runPreflightChecks.mockRejectedValueOnce(new Error("blocked after compose reconciliation"));
+
+    await expect(
+      triggerDeployment(ctx, {
+        projectId: "project-1",
+        branch: "main",
+        commitSha: "1eeaf7692a19ee6e7ecb64b9d1a5c3ee7c0ac2f5",
+        changedPaths: ["compose.yml"],
+      }),
+    ).rejects.toThrow("blocked after compose reconciliation");
+
+    // The actual stored row remains deployable even though reconciliation ran
+    // and the deployment failed AFTER it. Only the proposed spec is staged as
+    // drift for an explicit operator decision.
+    expect(state.stored().environment).toEqual(criticalApiEnvironment);
+    expect(state.stored().importedSpec).toEqual(criticalApiService().importedSpec);
+    expect(state.stored().driftSpec).toEqual(toComposeSpec(proposed));
+    expect(runPreflightChecks).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({
+        composeServices: [
+          expect.objectContaining({ name: "api", environment: criticalApiEnvironment }),
+        ],
+      }),
+    );
     expect(repos.deployment.create).not.toHaveBeenCalled();
     expect(kickoffBuild).not.toHaveBeenCalled();
   });
@@ -957,6 +1284,79 @@ describe("redeployBuildSession environment snapshot", () => {
       expect.objectContaining({ envVars: { MANUAL_ENV: "keep-me" } }),
     );
   });
+
+  it("updates update_status cache when resolving a new commit on redeploy", async () => {
+    const project = baseProject({
+      id: "project-1",
+      activeDeploymentId: "dep-old",
+      gitOwner: "oblien",
+      gitRepo: "openship",
+      gitBranch: "main",
+    });
+    repos.project.findById.mockResolvedValue(project);
+    getLatestCommit.mockResolvedValue({
+      sha: "new-sha-123456789012345678901234567890",
+      message: "feat: new commit",
+    });
+
+    await redeployBuildSession(ctx, "dep-old");
+
+    expect(repos.updateStatus.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        organizationId: project.organizationId,
+        projectId: project.id,
+        kind: "commit",
+        checkedAt: expect.any(Date),
+        detail: expect.objectContaining({
+          key: "oblien/openship#main",
+          latestSha: "new-sha-123456789012345678901234567890",
+          latestMessage: "feat: new commit",
+        }),
+      }),
+    );
+  });
+
+  it("queues a redeploy with preserved env when the new Compose file deletes critical keys", async () => {
+    const project = baseProject({
+      activeDeploymentId: "dep-old",
+      composePath: "compose.yml",
+      gitProvider: "github",
+      gitUrl: "https://github.com/acme/app.git",
+      gitOwner: "acme",
+      gitRepo: "app",
+      localPath: null,
+    });
+    repos.project.findById.mockResolvedValue(project);
+    const state = installStatefulComposeRepo(criticalApiService());
+    const proposed = {
+      name: "api",
+      image: "example/api:2",
+      ports: ["4000"],
+      environment: { NODE_ENV: "production", PORT: "4000" },
+      volumes: ["api_data:/data"],
+    };
+    resolveProjectInfo.mockResolvedValue({ services: [proposed] });
+    getLatestCommit.mockResolvedValue({ sha: "new-sha", message: "remove legacy inline env" });
+
+    await redeployBuildSession(ctx, "dep-old");
+
+    expect(state.stored().environment).toEqual(criticalApiEnvironment);
+    expect(state.stored().driftSpec).toEqual(toComposeSpec(proposed));
+    expect(repos.deployment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        commitSha: "new-sha",
+        meta: expect.objectContaining({
+          composeServices: [
+            expect.objectContaining({ name: "api", environment: criticalApiEnvironment }),
+          ],
+        }),
+      }),
+    );
+    expect(kickoffBuild).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "project-1" }),
+      expect.objectContaining({ id: "dep-new" }),
+    );
+  });
 });
 
 /**
@@ -1016,6 +1416,7 @@ describe("requestBuildAccess — folder-upload compose services", () => {
     // No service rows yet — the state right after projects/ensure created it.
     repos.service.listByProject.mockResolvedValue([]);
     repos.service.syncFromCompose.mockResolvedValue([]);
+    repos.server.getInOrganization.mockResolvedValue({ id: "srv_remote" });
 
     assertGitHubRepoAccess.mockResolvedValue(undefined);
     getForwardGitToServer.mockResolvedValue(false);
@@ -1036,6 +1437,24 @@ describe("requestBuildAccess — folder-upload compose services", () => {
     resolveStrategy.mockResolvedValue("server");
     runPreflightChecks.mockResolvedValue({ ok: true, checks: [] });
     kickoffBuild.mockResolvedValue("session-1");
+  });
+
+  it("rejects a foreign folder target before service or deployment writes", async () => {
+    const uploadSessionId = seedSession();
+    repos.server.getInOrganization.mockResolvedValue(null);
+
+    await expect(
+      requestBuildAccess(ctx, {
+        projectId: "project-1",
+        uploadSessionId,
+        deployTarget: "server",
+        serverId: "srv_foreign",
+      }),
+    ).rejects.toMatchObject({ statusCode: 404, code: "SERVER_TARGET_UNAVAILABLE" });
+
+    expect(repos.service.reconcileFromCompose).not.toHaveBeenCalled();
+    expect(repos.service.syncFromCompose).not.toHaveBeenCalled();
+    expect(repos.deployment.create).not.toHaveBeenCalled();
   });
 
   it("adopts the session's scanned services when the caller sent none", async () => {
@@ -1073,6 +1492,56 @@ describe("requestBuildAccess — folder-upload compose services", () => {
     expect(repos.service.syncFromCompose).toHaveBeenCalledWith("project-1", requested, {
       removeMissing: false,
     });
+  });
+
+  it("accepts migration handover pins only through the internal options", async () => {
+    const uploadSessionId = seedSession();
+
+    await requestBuildAccess(
+      ctx,
+      { projectId: "project-1", uploadSessionId },
+      {
+        handoverImages: { api: "ghcr.io/acme/api:migrated" },
+        handoverAppImage: "ghcr.io/acme/api:migrated",
+      },
+    );
+
+    expect(repos.deployment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        meta: expect.objectContaining({
+          handoverImages: { api: "ghcr.io/acme/api:migrated" },
+          handoverAppImage: "ghcr.io/acme/api:migrated",
+        }),
+      }),
+    );
+  });
+
+  it("ignores handover pins injected into the public request body", async () => {
+    const uploadSessionId = seedSession();
+
+    await requestBuildAccess(ctx, {
+      projectId: "project-1",
+      uploadSessionId,
+      handoverImages: { api: "attacker/image:latest" },
+      handoverAppImage: "attacker/app:latest",
+    } as never);
+
+    const meta = repos.deployment.create.mock.calls.at(-1)?.[0]?.meta;
+    expect(meta.handoverImages).toBeUndefined();
+    expect(meta.handoverAppImage).toBeUndefined();
+  });
+
+  it.each([
+    { missing: "ghcr.io/acme/api:migrated" },
+    { api: "" },
+    { api: "/opt/openship/static/releases/forged" },
+  ])("rejects invalid internal migration handover %o", async (handoverImages) => {
+    const uploadSessionId = seedSession();
+
+    await expect(
+      requestBuildAccess(ctx, { projectId: "project-1", uploadSessionId }, { handoverImages }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(repos.deployment.create).not.toHaveBeenCalled();
   });
 
   // #336: the wizard sees env masked, so a deploy request can echo "••••••••".

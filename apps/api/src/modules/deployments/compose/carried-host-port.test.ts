@@ -73,10 +73,10 @@ describe("the deploy routes the carried port through the allocator", () => {
     expect(block).toContain("pinnedHostPortClaims.push(allocation.claim)");
   });
 
-  it("says so when it had to move a carried port", () => {
-    // Otherwise a port silently changing between deploys looks like a bug from the outside.
-    expect(block).toContain("hostPort !== carried");
-    expect(block).toContain("is taken on this server");
+  it("fails closed on the same target and reports legitimate host migrations", () => {
+    expect(block).toContain("allocation.port !== allocation.preferred");
+    expect(block).toContain("lockPreferred: lockCarriedHostPorts");
+    expect(block).toContain("Project moved hosts");
   });
 
   it("keeps the unreadable-occupancy warning, which is a different failure", () => {

@@ -223,6 +223,11 @@ export function updateStatus(
     portCheck?: PortCheckResult[];
   },
 ): void {
+  // A prompt hold is independent of the SSE session's subscriber set. Always
+  // reject it before broadcasting a terminal cancel so the background worker
+  // cannot remain leased on a promise that no UI can answer anymore.
+  if (status === "cancelled") rejectPendingPrompt(sessionId, "Deployment cancelled");
+
   const session = sessions.get(sessionId);
   if (!session) return;
 
@@ -456,4 +461,12 @@ function rejectPendingPrompt(sessionId: string, reason: string): void {
   const session = sessions.get(sessionId);
   if (session) session.currentPrompt = undefined;
   promptRegistry.reject(sessionId, reason);
+}
+
+/** Wake a deploy worker blocked on a user-decision prompt when its deployment
+ * is cancelled. A terminal SSE event alone cannot do that: the prompt promise
+ * is independent of the session cache and otherwise keeps the durable worker
+ * lease alive forever. */
+export function cancelPendingPrompt(sessionId: string): void {
+  rejectPendingPrompt(sessionId, "Deployment cancelled");
 }

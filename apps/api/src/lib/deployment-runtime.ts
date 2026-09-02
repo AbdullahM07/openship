@@ -32,6 +32,7 @@ import { isLocalHostRow } from "./box-org";
 import { isConnectionLoss } from "./remote-state";
 import { resolveAcmeProviderOptions } from "./acme-config";
 import { findLocalServer } from "./startup/self-server";
+import { requireOrgServer } from "./server-target";
 import { registryAuthResolver } from "../modules/credentials/registry-auth";
 import {
   LOCAL_HOST_PORT_TARGET,
@@ -251,24 +252,7 @@ async function resolveOrgServer(
   }
 
   if (serverId) {
-    const server = await repos.server.getInOrganization(serverId, organizationId);
-    if (!server) {
-      // Actionable, but deliberately org-AGNOSTIC in wording: never look the id
-      // up outside this org. The strict org scope here IS the layer-1 host-root
-      // gate (an isLocal row resolved cross-org would escalate any org to a
-      // host-root executor), and the serverId comes from the client-supplied
-      // deploy snapshot — probing it unscoped would also be a cross-tenant
-      // existence/name oracle. So we explain the likely cause + recovery without
-      // revealing whether the id exists elsewhere.
-      throw new Error(
-        "This project's deploy target is no longer available. That server may have been " +
-          "removed from Openship (deleting one unbinds its projects), or this is a stale " +
-          "session after re-deploying Openship at the same URL, or your active organization " +
-          "differs from the project's. Re-open the deploy target picker and reselect a " +
-          "server, or switch your active organization to match, then redeploy.",
-      );
-    }
-    return server;
+    return requireOrgServer(serverId, organizationId);
   }
 
   const servers = await repos.server.listByOrganization(organizationId);

@@ -314,6 +314,15 @@ const TABLES: ReadonlyArray<TableSpec> = [
   },
 
   // GitHub — instance-only.
+  // Custom App credentials are tied to this control plane's callback/webhook
+  // URLs. They travel in a whole-instance migration (with secrets re-sealed),
+  // but never in a project/org promotion to another control plane.
+  {
+    sqlName: "git_source",
+    table: schema.gitSource,
+    scopes: [{ in: "instance", via: "all-rows" }],
+    hasOrganizationId: true,
+  },
   {
     sqlName: "git_installation",
     table: schema.gitInstallation,
@@ -908,6 +917,7 @@ export const ENCRYPTED_COLUMNS: ReadonlyArray<EncryptedColumnSpec> = [
   { table: "backup_destination", column: "sftpKeyPassphraseEnc" },
   { table: "dns_credential", column: "apiTokenEnc" },
   { table: "credential", column: "secretsEnc" },
+  { table: "git_source", column: "secretsEnc" },
   { table: "servers", column: "sshPassword" },
   { table: "servers", column: "sshPrivateKey" },
   { table: "servers", column: "sshKeyPassphrase" },

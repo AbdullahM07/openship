@@ -36,6 +36,14 @@ export type BackupRunStatus =
   | "cancelled"
   | "server_error";
 
+export interface PolicyLastRunSummary {
+  id: string;
+  status: string;
+  startedAt: Date;
+  finishedAt: Date | null;
+  bytesTransferred: number | null;
+}
+
 /** Result of atomically admitting one queued backup worker. */
 export type BackupRunExecutionClaim = "claimed" | "project_unavailable" | "state_changed";
 
@@ -515,13 +523,84 @@ export function createBackupRunRepo(db: Database) {
       });
     },
 
-    /** Most recent run for a policy (any status), newest first. Used by the
-     *  read-only backup-schedule view in the Jobs tab to show last-run state. */
-    async latestByPolicy(policyId: string): Promise<BackupRun | undefined> {
-      return db.query.backupRun.findFirst({
+    /**
+     * Most recent run (or aggregated batch summary for multi-service project policies)
+     * for a policy, newest first. Used by the read-only backup-schedule view in the Jobs tab
+     * and the Destination detail page to show last-run state.
+     *
+     * When a policy targets an entire project, triggering it fans out into multiple child
+     * runs with the same batchId. This method finds the newest run, gathers only its exact
+     * siblings, and returns a consolidated summary with total transferred bytes and batch
+     * status. Legacy rows have no batchId and retain the former single-run behavior because
+     * timestamp proximity cannot safely distinguish concurrent triggers.
+     */
+    async latestByPolicy(policyId: string): Promise<PolicyLastRunSummary | undefined> {
+      const latest = await db.query.backupRun.findFirst({
         where: and(eq(backupRun.policyId, policyId), isNull(backupRun.deletedAt)),
-        orderBy: (t, { desc }) => [desc(t.startedAt)],
+        orderBy: (t, { desc }) => [desc(t.startedAt), desc(t.id)],
       });
+      if (!latest) return undefined;
+
+      const singleRunSummary = (): PolicyLastRunSummary => ({
+        id: latest.id,
+        status: latest.status,
+        startedAt: latest.startedAt,
+        finishedAt: latest.finishedAt,
+        bytesTransferred: latest.bytesTransferred,
+      });
+      const batchId = latest.batchId;
+      if (!batchId) return singleRunSummary();
+
+      const batchRuns = await db.query.backupRun.findMany({
+        where: and(
+          eq(backupRun.policyId, policyId),
+          eq(backupRun.batchId, batchId),
+          isNull(backupRun.deletedAt),
+        ),
+      });
+
+      if (batchRuns.length <= 1) return singleRunSummary();
+
+      const earliestStartedAt = new Date(Math.min(...batchRuns.map((r) => r.startedAt.getTime())));
+
+      // Pick the least-advanced live child so the summary does not imply that
+      // the whole batch has progressed farther than its slowest member.
+      const inFlightStatus = IN_FLIGHT_RUN_STATUSES.find((status) =>
+        batchRuns.some((r) => r.status === status),
+      );
+      const hasUnfinishedRun = !!inFlightStatus || batchRuns.some((r) => !r.finishedAt);
+
+      const latestFinishedAt = hasUnfinishedRun
+        ? null
+        : new Date(Math.max(...batchRuns.map((r) => r.finishedAt!.getTime())));
+
+      let batchStatus: string;
+      if (inFlightStatus) {
+        batchStatus = inFlightStatus;
+      } else if (batchRuns.every((r) => r.status === "succeeded")) {
+        batchStatus = "succeeded";
+      } else {
+        batchStatus =
+          (["server_error", "failed", "cancelled"] as const).find((status) =>
+            batchRuns.some((r) => r.status === status),
+          ) ?? latest.status;
+      }
+
+      const knownByteCounts = batchRuns
+        .map((r) => r.bytesTransferred)
+        .filter((bytes): bytes is number => bytes !== null);
+      const totalBytes =
+        knownByteCounts.length > 0
+          ? knownByteCounts.reduce((sum, bytes) => sum + Number(bytes), 0)
+          : null;
+
+      return {
+        id: latest.id,
+        status: batchStatus,
+        startedAt: earliestStartedAt,
+        finishedAt: latestFinishedAt,
+        bytesTransferred: totalBytes,
+      };
     },
 
     /** Storage rollup per destination for one org: bytes actually stored

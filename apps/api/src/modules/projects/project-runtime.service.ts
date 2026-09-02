@@ -515,8 +515,8 @@ function liveUpstreamPort(site: ImportedSite): number | null {
   const upstreams =
     site.routes ?? (site.target.kind === "proxy" ? [{ path: "/", url: site.target.url }] : []);
   const ordered = [
-    ...upstreams.filter((u) => u.path === "/"),
-    ...upstreams.filter((u) => u.path !== "/"),
+    ...upstreams.filter((u) => u.path === "/" && !u.exact),
+    ...upstreams.filter((u) => u.path !== "/" || u.exact),
   ];
   for (const up of ordered) {
     try {
