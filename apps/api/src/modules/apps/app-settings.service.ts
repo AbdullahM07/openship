@@ -36,7 +36,7 @@ import { repos, type Project, type Service } from "@repo/db";
 import type { RequestContext } from "../../lib/request-context";
 import { assertResourceInOrg } from "../../lib/controller-helpers";
 import { encrypt, decrypt } from "../../lib/encryption";
-import type { ProjectDomainRow } from "../../lib/public-endpoints";
+import { comparePublicRouteRows, type ProjectDomainRow } from "../../lib/public-endpoints";
 import { isLoopbackHost, resolveProjectServerHost } from "../../lib/server-target";
 
 const ENVIRONMENT = "production";
@@ -258,12 +258,6 @@ function rowTargetPort(row: ProjectDomainRow): number | undefined {
     : undefined;
 }
 
-/** Primary row first, then stable by hostname — the primary route owns its port. */
-function byPrimaryThenHostname(left: ProjectDomainRow, right: ProjectDomainRow): number {
-  if (left.isPrimary !== right.isPrimary) return left.isPrimary ? -1 : 1;
-  return left.hostname.localeCompare(right.hostname);
-}
-
 /**
  * A service's PERSISTED route URLs, keyed by container port. Read from the
  * project's domain rows — a route exists because a human chose it and it was
@@ -295,7 +289,7 @@ function persistedServiceRouteUrls(
     urls.set(port, `https://${hostname}`);
   };
 
-  const ordered = [...domains].sort(byPrimaryThenHostname);
+  const ordered = [...domains].sort(comparePublicRouteRows);
   for (const row of ordered) {
     if (row.serviceId === service.id) add(row);
   }

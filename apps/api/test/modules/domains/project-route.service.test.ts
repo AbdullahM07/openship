@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Domain } from "@repo/db";
 
 const {
   listByProject,
@@ -64,9 +65,41 @@ vi.mock("../../../src/lib/managed-edge-proxy", () => ({
 import {
   deriveEnvironmentPublicEndpoints,
   deriveNextProjectRouteState,
+  deriveProjectRouteState,
   reapplyProjectLiveRoutes,
   shouldRefuseLoopbackRoute,
 } from "../../../src/modules/domains/project-route.service";
+
+const domainRow = (over: Partial<Domain> & Pick<Domain, "id" | "hostname">): Domain => ({
+  id: over.id,
+  ownerType: "project",
+  projectId: "project-1",
+  webhookSourceId: null,
+  serviceId: null,
+  hostname: over.hostname,
+  targetPort: 3000,
+  targetPath: null,
+  domainType: "custom",
+  isPrimary: false,
+  redirectTo: null,
+  redirectStatus: null,
+  externalIngress: false,
+  manualSsl: false,
+  status: "active",
+  verificationToken: null,
+  verified: true,
+  verifiedAt: null,
+  verifyAttempts: 0,
+  lastVerifyError: null,
+  lastCheckedAt: null,
+  sslStatus: "active",
+  sslChallenge: "http-01",
+  sslIssuer: null,
+  sslExpiresAt: null,
+  createdAt: new Date(0),
+  updatedAt: new Date(0),
+  ...over,
+});
 
 // Default for every suite below: the project has NO services, so a project-level
 // route resolves against `deployment.containerId` (the single-app path). The
@@ -116,6 +149,36 @@ describe("deriveEnvironmentPublicEndpoints", () => {
   it("returns no endpoints when the base project has no explicit destination", () => {
     expect(deriveEnvironmentPublicEndpoints([], "preview-app")).toEqual([]);
   });
+});
+
+describe("normalizeProjectRouteRows domain-type tie-breaker", () => {
+  it.each([false, true])(
+    "sorts an inferred legacy custom domain first when tied at isPrimary=%s",
+    (isPrimary) => {
+      const state = deriveProjectRouteState(
+        { slug: "app" },
+        {
+          projectDomains: [
+            domainRow({
+              id: "dom-free",
+              hostname: "app.opsh.io",
+              isPrimary,
+              domainType: "free",
+            }),
+            domainRow({
+              id: "dom-custom",
+              hostname: "app.rschl.de",
+              isPrimary,
+              domainType: null,
+            }),
+          ],
+        },
+      );
+
+      expect(state.primaryDomainType).toBe("custom");
+      expect(state.primaryCustomDomain).toBe("app.rschl.de");
+    },
+  );
 });
 
 // Behavioral regression for issue #129: the self-app's own boot route to its
