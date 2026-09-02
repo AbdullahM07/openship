@@ -214,8 +214,8 @@ export class DockerEdgeExecutor implements CommandExecutor {
     if (code !== 0) throw new Error(stderr.trim() || `Failed to rename ${from}`);
   }
 
-  async writeFile(path: string, content: string): Promise<void> {
-    if (this.fileMode === "mounted") return this.files.writeFile(path, content);
+  async writeFile(path: string, content: string, opts?: { mode?: number }): Promise<void> {
+    if (this.fileMode === "mounted") return this.files.writeFile(path, content, opts);
 
     // base64 in the COMMAND, never on stdin: `run()` deliberately doesn't hijack
     // the connection (see the note above — hijack breaks every exec under Bun),

@@ -847,8 +847,18 @@ export interface CommandExecutor extends ExecOnly {
     opts?: { signal?: AbortSignal },
   ): Promise<{ code: number; output: string }>;
 
-  /** Write content to a file on the target machine. Creates dirs as needed. */
-  writeFile(path: string, content: string): Promise<void>;
+  /**
+   * Write content to a file on the target machine. Creates dirs as needed.
+   *
+   * `opts.mode` is the mode the file must have from the moment it exists at `path` —
+   * for a secret, the difference between "0600" and "0600 after a round trip during
+   * which every local account could read it". An executor that stages and publishes
+   * applies it to the staged copy BEFORE publishing; one that creates in place applies
+   * it at creation (an existing file keeps its mode). Executors that can't honour it
+   * ignore it, so a caller that needs the guarantee on every transport still chmods
+   * afterwards — that closes the gap for them and is a no-op for the rest.
+   */
+  writeFile(path: string, content: string, opts?: { mode?: number }): Promise<void>;
 
   /** Read a file from the target machine. */
   readFile(path: string): Promise<string>;

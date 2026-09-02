@@ -519,12 +519,19 @@ export async function configureOutboundRelay(
 
   // 1) Write the SASL map via SFTP (creds never touch a shell string). On the
   //    container flavor that's the host end of the bind mount; Postfix sees it at
-  //    saslMap.engine.
-  await files.writeFile(saslMap.write, `${nexthop} ${input.username}:${input.password}\n`);
+  //    saslMap.engine. Mode 0600 from the moment it exists: on a sudo login that is
+  //    a chmod of the staged copy inside the publishing `sudo`, on a root login the
+  //    mode on the SFTP open — either way the map is never at `saslMap.write` more
+  //    open than that, not even for the one round trip a chmod-after would take.
+  await files.writeFile(saslMap.write, `${nexthop} ${input.username}:${input.password}\n`, {
+    mode: 0o600,
+  });
 
-  // 2) Lock down + hash the map. chmod the path we wrote — through `files`, since
-  //    the map is root's now; `postmap` must build the .db with the Postfix that
-  //    will READ it (its Berkeley-DB version), so it runs wherever the engine is.
+  // 2) Lock down + hash the map. The chmod is a backstop now — for a transport that
+  //    can't honour a mode, and for a map an older version left 0644 (an overwrite
+  //    keeps the existing mode) — and it goes through `files`, since the map is
+  //    root's; `postmap` must build the .db with the Postfix that will READ it (its
+  //    Berkeley-DB version), so it runs wherever the engine is.
   await files.exec(`chmod 600 ${saslMap.write}`);
   await exec.exec(engine(`postmap ${saslMap.engine}`));
   await files.exec(`chmod 600 ${saslMap.write}.db`).catch(() => {});

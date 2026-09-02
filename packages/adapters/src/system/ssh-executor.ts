@@ -396,7 +396,7 @@ export class SshExecutor implements CommandExecutor {
     });
   }
 
-  async writeFile(path: string, content: string): Promise<void> {
+  async writeFile(path: string, content: string, opts?: { mode?: number }): Promise<void> {
     const dir = remoteDirname(path);
     try {
       await this.exec(`mkdir -p ${sq(dir)}`);
@@ -407,7 +407,13 @@ export class SshExecutor implements CommandExecutor {
     return this.withChannelRetry(async () => {
       const sftp = await this.sftp();
       return new Promise<void>((resolve, reject) => {
-        sftp.writeFile(path, content, { encoding: "utf-8" }, (err) => {
+        // `mode` rides the OPEN, so a new file is never visible at the default 0644
+        // first. sftp applies it at creation only — an existing file keeps its mode.
+        const options =
+          opts?.mode === undefined
+            ? { encoding: "utf-8" as const }
+            : { encoding: "utf-8" as const, mode: opts.mode };
+        sftp.writeFile(path, content, options, (err) => {
           if (err) reject(err);
           else resolve();
         });

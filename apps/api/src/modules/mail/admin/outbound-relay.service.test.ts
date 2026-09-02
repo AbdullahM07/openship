@@ -131,7 +131,7 @@ function probeAnswer(login: Login): string {
 
 function makeExec(flavor: Flavor | "none" = "container", login: Login = "root") {
   const execCalls: string[] = [];
-  const writes: { path: string; content: string }[] = [];
+  const writes: { path: string; content: string; mode?: number }[] = [];
   const exec = {
     exec: async (cmd: string) => {
       if (cmd.startsWith('echo "opsh_begin=1"')) return probeAnswer(login);
@@ -144,8 +144,8 @@ function makeExec(flavor: Flavor | "none" = "container", login: Login = "root") 
       execCalls.push(cmd);
       return "";
     },
-    writeFile: async (path: string, content: string) => {
-      writes.push({ path, content });
+    writeFile: async (path: string, content: string, opts?: { mode?: number }) => {
+      writes.push({ path, content, mode: opts?.mode });
     },
   };
   return { exec: exec as never, execCalls, writes };
@@ -321,6 +321,16 @@ describe("host-side writes on a non-root login (#756)", () => {
       expect(
         execCalls.some((c) => c.startsWith(SUDO) && c.includes(`chmod 600 ${SASL_MAP[flavor].write}`)),
       ).toBe(true);
+
+      // …and it is 0600 BEFORE it is published, inside that same sudo: `mv` keeps the
+      // staged copy's mode, so this is what the file lands with. A chmod after the
+      // mv is a round trip during which every local account could read the map.
+      const chmodAt = publish!.indexOf("chmod 600");
+      const mvAt = publish!.indexOf("mv -f");
+      expect(chmodAt).toBeGreaterThan(-1);
+      expect(chmodAt).toBeLessThan(mvAt);
+      expect(publish!.slice(chmodAt, mvAt)).toContain(writes[0].path);
+      expect(writes[0].mode).toBe(0o600);
     });
 
     test(`[${flavor}] with sudo: only the host-side file half is elevated — Postfix keeps its transport`, async () => {
@@ -359,6 +369,8 @@ describe("host-side writes on a non-root login (#756)", () => {
     const { exec, execCalls, writes } = makeExec("container", "root");
     await configureOutboundRelay(exec, base);
     expect(writes[0].path).toBe(SASL_MAP.container.write);
+    // The mode rides the SFTP open, so even the first-ever write is never 0644.
+    expect(writes[0].mode).toBe(0o600);
     expect(execCalls.some((c) => c.startsWith(SUDO))).toBe(false);
   });
 });

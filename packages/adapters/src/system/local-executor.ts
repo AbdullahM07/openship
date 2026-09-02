@@ -115,9 +115,10 @@ export class LocalExecutor implements CommandExecutor {
     });
   }
 
-  async writeFile(path: string, content: string): Promise<void> {
+  async writeFile(path: string, content: string, opts?: { mode?: number }): Promise<void> {
     await fsMkdir(dirname(path), { recursive: true });
-    await fsWriteFile(path, content, "utf-8");
+    // `mode` applies at creation only; an existing file keeps its mode.
+    await fsWriteFile(path, content, { encoding: "utf-8", mode: opts?.mode });
   }
 
   async rename(from: string, to: string): Promise<void> {
