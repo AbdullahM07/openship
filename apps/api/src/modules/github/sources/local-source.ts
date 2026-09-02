@@ -31,18 +31,9 @@ import {
   resolveInstallUrl,
 } from "../github.auth";
 import { tokenFor, canResolveTokenFor } from "../github.token";
-import type {
-  GitHubPurpose,
-  GitHubTokenSource,
-  TokenContext,
-  TokenResult,
-} from "../github.token";
+import type { GitHubPurpose, GitHubTokenSource, TokenContext, TokenResult } from "../github.token";
 import type { RequestContext } from "../../../lib/request-context";
-import type {
-  GitHubConnectionState,
-  GitHubInstallation,
-  MappedRepository,
-} from "../github.types";
+import type { GitHubConnectionState, GitHubInstallation, MappedRepository } from "../github.types";
 import type { GhCliSource, GhCliStatus } from "./gh-cli-source";
 import type { GitHubAppSource } from "./app-source";
 import type {
@@ -53,6 +44,7 @@ import type {
   GitHubSource,
   GitHubUserStatus,
 } from "./types";
+import { hasActiveGitHubSource } from "../github-source.service";
 
 /**
  * THE one place a gh probe result becomes wire state.
@@ -137,7 +129,11 @@ export class LocalGitHubSource implements GitHubSource {
     // two so an App-covered repo is tagged `both` (remote-deployable) instead of
     // being mislabeled CLI-only. Cloud-App mode retains its cheap gh-first path
     // and does not add a SaaS round-trip to ordinary browsing.
-    if (this.gh && getGitHubAuthMode() === "app") {
+    if (
+      this.gh &&
+      (getGitHubAuthMode() === "app" ||
+        (await hasActiveGitHubSource(this.ctx.organizationId).catch(() => false)))
+    ) {
       const app = await this.app();
       const [cliRepos, appRepos] = await Promise.all([
         this.gh.listReposForOwner(owner),
@@ -156,7 +152,11 @@ export class LocalGitHubSource implements GitHubSource {
   }
 
   async getHome(): Promise<GitHubHome> {
-    if (this.gh && getGitHubAuthMode() === "app") {
+    if (
+      this.gh &&
+      (getGitHubAuthMode() === "app" ||
+        (await hasActiveGitHubSource(this.ctx.organizationId).catch(() => false)))
+    ) {
       const app = await this.app();
       if (app) {
         const [appHome, ghStatus, cliRepos, cliAccounts] = await Promise.all([
@@ -191,10 +191,7 @@ export class LocalGitHubSource implements GitHubSource {
     // connection status is surfaced separately by the Settings card.
     if (this.gh) {
       const status = await this.gh.status();
-      const [repos, accounts] = await Promise.all([
-        this.gh.listAllRepos(),
-        this.gh.listOwners(),
-      ]);
+      const [repos, accounts] = await Promise.all([this.gh.listAllRepos(), this.gh.listOwners()]);
       const state: GitHubConnectionState = {
         sources: {
           openshipApp: { connected: false },

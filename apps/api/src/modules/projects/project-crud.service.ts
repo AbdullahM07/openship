@@ -58,6 +58,7 @@ import {
   resolveWebhookStrategy,
 } from "../github/github.service";
 import { getInstallationIdByOrg, resolveInstallUrl } from "../github/github.auth";
+import { hasActiveGitHubSource, resolveGitHubWebBaseUrl } from "../github/github-source.service";
 import { domainWebhookUrl } from "../../lib/public-url";
 import { ensureSharedWebhook, findSharedWebhookId } from "./project-git-webhook";
 import {
@@ -883,7 +884,11 @@ async function createProductionProject(
   // force-enables autoDeploy. Same shape as every other gate we have had to move:
   // put it where the row is written, not on one of the roads leading there.
   // (linkProjectRepo resolves it server-side on its own path.)
-  if (env.CLOUD_MODE || getWebhookStrategy() === "app") {
+  if (
+    env.CLOUD_MODE ||
+    getWebhookStrategy() === "app" ||
+    (await hasActiveGitHubSource(organizationId).catch(() => false))
+  ) {
     const owner = data.gitOwner?.trim();
     data.installationId = owner
       ? ((await getInstallationIdByOrg(organizationId, owner)) ?? undefined)
@@ -1048,7 +1053,12 @@ export async function linkProjectRepo(
         return { ok: false, code: "not_found" } as const;
       }
 
-      const gitUrl = projectGitUrl(owner, repo);
+      const sourceWebBaseUrl = await resolveGitHubWebBaseUrl(organizationId, owner).catch(
+        () => null,
+      );
+      const gitUrl = sourceWebBaseUrl
+        ? `${sourceWebBaseUrl.replace(/\/+$/, "")}/${owner}/${repo}.git`
+        : projectGitUrl(owner, repo);
       const defaultBranch = await resolveDefaultBranch(ctx, owner, repo, input.branch);
       // A project_app is one source identity even if an old/partial write left its
       // environments inconsistent. Linking Git converges the whole group, so clear
@@ -1083,7 +1093,7 @@ export async function linkProjectRepo(
         autoDeploy: false,
       };
 
-      const strategy = await resolveWebhookStrategy(project!);
+      const strategy = await resolveWebhookStrategy(project!, organizationId);
 
       if (strategy === "app") {
         const resolvedInstId = await getInstallationIdByOrg(organizationId, owner);
@@ -2476,16 +2486,13 @@ export async function resolveProjectWebhookState(
     deployTarget?: string | null;
   },
 ): Promise<ProjectWebhookState> {
-  const strategy = await resolveWebhookStrategy(project);
+  const strategy = await resolveWebhookStrategy(project, organizationId);
 
   // A native App strategy delivers pushes for every target through this
   // instance's App webhook. In cloud-proxy mode (non-App base strategy), only a
   // cloud-target project receives pushes through the SaaS App.
   let installationInstalled = false;
-  if (
-    project.gitOwner &&
-    (strategy === "app" || project.deployTarget === "cloud")
-  ) {
+  if (project.gitOwner && (strategy === "app" || project.deployTarget === "cloud")) {
     installationInstalled = !!(await getInstallationIdByOrg(organizationId, project.gitOwner));
   }
 

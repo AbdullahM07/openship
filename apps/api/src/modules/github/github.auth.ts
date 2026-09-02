@@ -30,11 +30,14 @@ import { mapAccounts } from "./sources/mappers";
 import type { RequestContext } from "../../lib/request-context";
 import type { GitHubTokenSource } from "./github.token";
 import { resolveOrgOwner } from "../../lib/org-actor";
-import type {
-  GitHubConnectionState,
-  GitHubInstallation,
-  MappedAccount,
-} from "./github.types";
+import type { GitHubConnectionState, GitHubInstallation, MappedAccount } from "./github.types";
+import { generateGitHubAppJwt, githubAppFetch } from "./github.app-client";
+import {
+  createSourceInstallUrl,
+  hasActiveGitHubSource,
+  resolveGitHubApiBaseUrl,
+  resolveGitHubSourceCredentialsForInstallation,
+} from "./github-source.service";
 
 // ─── Token cache ─────────────────────────────────────────────────────────────
 
@@ -156,8 +159,9 @@ export async function invalidateOrgGitHubCache(organizationId: string): Promise<
  *   - GITHUB_PRIVATE_KEY_BASE64 - base64-encoded PEM (single env var line)
  * Null when neither is set — `generateAppJwt` throws on use.
  */
-const PRIVATE_KEY: string | null = env.GITHUB_PRIVATE_KEY
-  ?? (env.GITHUB_PRIVATE_KEY_BASE64
+const PRIVATE_KEY: string | null =
+  env.GITHUB_PRIVATE_KEY ??
+  (env.GITHUB_PRIVATE_KEY_BASE64
     ? Buffer.from(env.GITHUB_PRIVATE_KEY_BASE64, "base64").toString("utf-8")
     : null);
 
@@ -177,19 +181,7 @@ export function generateAppJwt(): string {
     throw new Error("GITHUB_PRIVATE_KEY or GITHUB_PRIVATE_KEY_BASE64 is required");
   }
 
-  const now = Math.floor(Date.now() / 1000);
-
-  const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
-  const payload = Buffer.from(
-    JSON.stringify({ iat: now - 60, exp: now + 600, iss: appId }),
-  ).toString("base64url");
-
-  const signature = crypto
-    .createSign("RSA-SHA256")
-    .update(`${header}.${payload}`)
-    .sign(PRIVATE_KEY, "base64url");
-
-  return `${header}.${payload}.${signature}`;
+  return generateGitHubAppJwt({ appId, privateKeyPem: PRIVATE_KEY });
 }
 
 // ─── App-level API request ───────────────────────────────────────────────────
@@ -202,22 +194,15 @@ export async function appFetch<T = unknown>(
   url: string,
   options: { method?: string; body?: unknown } = {},
 ): Promise<T> {
-  const jwt = generateAppJwt();
-  const res = await fetch(url, {
-    method: options.method ?? "GET",
-    headers: {
-      Authorization: `Bearer ${jwt}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
-
-  const data = await res.json() as T & { message?: string };
-  if (!res.ok) {
-    throw new Error(`GitHub App API error (${res.status}): ${data.message ?? "Unknown"}`);
+  if (!env.GITHUB_APP_ID || !PRIVATE_KEY) {
+    // Keep the historic, specific configuration messages from generateAppJwt.
+    generateAppJwt();
   }
-  return data;
+  return githubAppFetch<T>(
+    { appId: env.GITHUB_APP_ID!, privateKeyPem: PRIVATE_KEY! },
+    url,
+    options,
+  );
 }
 
 // ─── Installation ID lookup ──────────────────────────────────────────────────
@@ -237,48 +222,47 @@ export async function getInstallationId(
   owner: string,
 ): Promise<number | null> {
   if (!owner) return null;
-  // Cloud-app mode: ALWAYS ask SaaS. api.openship.io is the canonical
-  // store — the GitHub App webhook fires to SaaS, not to us, so its
-  // record is authoritative. Skip the local DB entirely; a stale row
-  // would lie for up to 50min after a user uninstalls / re-installs.
-  // tokenCache provides short-term memoization (50min TTL) so we don't
-  // hammer SaaS on every preflight.
-  const mode = await resolveGitHubAuthMode(ctx).catch(() => "none" as const);
-  if (mode === "cloud-app") {
-    // ctx.organizationId is the canonical answer — permission.assert
-    // has already rebound it to the resource-scoped org when this is a
-    // resource-bound route, so we never need to guess memberships[0].
-    const organizationId = ctx.organizationId;
-    const cacheKey = `inst:org:${organizationId}:${owner.toLowerCase()}`;
-    const store = await cacheStore<string>(GH_TOKEN_NS, { maxSize: 5_000 });
-    const cached = await store.get(cacheKey);
-    if (cached) return Number(cached);
-    const { cloudClient } = await import("../../lib/cloud/client");
-    const list = await cloudClient({ organizationId }).github.installations().catch(() => null);
-    if (!list) return null;
-    const match = list.find(
-      (entry) => entry.login.toLowerCase() === owner.toLowerCase(),
-    );
-    if (!match) return null;
-    await store.set(cacheKey, String(match.id), GITHUB_TOKEN_CACHE_TTL_SECONDS);
-    return match.id;
-  }
-
-  // Local App mode is workspace-scoped. userId is attribution only; using it
-  // as the cache/lookup boundary can leak an installation across workspaces.
   const organizationId = ctx.organizationId;
   const cacheKey = `inst:org:${organizationId}:${owner.toLowerCase()}`;
   const store = await cacheStore<string>(GH_TOKEN_NS, { maxSize: 5_000 });
   const cached = await store.get(cacheKey);
   if (cached) return Number(cached);
 
-  // Self-hosted "app" mode — local DB is the only store. The authenticated
-  // setup callback, not an unscoped webhook guess, writes this binding.
-  const row = await repos.gitInstallation.findByOrgAndOwner(organizationId, owner);
-  if (!row) return null;
+  // Source selection is per owner. Adding a custom App for one account must
+  // not steal unrelated owners from the existing Cloud, CLI or env-backed
+  // integration configured for this workspace.
+  const local = await repos.gitInstallation.findByOrgAndOwner(organizationId, owner);
+  if (local?.sourceId) {
+    await store.set(cacheKey, String(local.installationId), GITHUB_TOKEN_CACHE_TTL_SECONDS);
+    return local.installationId;
+  }
 
-  await store.set(cacheKey, String(row.installationId), GITHUB_TOKEN_CACHE_TTL_SECONDS);
-  return row.installationId;
+  // For an owner not covered by a custom source, preserve the pre-source auth
+  // mode. In cloud-app mode api.openship.io remains authoritative; a legacy
+  // local snapshot must never shadow it.
+  const mode = await resolveGitHubFallbackAuthMode(ctx).catch(() => "none" as const);
+  if (mode === "cloud-app") {
+    // ctx.organizationId is the canonical answer — permission.assert
+    // has already rebound it to the resource-scoped org when this is a
+    // resource-bound route, so we never need to guess memberships[0].
+    const { cloudClient } = await import("../../lib/cloud/client");
+    const list = await cloudClient({ organizationId })
+      .github.installations()
+      .catch(() => null);
+    if (!list) return null;
+    const match = list.find((entry) => entry.login.toLowerCase() === owner.toLowerCase());
+    if (!match) return null;
+    await store.set(cacheKey, String(match.id), GITHUB_TOKEN_CACHE_TTL_SECONDS);
+    return match.id;
+  }
+
+  // A source-less row can only be minted by the legacy env-backed App. OAuth,
+  // token and CLI modes may have historical rows, but none owns an App key, so
+  // reporting those rows as mintable makes preflight pass and deployment fail.
+  if (mode !== "app" || !local) return null;
+
+  await store.set(cacheKey, String(local.installationId), GITHUB_TOKEN_CACHE_TTL_SECONDS);
+  return local.installationId;
 }
 
 /**
@@ -300,6 +284,14 @@ export async function getInstallationIdByOrg(
   const cached = await store.get(cacheKey);
   if (cached) return Number(cached);
 
+  // A workspace-owned source is fully local and intentionally wins over the
+  // optional Openship Cloud bridge. It was explicitly configured for this org.
+  const local = await repos.gitInstallation.findByOrgAndOwner(organizationId, owner);
+  if (local?.sourceId) {
+    await store.set(cacheKey, String(local.installationId), GITHUB_TOKEN_CACHE_TTL_SECONDS);
+    return local.installationId;
+  }
+
   // Cloud-app mode: SaaS is the source of truth. cloudGithubInstallations
   // resolves the org owner internally and returns the team's
   // installations in one round-trip — no member iteration needed.
@@ -314,19 +306,24 @@ export async function getInstallationIdByOrg(
 
   if (mode === "cloud-app") {
     const { cloudClient } = await import("../../lib/cloud/client");
-    const list = await cloudClient({ organizationId }).github.installations().catch(() => null);
+    const list = await cloudClient({ organizationId })
+      .github.installations()
+      .catch(() => null);
     if (!list) return null;
-    const match = list.find(
-      (entry) => entry.login.toLowerCase() === owner.toLowerCase(),
-    );
+    const match = list.find((entry) => entry.login.toLowerCase() === owner.toLowerCase());
     if (!match) return null;
     await store.set(cacheKey, String(match.id), GITHUB_TOKEN_CACHE_TTL_SECONDS);
     return match.id;
   }
 
-  // Self-hosted "app" mode. The webhook fires to us, so local DB is
+  // A legacy row is usable only when this process actually owns the App key.
+  // In CLI/OAuth/token mode an old row is metadata, not a credential. Keep the
+  // CLOUD_MODE/no-owner background path working via the synchronous resolver.
+  if (mode !== "app" && getGitHubAuthMode() !== "app") return null;
+
+  // Self-hosted env-App / SaaS mode. The webhook fires to us, so local DB is
   // the source of truth.
-  const row = await repos.gitInstallation.findByOrgAndOwner(organizationId, owner);
+  const row = local ?? (await repos.gitInstallation.findByOrgAndOwner(organizationId, owner));
   if (!row) return null;
 
   await store.set(cacheKey, String(row.installationId), GITHUB_TOKEN_CACHE_TTL_SECONDS);
@@ -371,14 +368,40 @@ export async function getInstallationToken(
   } = {},
 ): Promise<string | null> {
   const organizationId = ctx.organizationId;
-  const mode = await resolveGitHubAuthMode(ctx);
+
+  // Resolve a workspace-owned source before consulting the legacy mode. Custom
+  // Apps are per owner; their presence elsewhere in the workspace must not turn
+  // a source-less historical row into an env-App credential.
+  let installation = installationId
+    ? await repos.gitInstallation.findByOrgOwnerAndInstallationId(
+        organizationId,
+        owner,
+        installationId,
+      )
+    : undefined;
+  installation ??= await repos.gitInstallation.findByOrgAndOwner(organizationId, owner);
+  const custom = installation?.sourceId
+    ? await resolveGitHubSourceCredentialsForInstallation(
+        organizationId,
+        owner,
+        installation.installationId,
+      )
+    : null;
+  // A source-bound installation must never fall through to the process-wide
+  // App key if its source disappears between the row and credential lookups.
+  if (installation?.sourceId && custom?.source.id !== installation.sourceId) return null;
+
+  const mode = custom ? "app" : await resolveGitHubFallbackAuthMode(ctx);
 
   // Narrowed and broad tokens MUST NOT share a cache entry: a broad token served
   // from the narrow key would silently over-grant, and a narrow token served from
   // the broad key would break unrelated callers. Sorted + lowercased so the same
   // repo set always produces the same key.
   const repoScope = opts.repositories?.length
-    ? `:repos:${[...opts.repositories].map((r) => r.toLowerCase()).sort().join(",")}`
+    ? `:repos:${[...opts.repositories]
+        .map((r) => r.toLowerCase())
+        .sort()
+        .join(",")}`
     : "";
 
   if (mode === "cloud-app") {
@@ -416,12 +439,16 @@ export async function getInstallationToken(
         // Cloud proxy may not echo the GitHub expires_at; if absent,
         // synthesize one 55 minutes out — still under the 60-minute
         // mint window so the cache will refresh before it dies.
-        ((minted as { expiresAt?: string }).expiresAt) ??
+        (minted as { expiresAt?: string }).expiresAt ??
         new Date(Date.now() + 55 * 60 * 1000).toISOString(),
     };
     await store.set(cacheKey, encodeTokenEnvelope(envelope), GITHUB_TOKEN_CACHE_TTL_SECONDS);
     return envelope.token;
   }
+
+  // CLI, PAT and OAuth modes do not possess a legacy App private key. Their
+  // token-chain steps remain available after this returns null.
+  if (mode !== "app") return null;
 
   // Local-mint path (cloud-mode SaaS or a self-hosted operator-owned App).
   // Always resolve the canonical workspace row, even when a project snapshot
@@ -429,15 +456,15 @@ export async function getInstallationToken(
   // matching but is not authorization: it may be stale after reinstall, and a
   // caller-controlled/legacy value must never let this App mint for another
   // workspace's installation.
-  const canonicalInstallationId = await getInstallationIdByOrg(organizationId, owner);
-  if (!canonicalInstallationId) return null;
-  installationId = canonicalInstallationId;
+  if (!installation) return null;
+  installationId = installation.installationId;
 
   // The installation token from GitHub is keyed purely on the
   // installationId (an org-wide GitHub resource), so every member of
   // the same org should share one cache entry. Key by org so teammates
   // hit the same mint result.
-  const cacheKey = `instToken:local:org:${organizationId}:${owner}:${installationId}${repoScope}`;
+  const sourceKey = custom?.source.id ?? "legacy";
+  const cacheKey = `instToken:local:org:${organizationId}:${sourceKey}:${owner}:${installationId}${repoScope}`;
   const store = await cacheStore<string>(GH_TOKEN_NS, { maxSize: 5_000 });
   const cachedRaw = await store.get(cacheKey);
   if (cachedRaw) {
@@ -446,22 +473,27 @@ export async function getInstallationToken(
   }
 
   try {
-    const data = await appFetch<{ token: string; expires_at: string }>(
-      `https://api.github.com/app/installations/${installationId}/access_tokens`,
-      {
-        method: "POST",
-        ...(opts.repositories?.length ? { body: { repositories: opts.repositories } } : {}),
-      },
-    );
+    const request = {
+      method: "POST",
+      ...(opts.repositories?.length ? { body: { repositories: opts.repositories } } : {}),
+    };
+    const data = custom
+      ? await githubAppFetch<{ token: string; expires_at: string }>(
+          custom.credentials,
+          `/app/installations/${installationId}/access_tokens`,
+          request,
+        )
+      : await appFetch<{ token: string; expires_at: string }>(
+          `https://api.github.com/app/installations/${installationId}/access_tokens`,
+          request,
+        );
     const envelope: CachedInstallationToken = {
       token: data.token,
       // GitHub's `expires_at` is the SOURCE OF TRUTH for token lifetime.
       // Fall back to a 55-minute window only if the field is missing
       // (shouldn't happen on api.github.com, but defends against
       // GitHub Enterprise variants and test fixtures).
-      expiresAt:
-        data.expires_at ??
-        new Date(Date.now() + 55 * 60 * 1000).toISOString(),
+      expiresAt: data.expires_at ?? new Date(Date.now() + 55 * 60 * 1000).toISOString(),
     };
     await store.set(cacheKey, encodeTokenEnvelope(envelope), GITHUB_TOKEN_CACHE_TTL_SECONDS);
     return envelope.token;
@@ -474,7 +506,7 @@ export async function getInstallationToken(
     // forever.
     const message = (err as Error).message ?? "";
     if (/\(404\)/.test(message) || /Not Found/i.test(message)) {
-      await dropStaleInstallationRows(owner, installationId).catch(() => {
+      await dropStaleInstallationRows(owner, installationId, installation.sourceId).catch(() => {
         /* best-effort */
       });
     }
@@ -492,21 +524,24 @@ export async function getInstallationToken(
 async function dropStaleInstallationRows(
   owner: string,
   installationId: number,
+  sourceId?: string | null,
 ): Promise<void> {
   const rows = await repos.gitInstallation
-    .findByInstallationIdForProvider(installationId)
+    .findByInstallationIdForProvider(installationId, sourceId)
     .catch(() => []);
   const matching = rows.filter((row) => row.owner.toLowerCase() === owner.toLowerCase());
   if (matching.length === 0) return;
   // A GitHub installation id is global for this App. A 404 means every local
   // workspace binding to it is stale, not merely the current member's row.
-  await repos.gitInstallation.removeByInstallationIdForProvider(installationId);
-  await Promise.all([
-    ...new Set(matching.map((row) => row.userId)),
-  ].map((id) => invalidateUserGitHubCache(id)));
-  await Promise.all([
-    ...new Set(matching.map((row) => row.organizationId)),
-  ].map((id) => invalidateOrgGitHubCache(id)));
+  await repos.gitInstallation.removeByInstallationIdForProvider(installationId, sourceId);
+  await Promise.all(
+    [...new Set(matching.map((row) => row.userId))].map((id) => invalidateUserGitHubCache(id)),
+  );
+  await Promise.all(
+    [...new Set(matching.map((row) => row.organizationId))].map((id) =>
+      invalidateOrgGitHubCache(id),
+    ),
+  );
   console.warn(
     `[GitHub] dropped stale gitInstallation row for ${owner} (installationId=${installationId}) — GitHub returned 404`,
   );
@@ -611,9 +646,16 @@ export interface GitHubFetchOptions {
  */
 export async function githubFetch<T = unknown>(opts: GitHubFetchOptions): Promise<T> {
   const method = opts.method ?? "GET";
+  const customApiBase = opts.owner
+    ? await resolveGitHubApiBaseUrl(opts.ctx.organizationId, opts.owner, opts.installationId).catch(
+        () => null,
+      )
+    : null;
 
-  // gh-first for local reads.
-  if (method === "GET") {
+  // gh-first for local reads unless this owner is explicitly backed by a
+  // workspace custom App. A github.com CLI credential cannot authenticate to a
+  // GitHub Enterprise source, and an explicitly configured App is narrower.
+  if (method === "GET" && !customApiBase) {
     const { getLocalGhToken } = await import("./github.local-auth");
     const ghToken = await getLocalGhToken();
     if (ghToken) {
@@ -637,7 +679,7 @@ export async function githubFetch<T = unknown>(opts: GitHubFetchOptions): Promis
     // GHSA-hp2g-hw7g-f3vm at the single funnel every mint passes through,
     // independent of whatever the route-level role check allowed.
     op: opts.authorizeAs ?? (method === "GET" ? "read" : "write"),
-    only: opts.credential,
+    only: customApiBase ? ["app-installation"] : opts.credential,
   });
   const token = result?.token ?? null;
 
@@ -661,8 +703,14 @@ export async function githubFetch<T = unknown>(opts: GitHubFetchOptions): Promis
   // tokenFor owns "which token + is it authorized"; the wire mechanics
   // (headers, querystring, 204, error shape) live in the shared ghFetch
   // primitive so the gh-CLI listing helpers and this path can't drift.
+  const url =
+    result?.source === "app-installation" &&
+    customApiBase &&
+    opts.url.startsWith("https://api.github.com")
+      ? `${customApiBase}${opts.url.slice("https://api.github.com".length)}`
+      : opts.url;
   return ghFetch<T>(token, {
-    url: opts.url,
+    url,
     method,
     params: opts.params,
     headers: opts.headers,
@@ -721,7 +769,10 @@ export async function getUserStatus(userId: string) {
       break;
     case "cli": {
       token = await getUserToken(userId);
-      if (token) { tokenSource = "oauth"; break; }
+      if (token) {
+        tokenSource = "oauth";
+        break;
+      }
       // gh CLI fallback - only if the user hasn't explicitly disconnected it.
       // Otherwise a user who clicked "Disconnect" from cli mode would silently
       // stay connected because gh is still authed on the host.
@@ -780,17 +831,10 @@ export async function getUserStatusWithDiagnostics(
       const rows = await db
         .select({ id: schema.account.id })
         .from(schema.account)
-        .where(
-          and(
-            eq(schema.account.userId, userId),
-            eq(schema.account.providerId, "github"),
-          ),
-        );
+        .where(and(eq(schema.account.userId, userId), eq(schema.account.providerId, "github")));
       githubRowCount = rows.length;
     } catch (err) {
-      console.log(
-        `[cloud-saas:githubUserStatus] account lookup failed: ${safeErrorMessage(err)}`,
-      );
+      console.log(`[cloud-saas:githubUserStatus] account lookup failed: ${safeErrorMessage(err)}`);
     }
     return { connected: false, githubAccountRowsForUser: githubRowCount };
   }
@@ -944,7 +988,17 @@ export async function getUserInstallations(
 ): Promise<GitHubInstallation[]> {
   const userId = ctx.userId;
   const organizationId = ctx.organizationId;
-  const mode = await resolveGitHubAuthMode(ctx);
+  const customConfigured =
+    !env.CLOUD_MODE && (await hasActiveGitHubSource(organizationId).catch(() => false));
+  const customInstallations = customConfigured
+    ? await getStoredInstallationsForOrganization(organizationId, true)
+    : [];
+  // A custom source augments the existing integration. It is authoritative for
+  // owners it covers, but it must not hide installations that still come from
+  // Openship Cloud or the user's OAuth connection.
+  const mode = customConfigured
+    ? await resolveGitHubFallbackAuthMode(ctx)
+    : await resolveGitHubAuthMode(ctx);
 
   if (mode === "cloud-app") {
     // SaaS is the canonical source of truth — the GitHub App's webhook
@@ -959,8 +1013,7 @@ export async function getUserInstallations(
     // per-resource lookups (getInstallationId / getInstallationIdByOrg).
     const { cloudClient } = await import("../../lib/cloud/client");
     const list = await cloudClient({ organizationId }).github.installations();
-    if (!list) return [];
-    return list.map((entry) => ({
+    const cloudInstallations = (list ?? []).map((entry) => ({
       id: entry.id,
       account: {
         login: entry.login,
@@ -973,6 +1026,7 @@ export async function getUserInstallations(
       permissions: {},
       events: [],
     }));
+    return mergeInstallations(customInstallations, cloudInstallations);
   }
 
   // App installations are claimed into a specific workspace by the one-time
@@ -985,11 +1039,11 @@ export async function getUserInstallations(
   }
 
   const token = await getUserToken(userId);
-  if (!token) return [];
+  if (!token) return customInstallations;
 
   try {
-    const userStatus = status ?? await getUserStatus(userId);
-    if (!userStatus.connected) return [];
+    const userStatus = status ?? (await getUserStatus(userId));
+    if (!userStatus.connected) return customInstallations;
 
     const data = await githubFetch<{ installations: GitHubInstallation[] }>({
       ctx,
@@ -1018,7 +1072,7 @@ export async function getUserInstallations(
       console.warn("[GitHub] Failed to sync installations:", (err as Error).message);
     }
 
-    return installations;
+    return mergeInstallations(customInstallations, installations);
   } catch (err) {
     // Surface the underlying error so token-type mismatches (OAuth App vs
     // GitHub App user-to-server token) and other 403s don't disappear
@@ -1035,21 +1089,49 @@ export async function getUserInstallations(
 
 async function getStoredInstallationsForOrganization(
   organizationId: string,
+  customOnly = false,
 ): Promise<GitHubInstallation[]> {
-  const installations = await repos.gitInstallation.listByOrganization(organizationId);
-  return installations.map((installation) => ({
-    id: installation.installationId,
-    account: {
-      login: installation.owner,
-      id: storedAccountId(installation.providerOwnerId),
-      avatar_url: storedAccountAvatarUrl(installation.owner, installation.providerOwnerId),
-      type: installation.ownerType === "Organization" ? "Organization" : "User",
-    },
-    app_id: Number(env.GITHUB_APP_ID ?? 0),
-    target_type: installation.ownerType,
-    permissions: {},
-    events: [],
-  }));
+  const [installations, sources] = await Promise.all([
+    repos.gitInstallation.listByOrganization(organizationId),
+    repos.gitSource.listActiveByOrganization(organizationId).catch(() => []),
+  ]);
+  const sourceById = new Map(sources.map((source) => [source.id, source]));
+  return installations
+    .filter((installation) => !customOnly || installation.sourceId !== null)
+    .map((installation) => ({
+      id: installation.installationId,
+      account: {
+        login: installation.owner,
+        id: storedAccountId(installation.providerOwnerId),
+        avatar_url: storedAccountAvatarUrl(
+          installation.owner,
+          installation.providerOwnerId,
+          installation.sourceId ? sourceById.get(installation.sourceId)?.webBaseUrl : undefined,
+        ),
+        type: installation.ownerType === "Organization" ? "Organization" : "User",
+      },
+      app_id:
+        (installation.sourceId ? sourceById.get(installation.sourceId)?.appId : undefined) ??
+        Number(env.GITHUB_APP_ID ?? 0),
+      target_type: installation.ownerType,
+      permissions: {},
+      events: [],
+    }));
+}
+
+/** Merge installation catalogs by owner, preserving the first list's source
+ * preference. The rest of the GitHub UI selects accounts by login, so returning
+ * duplicate rows for the same owner would create duplicate controls without a
+ * way for the user to distinguish them. */
+function mergeInstallations(...lists: GitHubInstallation[][]): GitHubInstallation[] {
+  const merged = new Map<string, GitHubInstallation>();
+  for (const list of lists) {
+    for (const installation of list) {
+      const key = installation.account.login.toLowerCase();
+      if (!merged.has(key)) merged.set(key, installation);
+    }
+  }
+  return [...merged.values()];
 }
 
 function storedAccountId(providerOwnerId?: string | null): number {
@@ -1057,10 +1139,16 @@ function storedAccountId(providerOwnerId?: string | null): number {
   return Number.isFinite(id) && id > 0 ? id : 0;
 }
 
-function storedAccountAvatarUrl(owner: string, providerOwnerId?: string | null): string {
+function storedAccountAvatarUrl(
+  owner: string,
+  providerOwnerId?: string | null,
+  webBaseUrl = "https://github.com",
+): string {
   const id = storedAccountId(providerOwnerId);
-  if (id > 0) return `https://avatars.githubusercontent.com/u/${id}?v=4`;
-  return `https://github.com/${encodeURIComponent(owner)}.png`;
+  if (webBaseUrl === "https://github.com" && id > 0) {
+    return `https://avatars.githubusercontent.com/u/${id}?v=4`;
+  }
+  return `${webBaseUrl.replace(/\/+$/, "")}/${encodeURIComponent(owner)}.png`;
 }
 
 // Pure mapper lives in ./sources/mappers; re-exported for back-compat.
@@ -1102,14 +1190,33 @@ export function getGitHubAuthMode(): GitHubAuthMode {
  * The canonical answer for any request that has a userId. Resolution:
  *
  *   1. `CLOUD_MODE=true` (this IS api.openship.io) → "app", unconditionally.
- *   2. Explicit `GITHUB_AUTH_MODE` env var → used as-is on self-hosted only.
- *   3. Self-hosted + the user is connected to Openship Cloud → "cloud-app".
+ *   2. A workspace-owned custom App → "app" for the composite source UI.
+ *   3. Explicit `GITHUB_AUTH_MODE` env var → used as-is on self-hosted only.
+ *   4. Self-hosted + the user is connected to Openship Cloud → "cloud-app".
  *      All App-scoped operations (install URL, list installations, mint
  *      install token, OAuth identity) proxy through api.openship.io.
- *   4. Self-hosted + NOT cloud-connected → "cli" (the gh CLI / PAT
+ *   5. Self-hosted + NOT cloud-connected → "cli" (the gh CLI / PAT
  *      escape hatch — no App-scoped features available).
+ *
+ * Credential resolution is owner-aware and calls
+ * `resolveGitHubFallbackAuthMode` when no custom source covers the requested
+ * owner. The workspace-level answer here must never make one custom App hijack
+ * unrelated legacy/Cloud owners.
  */
 export async function resolveGitHubAuthMode(ctx: RequestContext): Promise<GitHubAuthMode> {
+  if (env.CLOUD_MODE) return "app";
+
+  // A source created in the dashboard is an explicit, workspace-scoped App
+  // configuration. It takes precedence over the legacy process-wide mode: an
+  // operator must not be able to save a valid App and then have every runtime
+  // path silently keep using `gh` because GITHUB_AUTH_MODE was left at `cli`.
+  if (await hasActiveGitHubSource(ctx.organizationId).catch(() => false)) return "app";
+
+  return resolveGitHubFallbackAuthMode(ctx);
+}
+
+/** Resolve the pre-custom-source mode for an owner not backed by a custom App. */
+async function resolveGitHubFallbackAuthMode(ctx: RequestContext): Promise<GitHubAuthMode> {
   if (env.CLOUD_MODE) return "app";
 
   const explicit = env.GITHUB_AUTH_MODE;
@@ -1124,9 +1231,7 @@ export async function resolveGitHubAuthMode(ctx: RequestContext): Promise<GitHub
   // "cli" just because the member personally isn't cloud-connected. Falls
   // back to the user-scoped check only when there's no org context.
   try {
-    const { isCloudConnectedForOrg, isCloudConnected } = await import(
-      "../../lib/cloud/session"
-    );
+    const { isCloudConnectedForOrg, isCloudConnected } = await import("../../lib/cloud/session");
     const connected = ctx.organizationId
       ? await isCloudConnectedForOrg(ctx.organizationId)
       : await isCloudConnected(ctx.userId);
@@ -1201,9 +1306,23 @@ export function getInstallUrl(): string {
  */
 export async function resolveInstallUrl(
   ctx: RequestContext,
+  sourceId?: string,
 ): Promise<{ url: string; state: string; cloudUnreachable?: boolean }> {
   const userId = ctx.userId;
   const organizationId = ctx.organizationId;
+  if (sourceId) {
+    if (ctx.role !== "owner") return { url: "", state: "" };
+    return createSourceInstallUrl(ctx, sourceId);
+  }
+  const preferredSource =
+    (await repos.gitSource.findDefault(organizationId).catch(() => undefined)) ??
+    (await repos.gitSource.listActiveByOrganization(organizationId).catch(() => []))[0];
+  if (preferredSource) {
+    return ctx.role === "owner"
+      ? createSourceInstallUrl(ctx, preferredSource.id)
+      : { url: "", state: "" };
+  }
+
   const mode = await resolveGitHubAuthMode(ctx);
   if (mode === "cloud-app") {
     // Bind the install to the active org so the resulting installation
@@ -1277,8 +1396,7 @@ export async function consumeInstallState(
   if (!binding) return null;
   if (
     binding.userId !== expectedUserId ||
-    (expectedOrganizationId !== undefined &&
-      binding.organizationId !== expectedOrganizationId)
+    (expectedOrganizationId !== undefined && binding.organizationId !== expectedOrganizationId)
   ) {
     // Do not consume on a caller/workspace mismatch. The nonce is unguessable,
     // and preserving it lets the legitimate user return to the originating
@@ -1310,9 +1428,7 @@ export async function consumeInstallState(
  * cli mode (self-hosted + NO cloud): there's no GitHub OAuth flow
  * available — the user can only use gh CLI. Returns null.
  */
-export async function resolveOauthHandoffUrl(
-  userId: string,
-): Promise<{ url: string } | null> {
+export async function resolveOauthHandoffUrl(userId: string): Promise<{ url: string } | null> {
   // userId-only path — the OAuth handoff is initiated before any org
   // is in scope (it IS the connect flow). Use the internal resolver.
   const mode = await resolveAuthModeForUserId(userId);
@@ -1371,8 +1487,6 @@ export async function disconnectUser(
       }
     }
   } catch (err) {
-    console.warn(
-      `[GitHub] disconnect cache sweep failed for ${userId}: ${(err as Error).message}`,
-    );
+    console.warn(`[GitHub] disconnect cache sweep failed for ${userId}: ${(err as Error).message}`);
   }
 }

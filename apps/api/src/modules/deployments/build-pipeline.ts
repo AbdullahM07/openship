@@ -76,6 +76,7 @@ import {
 import { normalizeTargetPath } from "../../lib/public-endpoints";
 import { resolveRuntimeResources, resolveBuildResources } from "../../lib/resources";
 import { cloneOnServerAvailable, resolveBuildGitToken } from "../github/clone-auth";
+import { resolveGitHubWebBaseUrl } from "../github/github-source.service";
 import { openDeployRelay } from "../../lib/git-forwarding";
 import { resolveOrgOwner } from "../../lib/org-actor";
 import { resolveAcmeProviderOptions } from "../../lib/acme-config";
@@ -814,6 +815,21 @@ async function executeBuildAndDeploy(
     const orgOwner = await resolveOrgOwner(dep.organizationId).catch(() => null);
     const actorUserId = orgOwner?.userId ?? "";
 
+    // Projects created before a GitHub Enterprise source was connected may
+    // still carry github.com's clone origin. The installation is the durable
+    // source selector, so normalize the frozen snapshot at execution time too;
+    // this covers old projects and source rebindings without a data rewrite.
+    if (project.gitOwner && project.gitRepo) {
+      const webBaseUrl = await resolveGitHubWebBaseUrl(
+        dep.organizationId,
+        project.gitOwner,
+        project.installationId ?? undefined,
+      ).catch(() => null);
+      if (webBaseUrl) {
+        snapshot.repoUrl = `${webBaseUrl.replace(/\/+$/, "")}/${project.gitOwner}/${project.gitRepo}.git`;
+      }
+    }
+
     // Resolved up front so the relay-fallback gate below can exclude
     // multi-service builds (whose clone path differs).
     const { useServicePipeline, servicePreflightServices } = await resolveServicePipelineMode(
@@ -882,6 +898,7 @@ async function executeBuildAndDeploy(
           projectId: project.id,
           owner: project.gitOwner ?? undefined,
           repo: project.gitRepo ?? undefined,
+          installationId: project.installationId ?? undefined,
           buildStrategy: clonePlan.cloneCredentialPurpose,
           // Only meaningful for an on-server clone — lets a per-server GitHub auth
           // config (device token / PAT / SSH key) win for that server.
@@ -2283,9 +2300,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
           phase.cancellationSignal,
         ),
       signal: phase.cancellationSignal,
-      keepProvisionedOnCancel: deploymentCancellationKeepsProvisioned(
-        phase.cancellationSignal,
-      ),
+      keepProvisionedOnCancel: deploymentCancellationKeepsProvisioned(phase.cancellationSignal),
     },
     logger,
   );
@@ -2314,12 +2329,14 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
       deployResult.containerId &&
       !isStaticFileServe
     ) {
-      await runtime.destroy(deployResult.containerId).catch((err) =>
-        logger.log(
-          `Warning: failed to clean up cancelled container: ${safeErrorMessage(err)}\n`,
-          "warn",
-        ),
-      );
+      await runtime
+        .destroy(deployResult.containerId)
+        .catch((err) =>
+          logger.log(
+            `Warning: failed to clean up cancelled container: ${safeErrorMessage(err)}\n`,
+            "warn",
+          ),
+        );
     }
     await onCancelled(ctx, buildResult.durationMs, {
       keepProvisioned: deploymentCancellationKeepsProvisioned(phase.cancellationSignal),

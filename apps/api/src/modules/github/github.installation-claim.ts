@@ -19,6 +19,7 @@ import {
   resolveGitHubAuthMode,
 } from "./github.auth";
 import { verifyGitHubInstallationForUser } from "./github.installation-verification";
+import { verifyGitHubInstallationForSource } from "./github.installation-verification";
 
 export type LocalInstallationClaimResult =
   | { kind: "ok"; installation: { id: number; login: string; type: string } }
@@ -35,17 +36,6 @@ export async function claimLocalGitHubInstallation(
     setupAction?: string;
   },
 ): Promise<LocalInstallationClaimResult> {
-  if (
-    env.CLOUD_MODE ||
-    !localGitHubAppConfiguration.configured ||
-    (await resolveGitHubAuthMode(ctx)) !== "app"
-  ) {
-    return {
-      kind: "forbidden",
-      message: "This instance is not using an operator-owned GitHub App.",
-    };
-  }
-
   const state = typeof input.state === "string" ? input.state.trim() : "";
   const installationId = Number(input.installationId);
   if (!state || !Number.isSafeInteger(installationId) || installationId <= 0) {
@@ -58,11 +48,33 @@ export async function claimLocalGitHubInstallation(
   if (
     !binding ||
     binding.userId !== ctx.userId ||
-    binding.organizationId !== ctx.organizationId
+    binding.organizationId !== ctx.organizationId ||
+    binding.flow !== "install"
   ) {
     return {
       kind: "forbidden",
       message: "This install link is expired, already used, or belongs to another workspace.",
+    };
+  }
+
+  const customSource = binding.sourceId
+    ? await repos.gitSource.findActiveById(ctx.organizationId, binding.sourceId)
+    : undefined;
+  if (binding.sourceId && !customSource) {
+    return {
+      kind: "forbidden",
+      message: "This GitHub source no longer exists or is not active.",
+    };
+  }
+  if (
+    !customSource &&
+    (env.CLOUD_MODE ||
+      !localGitHubAppConfiguration.configured ||
+      (await resolveGitHubAuthMode(ctx)) !== "app")
+  ) {
+    return {
+      kind: "forbidden",
+      message: "This instance is not using an operator-owned GitHub App.",
     };
   }
 
@@ -74,7 +86,9 @@ export async function claimLocalGitHubInstallation(
   }
 
   try {
-    const verification = await verifyGitHubInstallationForUser(ctx.userId, installationId);
+    const verification = customSource
+      ? await verifyGitHubInstallationForSource(customSource, installationId)
+      : await verifyGitHubInstallationForUser(ctx.userId, installationId);
     if (verification.kind === "forbidden") {
       return { kind: "forbidden", message: verification.message };
     }
@@ -83,6 +97,7 @@ export async function claimLocalGitHubInstallation(
     const claimed = await repos.gitInstallation.claimWithState(state, {
       userId: ctx.userId,
       organizationId: ctx.organizationId,
+      sourceId: customSource?.id ?? null,
       provider: "github",
       installationId,
       owner: account.login.toLowerCase(),
@@ -107,21 +122,24 @@ export async function claimLocalGitHubInstallation(
       console.warn(`[GitHub] installation cache invalidation failed: ${safeErrorMessage(error)}`);
     });
 
-    await repos.auditEvent.create({
-      organizationId: ctx.organizationId,
-      actorUserId: ctx.userId,
-      eventType: "github.install",
-      resourceType: "github",
-      resourceId: String(installationId),
-      source: "dashboard",
-      before: null,
-      after: {
-        installationId,
-        owner: account.login,
-        ownerType: account.type,
-        authMode: "self-hosted-app",
-      },
-    }).catch(() => {});
+    await repos.auditEvent
+      .create({
+        organizationId: ctx.organizationId,
+        actorUserId: ctx.userId,
+        eventType: "github.install",
+        resourceType: "github",
+        resourceId: String(installationId),
+        source: "dashboard",
+        before: null,
+        after: {
+          installationId,
+          owner: account.login,
+          ownerType: account.type,
+          authMode: "self-hosted-app",
+          sourceId: customSource?.id ?? null,
+        },
+      })
+      .catch(() => {});
 
     return {
       kind: "ok",

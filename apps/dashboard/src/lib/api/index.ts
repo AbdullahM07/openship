@@ -63,8 +63,15 @@ export {
 } from "./jobs";
 export { tokensApi } from "./tokens";
 export type { AccessToken, CreatedAccessToken, McpClient, McpClientDetail } from "./tokens";
-export { githubApi } from "./github";
-export type { RepoTreeEntry } from "./github";
+export { githubApi, GITHUB_SOURCES_CHANGED_EVENT } from "./github";
+export type {
+  RepoTreeEntry,
+  GitHubSource,
+  GitHubSourceConfiguration,
+  GitHubSourceInstallation,
+  ManualGitHubSourceInput,
+  UpdateGitHubSourceInput,
+} from "./github";
 export { iconsApi } from "./icons";
 export { imagesApi } from "./images";
 export type { ImageCatalogEntry, ListImagesResponse } from "./images";
