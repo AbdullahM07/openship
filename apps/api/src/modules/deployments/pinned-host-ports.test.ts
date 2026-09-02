@@ -157,6 +157,65 @@ describe("pinnedHostPortsToAvoid", () => {
     });
   });
 
+  it("repairs a missing canonical claim only when the live binding proves the carried port", async () => {
+    const canonicalClaims: Array<ReturnType<typeof storedClaim>> = [];
+    claimRepo.list.mockImplementation(async (targetKey: string) =>
+      targetKey === remoteTarget.targetKey ? canonicalClaims : [],
+    );
+    claimRepo.reserve.mockImplementation(async (input) => {
+      const claim = storedClaim("reconciled", input.targetKey, input);
+      canonicalClaims.push(claim);
+      return claim;
+    });
+
+    const result = await prepareTargetPinnedHostPorts({
+      target: remoteTarget,
+      edgeProxy: { listLoopbackUpstreamPortsStrict: async () => new Set([20008]) },
+      verifiedCarriedHostPorts: [
+        {
+          owner: { projectId: "compose", serviceId: "api", containerPort: 4000 },
+          hostPort: 20008,
+          liveHostPortByContainerPort: { 4000: 20008 },
+        },
+      ],
+    });
+
+    expect(claimRepo.reserve).toHaveBeenCalledWith({
+      targetKey: remoteTarget.targetKey,
+      projectId: "compose",
+      serviceId: "api",
+      containerPort: 4000,
+      port: 20008,
+    });
+    expect(claimRepo.quarantine).not.toHaveBeenCalled();
+    expect(result).toEqual(expect.arrayContaining([expect.objectContaining({ port: 20008 })]));
+  });
+
+  it("does not repair a cached port when the live binding disagrees", async () => {
+    const canonicalClaims: Array<ReturnType<typeof storedClaim>> = [];
+    claimRepo.list.mockImplementation(async (targetKey: string) =>
+      targetKey === remoteTarget.targetKey ? canonicalClaims : [],
+    );
+
+    await prepareTargetPinnedHostPorts({
+      target: remoteTarget,
+      edgeProxy: { listLoopbackUpstreamPortsStrict: async () => new Set([20008]) },
+      verifiedCarriedHostPorts: [
+        {
+          owner: { projectId: "compose", serviceId: "api", containerPort: 4000 },
+          hostPort: 20008,
+          liveHostPortByContainerPort: { 4000: 20000 },
+        },
+      ],
+    });
+
+    expect(claimRepo.reserve).not.toHaveBeenCalled();
+    expect(claimRepo.quarantine).toHaveBeenCalledWith({
+      targetKey: remoteTarget.targetKey,
+      port: 20008,
+    });
+  });
+
   it("blocks allocation preparation when edge inventory is inconclusive", async () => {
     const failure = new Error("edge config unreadable");
     await expect(

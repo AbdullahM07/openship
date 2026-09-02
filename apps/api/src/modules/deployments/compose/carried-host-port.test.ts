@@ -74,7 +74,7 @@ describe("the deploy routes the carried port through the allocator", () => {
   });
 
   it("fails closed on the same target and reports legitimate host migrations", () => {
-    expect(block).toContain("hostPort !== carried");
+    expect(block).toContain("allocation.port !== allocation.preferred");
     expect(block).toContain("lockPreferred: lockCarriedHostPorts");
     expect(block).toContain("Project moved hosts");
   });

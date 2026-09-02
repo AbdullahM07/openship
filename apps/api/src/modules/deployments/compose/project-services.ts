@@ -21,7 +21,7 @@ export function isMultiServiceProject(
 ): boolean {
   // A declared compose file is authoritative project shape, even for a legacy
   // row whose framework still says plain "docker" and has no service rows yet.
-  // This is also the bootstrap signal reconcileComposeDrift uses to create the
+  // This is also the bootstrap signal reconcileComposeSource uses to create the
   // first rows; without it composePath only affected scanning, not deployment.
   if (project.composePath?.trim()) return true;
   const framework = project.framework as StackId | undefined;

@@ -121,11 +121,12 @@ vi.mock("../github/github.service", () => ({
   resolveDefaultBranch: async () => "main",
   listBranches: async () => h.branches,
   getLatestCommit: async () => null,
+  getWebhookStrategy: () => "per-project",
   resolveWebhookStrategy: async () => ({}),
 }));
 vi.mock("../github/github.auth", () => ({
   getInstallationIdByOrg: async () => undefined,
-  getInstallUrl: () => "",
+  resolveInstallUrl: async () => ({ url: "", state: "" }),
 }));
 vi.mock("./project-git-webhook", () => ({
   ensureSharedWebhook: async () => null,

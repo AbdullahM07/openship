@@ -106,13 +106,9 @@ export function elevatedExecutor(inner: CommandExecutor): CommandExecutor {
    * `chown 0:0` before the move because `mv` PRESERVES ownership, both by rename and by
    * cross-device copy: the published file was landing under /etc owned by the login user,
    * so on exactly the hosts this decorator exists for, a non-root account could rewrite
-   * root's nginx.conf after we wrote it. `mv` preserves the MODE the same way, and that
-   * cuts both ways. The default is deliberately left alone — forcing one here would
-   * silently loosen a caller's own (`nginx.ts` `_writeFile` sets its on the staged path).
-   * But a caller that names `opts.mode` gets it applied to the staged copy INSIDE the
-   * same `sudo` as the publish: a chmod of the published path afterwards is a separate
-   * round trip, and for that whole round trip a secret sat readable by every local
-   * account — the SASL relay map did exactly that (#756).
+   * root's nginx.conf after we wrote it. The default mode is deliberately left alone;
+   * secret callers pass `writeFile(..., { mode: 0o600 })`, while forcing one mode here
+   * would silently loosen or over-tighten other configs.
    */
   const writeFileElevated = async (
     path: string,
@@ -123,13 +119,11 @@ export function elevatedExecutor(inner: CommandExecutor): CommandExecutor {
     await inner.exec(`mkdir -m 700 ${sq(stage)}`);
     try {
       const staged = `${stage}/payload`;
-      await inner.writeFile(staged, content, opts);
-      const tighten =
-        opts?.mode === undefined ? "" : `chmod ${opts.mode.toString(8)} ${sq(staged)} && `;
+      if (opts === undefined) await inner.writeFile(staged, content);
+      else await inner.writeFile(staged, content, opts);
       await inner.exec(
         elevateCommand(
-          `mkdir -p ${sq(dirOf(path))} && ${tighten}chown 0:0 ${sq(staged)} && ` +
-            `mv -f ${sq(staged)} ${sq(path)}`,
+          `mkdir -p ${sq(dirOf(path))} && chown 0:0 ${sq(staged)} && mv -f ${sq(staged)} ${sq(path)}`,
         ),
       );
     } finally {

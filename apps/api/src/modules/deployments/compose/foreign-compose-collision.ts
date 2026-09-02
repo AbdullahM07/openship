@@ -5,6 +5,23 @@ export interface ForeignComposeCollision {
   containerName: string;
 }
 
+const PARALLEL_STACK_RESOURCE_STATES = new Set([
+  "running",
+  "restarting",
+  "paused",
+  "created",
+]);
+
+/**
+ * A stopped container is historical state and cannot create a parallel
+ * workload or reserve its published ports. Keep the guard fail-closed for
+ * containers that can still own resources, including a freshly-created
+ * container whose port binding exists before its first start.
+ */
+function canBlockParallelStack(state: string | undefined): boolean {
+  return PARALLEL_STACK_RESOURCE_STATES.has(state?.trim().toLowerCase() ?? "");
+}
+
 /**
  * Detect a pre-existing Docker Compose stack which merely shares this project's
  * slug. A normal deployment does not own those containers and must not silently
@@ -21,6 +38,7 @@ export function findForeignComposeCollisions(input: {
   return input.containers
     .filter(
       (container) =>
+        canBlockParallelStack(container.state) &&
         !tracked.has(container.id) &&
         container.composeProject === input.slug &&
         !!container.composeService &&

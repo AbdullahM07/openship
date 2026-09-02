@@ -34,6 +34,34 @@ import {
   type RoutedDomainInput,
 } from "./route-registration";
 
+/** Raised internally when the outer deployment worker was cancelled. */
+export class DeployCancelledError extends Error {
+  constructor(message = "Deployment cancelled") {
+    super(message);
+    this.name = "DeployCancelledError";
+  }
+}
+
+function throwIfCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DeployCancelledError();
+}
+
+function delayWithCancellation(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new DeployCancelledError());
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      reject(new DeployCancelledError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 // ─── Prompt callback ────────────────────────────────────────────────────────
 
 /**
@@ -203,10 +231,15 @@ export interface DeployPipelineInput {
   routeOptions?: RouteRegistrationOptions;
   /** Callback to pause and prompt the user - required for interactive preflight. */
   promptUser?: PromptUserFn;
+  /** Outer deployment cancellation. Checked at every mutating boundary. */
+  signal?: AbortSignal;
+  /** Record-only teardown: stop the worker but leave runtime resources exactly
+   * as they are, including a newly activated workload and retained predecessor. */
+  keepProvisionedOnCancel?: boolean;
 }
 
 export interface DeployPipelineResult {
-  status: "ready" | "failed";
+  status: "ready" | "failed" | "cancelled";
   containerId?: string;
   url?: string;
   error?: string;
@@ -272,7 +305,16 @@ export async function runDeployPipeline(
   input: DeployPipelineInput,
   logger: BuildLogger,
 ): Promise<DeployPipelineResult> {
-  const { config, previousContainerId, domains, routing, ssl, routeOptions, promptUser } = input;
+  const {
+    config,
+    previousContainerId,
+    domains,
+    routing,
+    ssl,
+    routeOptions,
+    promptUser,
+    signal,
+  } = input;
   const overlap = env.canOverlap === true;
   const teardownTimeoutMs = input.teardownTimeoutMs ?? TEARDOWN_TIMEOUT_MS;
 
@@ -349,12 +391,14 @@ export async function runDeployPipeline(
   };
 
   try {
+    throwIfCancelled(signal);
     logger.step("deploy", "running", "Deploying...");
 
     // ── Pre-deploy validation ────────────────────────────────────────
     if (env.preflight) {
       const noopPrompt: PromptUserFn = async () => "abort";
       await env.preflight(config, promptUser ?? noopPrompt);
+      throwIfCancelled(signal);
     }
 
     // ── Non-overlap only: stop OLD first (it holds the fixed port) ─────
@@ -364,13 +408,15 @@ export async function runDeployPipeline(
     if (!overlap && previousContainerId) {
       await stopPreviousRetaining();
       // Give the OS a moment to release the port / socket.
-      await new Promise((r) => setTimeout(r, 1000));
+      await delayWithCancellation(1000, signal);
     }
 
     // ── Activate the new deployment ──────────────────────────────────
+    throwIfCancelled(signal);
     const onLog: LogCallback = (entry) => logger.callback(entry);
     const { containerId, url } = await env.activate(config, onLog);
     activatedContainerId = containerId;
+    throwIfCancelled(signal);
 
     if (!containerId) {
       throw new Error("Deploy completed but no container was created");
@@ -381,6 +427,7 @@ export async function runDeployPipeline(
     // here and the overlap path auto-reverts to the still-running old one.
     if (env.healthCheck) {
       await env.healthCheck(containerId, config);
+      throwIfCancelled(signal);
     }
 
     // ── Register routes (repoint traffic to the new deployment) ───────
@@ -389,6 +436,7 @@ export async function runDeployPipeline(
       : env.resolveTargetUrl
         ? await env.resolveTargetUrl(containerId, config.port).then((targetUrl) => targetUrl ? { targetUrl } : null)
         : null;
+    throwIfCancelled(signal);
     const routeTargetsByPort = env.resolveTargetUrl
       ? new Map<number, Omit<RouteConfig, "domain" | "tls">>()
       : undefined;
@@ -399,6 +447,7 @@ export async function runDeployPipeline(
       );
 
       for (const port of uniquePorts) {
+        throwIfCancelled(signal);
         if (port === config.port && routeTarget) {
           routeTargetsByPort.set(port, routeTarget);
           continue;
@@ -422,6 +471,7 @@ export async function runDeployPipeline(
       routeTargetsByPort,
       routeOptions,
     );
+    throwIfCancelled(signal);
 
     // ── Overlap only: now the new one is healthy + routed, stop OLD LAST ─
     // Best-effort, and a no-op when the caller set deactivatePrevious=false
@@ -446,8 +496,17 @@ export async function runDeployPipeline(
     const msg = safeErrorMessage(err);
     const errorCode = err instanceof DeployError ? err.code : undefined;
     const errorDetails = err instanceof DeployError ? err.details : undefined;
-    logger.step("deploy", "failed", `Deploy failed: ${msg}`);
-    logger.log(`\x1b[1;31mDeploy failed: ${msg}\x1b[0m\n`, "error");
+    const cancelled = signal?.aborted || err instanceof DeployCancelledError;
+    if (cancelled) {
+      logger.step("deploy", "failed", "Deployment cancelled");
+      logger.log(
+        "Deployment cancelled while it was unwinding; the previous release was preserved.\n",
+        "warn",
+      );
+    } else {
+      logger.step("deploy", "failed", `Deploy failed: ${msg}`);
+      logger.log(`\x1b[1;31mDeploy failed: ${msg}\x1b[0m\n`, "error");
+    }
 
     // Non-overlap auto-revert: the old deployment was stopped before the new one
     // started, so on failure start it again (best-effort — the pre-stop RETAINS it
@@ -455,7 +514,12 @@ export async function runDeployPipeline(
     // there is nothing to restore. Without this a failed health gate left the
     // project with no running deployment at all, since the caller also reaps the
     // failed deploy's own container.
-    if (!overlap && previousContainerId && env.reactivatePrevious) {
+    if (
+      !overlap &&
+      previousContainerId &&
+      env.reactivatePrevious &&
+      !(cancelled && input.keepProvisionedOnCancel)
+    ) {
       try {
         logger.log("Deploy failed — restarting the previous deployment…\n", "warn");
         // Free the contended port FIRST. The failed deployment is still running
@@ -483,6 +547,10 @@ export async function runDeployPipeline(
       }
     }
 
-    return { status: "failed", error: msg, errorCode, errorDetails, containerId: activatedContainerId };
+    return {
+      status: cancelled ? "cancelled" : "failed",
+      ...(cancelled ? { error: "Deployment cancelled" } : { error: msg, errorCode, errorDetails }),
+      containerId: activatedContainerId,
+    };
   }
 }

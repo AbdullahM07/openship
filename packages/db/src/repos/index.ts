@@ -12,6 +12,7 @@ export {
   type NewGithubInstallState,
   type CreateInstallStateInput,
 } from "./github-install-state.repo";
+export { createGitSourceRepo, type GitSource, type NewGitSource } from "./git-source.repo";
 export {
   createPersonalAccessTokenRepo,
   type PersonalAccessToken,
@@ -269,6 +270,7 @@ import { createSessionRepo } from "./session.repo";
 import { createAccountRepo } from "./account.repo";
 import { createGitInstallationRepo } from "./git-installation.repo";
 import { createGithubInstallStateRepo } from "./github-install-state.repo";
+import { createGitSourceRepo } from "./git-source.repo";
 import { createProjectGroupRepo } from "./project-group.repo";
 import { createProjectRepo } from "./project.repo";
 import { createDeploymentRepo } from "./deployment.repo";
@@ -353,6 +355,7 @@ export const repos = {
   account: createAccountRepo(db),
   gitInstallation: createGitInstallationRepo(db),
   githubInstallState: createGithubInstallStateRepo(db),
+  gitSource: createGitSourceRepo(db),
   projectGroup: createProjectGroupRepo(db),
   project: createProjectRepo(db),
   deployment: createDeploymentRepo(db),

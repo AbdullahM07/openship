@@ -239,7 +239,14 @@ export const deployApi = {
     api.get<any>(endpoints.deploy.list, { params: opts }),
 
   /** Cancel a deployment */
-  cancel: (id: string) => api.post<any>(endpoints.deploy.cancel(id)),
+  cancel: (id: string) =>
+    api.post<{
+      success: boolean;
+      pending: boolean;
+      status: "cancelling" | "cancelled";
+      message: string;
+      error?: string;
+    }>(endpoints.deploy.cancel(id)),
 
   /** Delete a deployment */
   deleteDeployment: (id: string) => api.delete<any>(endpoints.deploy.delete(id)),

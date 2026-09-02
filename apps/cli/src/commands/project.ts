@@ -51,6 +51,8 @@ function printProject(project: Record<string, unknown>): void {
       project.gitOwner && project.gitRepo ? `${project.gitOwner}/${project.gitRepo}` : null,
     ],
     ["gitBranch", project.gitBranch],
+    ["deployTarget", project.deployTarget],
+    ["serverId", project.serverId],
     ["autoDeploy", project.autoDeploy],
     ["status", project.status],
   ];
@@ -198,6 +200,7 @@ const createCmd = new Command("create")
   .option("--local-path <path>", "Local source path")
   .option("--port <port>", "Container port", (v) => Number(v))
   .option("--type <type>", "Project type: app | docker | services | monorepo")
+  .option("--server <id>", "Registered server ID (see `openship server list`)")
   .action(
     action(async (opts) => {
       const body: Record<string, unknown> = { name: opts.name };
@@ -209,8 +212,13 @@ const createCmd = new Command("create")
       if (opts.localPath) body.localPath = opts.localPath;
       if (opts.port) body.port = opts.port;
       if (opts.type) body.projectType = opts.type;
+      if (opts.server) body.serverId = opts.server;
 
-      const { data } = await apiRequest<{ data: Record<string, unknown> }>("/projects", {
+      // Local imports must go through the API's canonical scanner so a Compose
+      // project is created with its service rows. Parsing on the CLI would drift
+      // from GitHub imports and would only work when the CLI and API share a host.
+      const endpoint = opts.localPath ? "/projects/import" : "/projects";
+      const { data } = await apiRequest<{ data: Record<string, unknown> }>(endpoint, {
         method: "POST",
         body: JSON.stringify(body),
       });

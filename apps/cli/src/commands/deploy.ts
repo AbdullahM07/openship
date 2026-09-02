@@ -7,7 +7,7 @@
  *                 MCP / dashboard folder deploy uses (see lib/folder-deploy.ts).
  *
  * The git path's controller accepts an allowlist body ({ projectId, branch,
- * commitSha, environment, forceAll, serviceIds, smartRoute, refresh }) and
+ * commitSha, environment, serverId, forceAll, serviceIds, smartRoute, refresh }) and
  * responds 202 with { data: { deployment_id, project_id } }; --watch attaches
  * to the GET /:id/stream SSE path.
  */
@@ -23,9 +23,11 @@ import { isJsonMode, printJson, err, info } from "../lib/output";
 /** Read a value from git, or undefined when not in a repo / git missing. */
 function git(args: string[]): string | undefined {
   try {
-    return execFileSync("git", args, { stdio: ["ignore", "pipe", "ignore"] })
-      .toString()
-      .trim() || undefined;
+    return (
+      execFileSync("git", args, { stdio: ["ignore", "pipe", "ignore"] })
+        .toString()
+        .trim() || undefined
+    );
   } catch {
     return undefined;
   }
@@ -45,7 +47,11 @@ export const deployCommand = new Command("deploy")
   .option("--service-ids <ids>", "Comma-separated service IDs to deploy (smart routing)")
   .option("--smart-route", "Rebuild only services changed since the active deploy")
   .option("--refresh", "Re-apply current env to the active deploy (no git pull, no rebuild)")
-  .option("--name <name>", "Project name for a folder (non-git) deploy (defaults to the directory name)")
+  .option(
+    "--name <name>",
+    "Project name for a folder (non-git) deploy (defaults to the directory name)",
+  )
+  .option("--server <id>", "Registered server ID (see `openship server list`)")
   .option("--watch", "Stream the deployment logs until it finishes")
   .action(async (opts) => {
     const link = readProjectLink();
@@ -65,7 +71,10 @@ export const deployCommand = new Command("deploy")
     // git-only; commit/smart-route/refresh genuinely need git history.
     const gitOnlyFlags = opts.commit || opts.smartRoute || opts.refresh;
     const serviceIds: string[] | undefined = opts.serviceIds
-      ? opts.serviceIds.split(",").map((s: string) => s.trim()).filter(Boolean)
+      ? opts.serviceIds
+          .split(",")
+          .map((s: string) => s.trim())
+          .filter(Boolean)
       : undefined;
 
     let deploymentId: string | undefined;
@@ -79,6 +88,7 @@ export const deployCommand = new Command("deploy")
           name: opts.name,
           projectId: opts.project || link?.projectId,
           environment: env,
+          serverId: opts.server,
           serviceIds,
           onStep: (m) => {
             if (spinner) spinner.text = m;
@@ -121,6 +131,7 @@ export const deployCommand = new Command("deploy")
         branch,
         commitSha: opts.commit || undefined,
         environment: env,
+        serverId: opts.server || undefined,
         forceAll: opts.forceAll || undefined,
         serviceIds,
         smartRoute: opts.smartRoute || undefined,

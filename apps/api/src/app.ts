@@ -3,7 +3,7 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { env, trustedOrigins } from "./config/env";
 import { handleApiError } from "./middleware/error-handler";
-import { rateLimiterFor } from "./middleware/rate-limiter";
+import { authRouteLimiter } from "./middleware/rate-limiter";
 import { clientIpMiddleware } from "./middleware/client-ip";
 import { betterAuthShield } from "./middleware/better-auth-shield";
 import { forceMcpConsent } from "./middleware/mcp-consent";
@@ -14,6 +14,7 @@ import { validatePlanPriceIds } from "@repo/core";
 import { resolvePlatformConfig } from "./lib/controller-helpers";
 import { runWithRequestStore } from "./lib/request-store";
 import { runWithCallSource } from "./lib/call-source";
+import { sanitizeRequestLogLine } from "./lib/request-log-redaction";
 
 import { authRoutes } from "./modules/auth/auth.routes";
 import { auth } from "./lib/auth";
@@ -116,7 +117,13 @@ app.use(
     credentials: true,
   }),
 );
-app.use("*", logger());
+// Hono's default logger includes the raw query string and path. Invitation ids
+// are bearer credentials embedded in a path, while OAuth/signed credentials
+// commonly live in queries, so sanitize both before anything reaches stdout.
+app.use(
+  "*",
+  logger((line) => console.log(sanitizeRequestLogLine(line))),
+);
 // Seed a per-request memo store FIRST so every downstream handler shares it.
 // Collapses idempotent-per-request reads (cloud session validation, GitHub
 // auth-mode, installations) to one call each — a single /github/status was
@@ -148,11 +155,10 @@ app.onError(handleApiError);
 // policy. A global limiter ran upstream of auth, so it could never see `ctx`
 // (always default-anon) and double-charged routes with their own policy.
 //
-// Better Auth is a RAW catch-all (not secureRouter), so it carries its own:
-// POST → `auth-tight` (credential-stuffing), GET (get-session, OAuth
-// callbacks) → `default-anon` (hot). See lib/rate-limit/policies.ts.
-app.on("POST", "/api/auth/*", rateLimiterFor("auth-tight"));
-app.on("GET", "/api/auth/*", rateLimiterFor("default-anon"));
+// Better Auth is a RAW catch-all (not secureRouter), so it carries one central
+// limiter: POSTs and invitation bearer-token previews use `auth-tight`; ordinary
+// session/OAuth GETs use `default-anon`. A route must not add a second limiter.
+app.use("/api/auth/*", authRouteLimiter);
 
 // Shield Better Auth's organization-plugin reads (list-members,
 // list-invitations, get-active-member-role) — they leak admin-tier
@@ -251,7 +257,14 @@ const authCallbackHtml = `<!DOCTYPE html><html><head><title>Success</title></hea
 
 app.get("/auth/callback/install", (c) => {
   if (githubAuth.getGitHubAuthMode() === "app") {
-    return c.redirect(githubAuth.getInstallUrl());
+    // The setup URL's installation_id is attacker-controlled. A local App
+    // install is usable only when it carries the one-shot user/workspace state
+    // minted before OAuth. Never retain the old stateless fallback here.
+    const state = c.req.query("state")?.trim();
+    if (!state) {
+      return c.text("Missing GitHub installation state. Start again from Settings.", 400);
+    }
+    return c.redirect(`${githubAuth.getInstallUrl()}?state=${encodeURIComponent(state)}`);
   }
   return c.html(authCallbackHtml);
 });

@@ -108,7 +108,8 @@ export interface TokenContext {
    *  "write". Threaded into `canUseGitHubRepo` — see the funnel gate in
    *  `chainCtx`. A read grant + owner-wide reach must never satisfy a write. */
   op?: GitHubAccessOp;
-  /** Override the installation id (rare; usually inferred from owner). */
+  /** Project snapshot used for diagnostics/webhook correlation. Token minting
+   *  still resolves the canonical workspace installation server-side. */
   installationId?: number;
   /** Project id — for per-project clone token lookup. */
   projectId?: string;

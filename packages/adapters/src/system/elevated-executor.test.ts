@@ -13,9 +13,7 @@ function fakeExecutor() {
     code: 0,
     output: "",
   }));
-  const writeFile = vi.fn(
-    async (_path: string, _content: string, _opts?: { mode?: number }) => {},
-  );
+  const writeFile = vi.fn(async (_path: string, _content: string) => {});
   const readFile = vi.fn(async (_path: string) => "file-contents");
   const exists = vi.fn(async (_path: string) => true);
   const mkdir = vi.fn(async (_path: string) => {});
@@ -124,24 +122,19 @@ describe("elevatedExecutor", () => {
     expect(String(exec.mock.calls[2]?.[0])).toBe(`rm -rf ${sq(stageDirOf(staged))}`);
   });
 
-  it("applies a requested mode to the staged copy INSIDE the publishing command, before the mv", async () => {
+  it("creates a private-mode payload before publishing a secret", async () => {
     const { inner, writeFile, exec } = fakeExecutor();
 
-    await elevatedExecutor(inner).writeFile("/etc/postfix/sasl_passwd", "[relay]:587 u:p\n", {
+    await elevatedExecutor(inner).writeFile("/etc/postfix/sasl_passwd", "relay-secret", {
       mode: 0o600,
     });
 
     const staged = String(writeFile.mock.calls[0]?.[0]);
-    // The mode rides the inner write too, so the staged copy itself is never 0644.
-    expect(writeFile.mock.calls[0]?.[2]).toEqual({ mode: 0o600 });
-    // `mv` preserves mode, so tightening the staged copy is what the published file
-    // lands with. A chmod after the mv would be a second round trip during which the
-    // secret sat 0644 in a root-owned, world-traversable dir (#756).
-    expect(String(exec.mock.calls[1]?.[0])).toBe(
-      elevateCommand(
-        `mkdir -p ${sq("/etc/postfix")} && chmod 600 ${sq(staged)} && chown 0:0 ${sq(staged)} && ` +
-          `mv -f ${sq(staged)} ${sq("/etc/postfix/sasl_passwd")}`,
-      ),
+    expect(writeFile).toHaveBeenCalledWith(staged, "relay-secret", { mode: 0o600 });
+    expect(writeFile.mock.invocationCallOrder[0]!).toBeLessThan(exec.mock.invocationCallOrder[1]!);
+    // The content travels through the file channel, never argv/process listings.
+    expect(exec.mock.calls.map((call) => String(call[0])).join("\n")).not.toContain(
+      "relay-secret",
     );
   });
 

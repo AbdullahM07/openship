@@ -3,6 +3,173 @@
 All notable changes to Openship. Versions follow [semver](https://semver.org);
 the in-app updater surfaces critical advisories from `release-advisories.json`.
 
+## Unreleased
+
+## 0.6.10
+
+This release hardens the full deployment lifecycle, makes Compose reconciliation
+lossless, completes remote-server setup and CLI targeting, fixes external mail
+health and administration, and ships the invitation, DNS, catalog-routing, and
+update-experience work accumulated since 0.6.9.
+
+### Source control
+
+- **Self-hosted workspaces can own and manage multiple GitHub Apps** — Settings → Git now supports
+  one-click GitHub.com manifest creation and manual GitHub/GitHub Enterprise Server registration,
+  without an Openship Cloud or OAuth dependency. Private keys, client secrets, and webhook secrets
+  are encrypted at rest; source-specific JWTs mint short-lived repository-scoped tokens against the
+  correct API origin; GitHub sends verified lifecycle, push, and check webhooks directly to the
+  instance. Owners can install an App on multiple accounts, rotate and verify credentials, select a
+  default source, and safely delete one while project bindings move to an available replacement.
+  Existing environment-backed Apps, `gh`, personal tokens, and per-server SSH keys remain compatible
+  fallbacks (#782).
+- **GitHub App installation is tenant-safe end to end** — install callbacks bind a durable one-shot
+  nonce to the initiating user and workspace and verify the reported installation against the
+  configured App before atomically persisting and reconciling it. The cloud callback survives API
+  replicas/restarts, rejects removed workspace members, and cannot bind another tenant's
+  caller-supplied installation id. Installation rows, token caches, project bindings, lifecycle
+  webhooks, and reconnects are workspace-scoped; webhook arrival order never guesses a workspace
+  from membership order (#759).
+
+### Accounts and teams
+
+- **Self-hosted organization invitations now work for brand-new users** — the
+  claim page loads safely before sign-in, routes existing users back after
+  login, offers token-bound account creation only when authorized, and exposes
+  a copyable link beside each pending invitation. Invitation authorization,
+  identity, credential, personal workspace, and membership now commit under one
+  locked transaction, so cancellation races and failed signup cannot leave an
+  unauthorized or partial account that blocks retry. Accept, reject, cancel,
+  and signup mutations are serialized per invitation across API replicas. API
+  access logs and Edge request telemetry also redact invitation bearer tokens
+  and discard query strings before storage (#743).
+
+### DNS
+
+- **Service custom domains use the explicit DNS plan/apply workflow** — saving
+  a service route creates the same pending domain row as every other custom
+  domain, then the shared records panel previews provider changes and applies
+  them only when requested. The API documentation no longer promises a silent
+  provider write that the product deliberately does not perform (#760).
+
+### Server setup
+
+- **Remote servers always require Docker before Edge** — server readiness no
+  longer inherits the control plane's `DEPLOY_MODE`. Docker and Git are checked
+  for every managed target, while one shared dependency planner inserts and
+  orders Docker ahead of the container-based Edge across streamed setup,
+  `SystemManager`, and direct component installation guards (#767).
+
+### Builds
+
+- **BuildKit builds work from Bun-based self-hosted installations** — Docker's
+  reverse h2c session now bypasses Bun's incompatible `node:http` upgrade path
+  while retaining dockerode's BuildKit session and registry-auth service. Local
+  Compose builds using syntax directives, cache mounts, heredocs, and other
+  BuildKit-only Dockerfile features no longer fail on `/session` before the
+  Dockerfile starts (#745).
+
+### Updates
+
+- **Update prompts show the product changelog** — dashboard and desktop update
+  surfaces now read the matching version from the tagged `CHANGELOG.md` instead
+  of repeating the GitHub Release body. The native update panel keeps advisory
+  copy separate from a resizable, scrollable changelog, and all changelog actions
+  open the version page on `openship.io` rather than GitHub (#752).
+
+### Catalog apps
+
+- **Port-only app endpoints are actually published** — an explicit port-only
+  choice now persists a fixed all-interface Docker binding, including for
+  catalog routes such as Supabase Kong that declare a served port but no Compose
+  `ports` entry. This makes the wizard's server URL and `{{publicUrl:…}}`
+  substitutions truthful. Retrying a failed draft reconciles the binding
+  idempotently, and switching to a domain removes or restores only the mapping
+  owned by the installer (#770).
+
+### Mail delivery
+
+- **Mail setup now proves public reachability before declaring success** — the
+  final setup step combines the target's listener table with bounded off-box TCP
+  checks for 25, 465, 587 and 993. The Health tab shows each port as a first-class
+  signal, reusing a coalesced 60-second sweep, and test-email timeouts now identify
+  provider firewalls/security groups/security lists/NSGs instead of blaming a
+  stopped SMTP daemon when Postfix is demonstrably listening (#755).
+- **Mail health no longer treats fake-IP IPv6 answers as broken DNS** — synthetic
+  ULA AAAA responses from Clash/sing-box are now `unknown`, matching the existing
+  A-record behavior. Together with the informational SpamAssassin row and
+  normalized split-string DKIM comparison, this closes all three false-positive
+  paths reported in #240.
+- **Relayed webmail keeps the correct split-delivery path** — webmail continues to
+  submit to the local Postfix on 465, which alone owns relay scope, DKIM signing,
+  and provider credentials. The identical timeout reported in #391 now receives
+  the shared public-port diagnosis; provider relay credentials are never copied
+  into the webmail container.
+- **The platform sender now self-heals instead of getting stuck on SMTP 535** —
+  cached `openship@<domain>` credentials are reused only while the live mailbox
+  and forwarding rows remain active. A deleted row is recreated automatically,
+  and an already-cached transporter rotates once and retries safely on an auth
+  rejection (#754).
+- **The platform mailbox is protected and repairable** — ordinary mailbox edit
+  and delete operations reject the Openship-owned sender, while the Mailboxes
+  tab exposes a dedicated password rotation/repair action that also works when
+  the row is missing.
+- **Mail configuration works with non-root SSH users** — relay maps and
+  additional-domain DKIM configuration now elevate only root-owned host-file
+  operations while Docker commands keep the login user's daemon context. Relay
+  credentials are published atomically as `0600`, and a server without root or
+  passwordless sudo receives an actionable typed refusal unless the mail bind
+  mount was explicitly made writable for that login (#756).
+
+### Deployment cancellation
+
+- **Cancelling after an image build now stops the whole deployment worker** —
+  cancellation propagates through post-build preflight, human prompts,
+  host-scoped provisioning locks, activation, health checks, routing, and both
+  single-service and Compose pipelines. A durable database signal also wakes a
+  worker running in another API process.
+- **Redeploy waits for real worker completion** — a cancelled row keeps its
+  execution lease until cleanup has finished, while the dashboard shows the
+  cancellation still stopping instead of offering a redeploy that cannot safely
+  start. The API and CLI report success only after that lease is released;
+  otherwise cancellation remains explicitly pending. Refreshing reattaches to
+  that server-backed state (#757).
+- **Cancellation cannot replace or tear down the live release** — the cancelled
+  transition is conditional and atomic, and cleanup excludes containers carried
+  forward from the active Compose release. If ownership cannot be proven,
+  cleanup fails closed.
+
+### Compose reconciliation
+
+- **Repository edits cannot silently erase service environment variables** —
+  removing one or more environment keys from Compose now preserves the running
+  service configuration and creates an explicit drift review, even when the
+  operator never edited the imported baseline. Accepting that review remains
+  the deliberate way to apply the deletion.
+- **Local-path Compose projects materialize their services automatically** —
+  `project create --local-path ... --type services` now uses the API's canonical
+  scanner and persists the detected rows immediately. Deploy and redeploy also
+  re-read the same local source through the existing three-way reconciler, so a
+  legacy zero-row project self-repairs instead of entering an empty services
+  pipeline (#751).
+- **Compose env expressions have one sync/deploy meaning** — raw manual syncs
+  preserve `${VAR}` provenance and resolve it from the final project/service
+  environment at deploy time, while Docker Compose-normalized CLI syncs carry an
+  explicit final-value marker so escaped `$$` is never expanded twice (#751).
+- **Terminal failures survive refresh** — the deployment lifecycle writes one
+  deduplicated terminal error into the durable build log for every lifecycle
+  failure path, including an empty Compose service set, instead of leaving the
+  explanation only in `deployment.error_message` (#751).
+
+### CLI
+
+- **New projects and deploys can target a registered SSH server** —
+  `project create --server <id>` stores the initial binding, while
+  `deploy --server <id>` drives Git and folder uploads through the same
+  org-scoped target resolver and deployment preflight as the dashboard. The
+  deployment response exposes a stable id for `--watch`, `project get` shows the
+  resolved target, and a failed deploy never retargets the project (#763).
+
 ## 0.6.9
 
 This critical deployment-safety hotfix makes legacy Docker Compose ownership and

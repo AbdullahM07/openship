@@ -236,6 +236,14 @@ export const endpoints = {
     connectPoll: "github/connect/poll",
     disconnect: "github/disconnect",
     instanceToken: "github/instance-token",
+    sources: "github/sources",
+    sourceManifest: "github/sources/manifest",
+    sourceManifestConvert: "github/sources/manifest/convert",
+    sourceManual: "github/sources/manual",
+    source: (id: string) => `github/sources/${encodeURIComponent(id)}`,
+    sourceVerify: (id: string) => `github/sources/${encodeURIComponent(id)}/verify`,
+    sourceDefault: (id: string) => `github/sources/${encodeURIComponent(id)}/default`,
+    sourceInstall: (id: string) => `github/sources/${encodeURIComponent(id)}/install`,
   },
 
   /* ---------------------------------------------------------------- */
@@ -402,6 +410,8 @@ export const endpoints = {
       mailboxes: (serverId: string) => `mail/admin/${encodeURIComponent(serverId)}/mailboxes`,
       mailbox: (serverId: string, email: string) =>
         `mail/admin/${encodeURIComponent(serverId)}/mailboxes/${encodeURIComponent(email)}`,
+      rotatePlatformMailbox: (serverId: string) =>
+        `mail/admin/${encodeURIComponent(serverId)}/platform-mailbox/rotate`,
       aliases: (serverId: string) => `mail/admin/${encodeURIComponent(serverId)}/aliases`,
       alias: (serverId: string, id: number) =>
         `mail/admin/${encodeURIComponent(serverId)}/aliases/${id}`,
