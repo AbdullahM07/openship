@@ -30,6 +30,7 @@ const deploymentRepo = vi.hoisted(() => ({
   findInProgressByReleaseVersion: vi.fn(),
 }));
 const serviceRepo = vi.hoisted(() => ({ listByProject: vi.fn(), listByDeployment: vi.fn() }));
+const compareCommits = vi.hoisted(() => vi.fn());
 
 vi.mock("@repo/db", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@repo/db")>();
@@ -38,6 +39,11 @@ vi.mock("@repo/db", async (importOriginal) => {
     repos: { ...actual.repos, deployment: deploymentRepo, service: serviceRepo },
   };
 });
+
+vi.mock("../../../src/modules/github/github.service", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  compareCommits,
+}));
 
 import {
   commitSourceKey,
@@ -80,9 +86,21 @@ beforeEach(() => {
   deploymentRepo.findInProgressByReleaseVersion.mockResolvedValue(undefined);
   serviceRepo.listByProject.mockResolvedValue([]);
   serviceRepo.listByDeployment.mockResolvedValue([]);
+  compareCommits.mockReset();
 });
 
 describe("commit drift — the deployed side is live", () => {
+  it("ignores commits outside the project root (#637)", async () => {
+    const p = gitProject({ rootDirectory: "services/backend" });
+    deploymentRepo.findById.mockResolvedValue({ id: "dep_live", commitSha: SHIPPED });
+    compareCommits.mockResolvedValue({ files: ["services/client/page.tsx"] });
+
+    expect(await evaluateDrift(p, commitUpstream(p, NEWER), {} as never)).toMatchObject({
+      behind: false,
+    });
+    expect(compareCommits).toHaveBeenCalledWith({}, "oblien", "openship", SHIPPED, NEWER);
+  });
+
   it("reports no update once the deployment shipped the cached HEAD", async () => {
     // The exact reported case: the cached upstream is old (polled while an older
     // release was live), but the project has since deployed that very commit.
