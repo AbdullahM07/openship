@@ -42,6 +42,7 @@ import {
   HOST_AMAVIS_CONF_PROBE,
   forgetMailEngine,
   mailConfigFile,
+  mailConfigWriter,
   mailEngineCommand,
   mailUnitActionCommand,
   requireMailEngine,
@@ -890,7 +891,9 @@ export async function provisionDomainDkim(
   const signEntry = `   '.${newDomain}'  => { d => '${newDomain}', a => 'rsa-sha256', ttl => 21*24*3600 },`;
   const next = spliceAmavisConf(existing, newDomain, dkimKeyLine, signEntry);
   if (next !== existing) {
-    await exec.writeFile(confPath, next);
+    // `conf.write` is root-owned on both flavors; the plain executor's SFTP write
+    // lands as the login user and is refused on a non-root box (#756).
+    await (await mailConfigWriter(exec)).writeFile(confPath, next);
   }
 
   // ── Step 4: reload amavis so the new key is signed with ──────────────

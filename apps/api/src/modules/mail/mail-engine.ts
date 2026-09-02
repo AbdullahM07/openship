@@ -47,6 +47,7 @@ import {
   MAIL_DB_CONTAINER,
   MAIL_DB_NAME,
   MAIL_HOST_PATHS,
+  privilegedExecutor,
   type CommandExecutor,
   type MailEngineFlavor,
   type MailEngineProbe,
@@ -141,6 +142,25 @@ export class MailDbNotInitializedError extends AppError {
       "MAIL_DB_NOT_INITIALIZED",
     );
     this.name = "MailDbNotInitializedError";
+  }
+}
+
+/**
+ * The login can't write the host end of the config bind mounts, and there is no
+ * route to root.
+ *
+ * `MAIL_HOST_PATHS` sit in root-owned directories (Docker materialises a bind mount
+ * as root), and a box registered with its distro's default login — `ubuntu`,
+ * `admin`, `ec2-user` — reaches Postfix fine through `docker exec` but writes the
+ * SASL map over SFTP, which has no `docker` group to lean on. That surfaced as a
+ * bare ssh2 "Permission denied" 500 with nothing to act on (#756). 409 for the same
+ * reason as the engine gate: the request is valid, the box is reachable, and the
+ * remediation is one documented change on the server.
+ */
+export class MailHostNotWritableError extends AppError {
+  constructor(reason: string) {
+    super(reason, 409, "MAIL_HOST_NOT_WRITABLE");
+    this.name = "MailHostNotWritableError";
   }
 }
 
@@ -505,8 +525,9 @@ export const HOST_AMAVIS_CONF_PROBE: string = HOST_AMAVIS_CONF_CANDIDATES.map(
 /**
  * Where an editable daemon config file lives on each side.
  *
- * `write` is the path to WRITE (always a real host path — `exec.writeFile` uses
- * SFTP with no shell, the SASL-password security invariant); `engine` is the path
+ * `write` is the path to WRITE (always a real host path — write it through the
+ * executor {@link mailConfigWriter} hands back, whose `writeFile` is SFTP with no
+ * shell, the SASL-password security invariant); `engine` is the path
  * the daemon itself sees, which is what `postmap` / `postconf` / a `dkim_key(...)`
  * directive must reference. On the container flavor those are the two ends of a
  * bind mount (`MAIL_CONTAINER_MOUNTS`); on a legacy box they're the same file.
@@ -517,6 +538,27 @@ export function mailConfigFile(
 ): { write: string; engine: string } {
   const engine = MAIL_ENGINE_PATHS[file];
   return flavor === "container" ? { write: MAIL_HOST_PATHS[file], engine } : { write: engine, engine };
+}
+
+/**
+ * The executor that can reach what {@link mailConfigFile}'s `write` names.
+ *
+ * Every `write` path is root-owned — `/etc/postfix` on a legacy box, the bind-mount
+ * source under `/var/lib/openship/mail` on a container one — and the plain executor
+ * writes it over SFTP as the login user. On a root login this is that same executor
+ * back. On a non-root login with sudo it is `elevatedExecutor`, whose `writeFile`
+ * stages the content over SFTP into a private dir and publishes it with `sudo mv`,
+ * so the SASL-password invariant holds: the secret still never crosses a command
+ * line. A supported host with neither is a typed refusal up front, before anything
+ * is half-applied; a host we can't measure proceeds as it always did, so a chatty
+ * banner doesn't turn a working root login into a refusal.
+ */
+export async function mailConfigWriter(exec: CommandExecutor): Promise<CommandExecutor> {
+  const grant = await privilegedExecutor(exec, "Writing the mail server's configuration", {
+    onRefusedHost: "proceed",
+  });
+  if (!grant.supported) throw new MailHostNotWritableError(grant.reason);
+  return grant.value.executor;
 }
 
 // ─── Daemon state ────────────────────────────────────────────────────────────

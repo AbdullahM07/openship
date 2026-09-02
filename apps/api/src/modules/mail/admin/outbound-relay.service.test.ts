@@ -93,14 +93,48 @@ const HOST_UNITS_ACTIVE = [
  *   - `container` → the engine container inspects as running,
  *   - `host`      → no container, legacy systemd postfix + dovecot both active.
  *
+ * It answers the host-privilege probe the same way (`login`), so the real
+ * `privilegedExecutor` gate decides which executor the host-side writes go through.
+ *
  * Probe commands are answered but kept out of `execCalls`, which therefore holds
  * only the commands the SERVICE issued.
  */
-function makeExec(flavor: Flavor | "none" = "container") {
+type Login = "root" | "sudo" | "none";
+
+/**
+ * The privilege probe's answer for each login, in the `opsh_` key format
+ * `parseEnvironmentProbe` reads. `root` is the box every existing assertion was
+ * written on; `sudo` is the Ubuntu/Debian/AL2023 default the relay used to 500 on
+ * (#756); `none` is a supported host with no route to root at all.
+ */
+function probeAnswer(login: Login): string {
+  const user = login === "root" ? "root" : "ubuntu";
+  return [
+    "opsh_begin=1",
+    "opsh_os=Linux",
+    "opsh_arch=x86_64",
+    `opsh_uid=${login === "root" ? 0 : 1000}`,
+    `opsh_user=${user}`,
+    `opsh_home=/home/${user}`,
+    "opsh_osr:ID=ubuntu",
+    'opsh_osr:VERSION_ID="24.04"',
+    "opsh_pm=apt",
+    "opsh_sm=systemd",
+    `opsh_sudo=${login === "sudo" ? "y" : "n"}`,
+    "opsh_fw=unknown",
+    "opsh_libc=glibc",
+    "opsh_selinux=absent",
+    "opsh_container=n",
+    "opsh_end=1",
+  ].join("\n");
+}
+
+function makeExec(flavor: Flavor | "none" = "container", login: Login = "root") {
   const execCalls: string[] = [];
   const writes: { path: string; content: string }[] = [];
   const exec = {
     exec: async (cmd: string) => {
+      if (cmd.startsWith('echo "opsh_begin=1"')) return probeAnswer(login);
       if (cmd.includes("docker inspect")) {
         return flavor === "container" ? "true\topenship/mail:test" : "";
       }
@@ -249,6 +283,83 @@ describe("disableOutboundRelay", () => {
     const { exec, execCalls } = makeExec("none");
     await expect(disableOutboundRelay(exec)).rejects.toThrow(/no mail engine/i);
     expect(execCalls).toEqual([]);
+  });
+});
+
+/**
+ * The host end of the maps is root-owned, and a box registered with its distro's
+ * default login (`ubuntu`, `admin`, `ec2-user`) reaches Postfix as root through
+ * `docker exec` but wrote the map over SFTP as itself — the one step that could
+ * fail, and it did, as a bare "Permission denied" 500 (#756).
+ */
+describe("host-side writes on a non-root login (#756)", () => {
+  const base = { provider: "ses" as const, region: "us-east-1", port: 587, username: "AKIASMTPUSER", password: "s3cr3tPass" };
+  const SUDO = "sudo -n sh -c ";
+
+  for (const flavor of ["container", "host"] as Flavor[]) {
+    test(`[${flavor}] with sudo: stages the map over SFTP and publishes it as root — never on a command line`, async () => {
+      const { exec, execCalls, writes } = makeExec(flavor, "sudo");
+      await configureOutboundRelay(exec, base);
+
+      // The secret still travels by SFTP, into a private staging dir — not to the
+      // root-owned path directly, and not through `sudo tee` on an argv.
+      expect(writes).toHaveLength(1);
+      expect(writes[0].path).toMatch(/^\/tmp\/\.openship-elev-[0-9a-f]+\/payload$/);
+      expect(writes[0].content).toContain("AKIASMTPUSER:s3cr3tPass");
+      for (const cmd of execCalls) {
+        expect(cmd).not.toContain("s3cr3tPass");
+        expect(cmd).not.toContain("AKIASMTPUSER");
+      }
+
+      // Root publishes it into place, and locks it down as root too — the file is
+      // root's now, so an unelevated chmod would just be the next EPERM.
+      const publish = execCalls.find(
+        (c) => c.startsWith(SUDO) && c.includes("mv -f") && c.includes(SASL_MAP[flavor].write),
+      );
+      expect(publish).toBeDefined();
+      expect(publish).toContain("chown 0:0");
+      expect(
+        execCalls.some((c) => c.startsWith(SUDO) && c.includes(`chmod 600 ${SASL_MAP[flavor].write}`)),
+      ).toBe(true);
+    });
+
+    test(`[${flavor}] with sudo: only the host-side file half is elevated — Postfix keeps its transport`, async () => {
+      const { exec, execCalls } = makeExec(flavor, "sudo");
+      await configureOutboundRelay(exec, base);
+      const postfixCmds = execCalls.filter((c) => /postmap|postconf|postfix reload/.test(c));
+      expect(postfixCmds.length).toBeGreaterThan(0);
+      for (const cmd of postfixCmds) expect(cmd).not.toContain(SUDO);
+    });
+
+    test(`[${flavor}] with sudo: disabling removes the root-owned map as root`, async () => {
+      fakeState = {
+        ...fakeState,
+        outboundRelay: { enabled: true, provider: "ses", host: "email-smtp.us-east-1.amazonaws.com", port: 587 },
+      };
+      const { exec, execCalls } = makeExec(flavor, "sudo");
+      await disableOutboundRelay(exec);
+      expect(
+        execCalls.some((c) => c.startsWith(SUDO) && c.includes(`rm -f ${SASL_MAP[flavor].write}`)),
+      ).toBe(true);
+    });
+  }
+
+  test("neither root nor sudo: a typed 409 naming the fix, before anything touches the box", async () => {
+    const { exec, execCalls, writes } = makeExec("container", "none");
+    await expect(configureOutboundRelay(exec, base)).rejects.toMatchObject({
+      statusCode: 409,
+      code: "MAIL_HOST_NOT_WRITABLE",
+      message: expect.stringMatching(/root|sudo/),
+    });
+    expect(writes).toEqual([]);
+    expect(execCalls).toEqual([]);
+  });
+
+  test("root login: the caller's own executor, exactly as before", async () => {
+    const { exec, execCalls, writes } = makeExec("container", "root");
+    await configureOutboundRelay(exec, base);
+    expect(writes[0].path).toBe(SASL_MAP.container.write);
+    expect(execCalls.some((c) => c.startsWith(SUDO))).toBe(false);
   });
 });
 
