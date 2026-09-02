@@ -45,6 +45,12 @@ export interface PinnedArtifactSnapshot extends SnapshotClassInput {
    * static equivalent of reusing a retained image.
    */
   handoverStaticDir?: string;
+  /** One-deployment execution intent. These fields must not leak into a later
+   * manual redeploy or rollback merely because its source snapshot is reused. */
+  targetServiceIds?: string[];
+  strictServiceScope?: boolean;
+  refreshServiceIds?: string[];
+  forcePullImages?: boolean;
   composeServices?: Array<{
     name: string;
     enabled?: boolean;
@@ -98,13 +104,17 @@ export function hasPinnedArtifacts(snapshot: PinnedArtifactSnapshot | null | und
   return Object.values(snapshot?.handoverImages ?? {}).some((ref) => !!nonEmpty(ref));
 }
 
-/** Strip every pinned artifact — for a deploy that must genuinely rebuild. */
+/** Strip every one-shot artifact and execution hint before a new native deploy. */
 export function withoutPinnedArtifacts<T extends PinnedArtifactSnapshot>(snapshot: T): T {
   const {
     handoverImages: _images,
     handoverAppImage: _app,
     handoverStaticDir: _static,
     refreshAppDeploymentId: _refreshApp,
+    targetServiceIds: _targets,
+    strictServiceScope: _strictScope,
+    refreshServiceIds: _refreshServices,
+    forcePullImages: _forcePull,
     ...rest
   } = snapshot;
   return rest as T;

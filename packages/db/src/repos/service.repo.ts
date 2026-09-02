@@ -103,6 +103,63 @@ export const composeSpecsEqual = (a: ComposeServiceSpec, b: ComposeServiceSpec) 
   canonicalSpec(a) === canonicalSpec(b);
 
 /**
+ * Environment keys a repo compose edit would DELETE from the imported
+ * baseline. Values may be credentials or the only copy of legacy configuration,
+ * so deletion is the one compose change that must never auto-apply during a
+ * redeploy. The drift-approval path remains the explicit deletion operation.
+ */
+export function removedComposeEnvironmentKeys(
+  baseInput: ComposeServiceSpec,
+  nextInput: ComposeServiceSpec,
+): string[] {
+  const base = toComposeSpec(baseInput).environment ?? {};
+  const next = toComposeSpec(nextInput).environment ?? {};
+  return Object.keys(base)
+    .filter((key) => !Object.hasOwn(next, key))
+    .sort();
+}
+
+/**
+ * A current parser adds provenance metadata that older imported baselines could
+ * not contain. That is a representation upgrade, not a repo edit. It used to
+ * raise a review banner where the masked environment showed the same keys on
+ * both sides and `advanced` differed only by *TemplateKeys.
+ *
+ * Narrow by design: this applies only when the OLD baseline lacks a provenance
+ * marker the new parse carries, every non-environment compose field is equal
+ * after stripping those internal markers, and the environment key set is
+ * unchanged. Values stay operator-owned; only the baseline advances.
+ */
+export function isComposeProvenanceUpgrade(
+  baseInput: ComposeServiceSpec,
+  nextInput: ComposeServiceSpec,
+): boolean {
+  const base = toComposeSpec(baseInput);
+  const next = toComposeSpec(nextInput);
+  const baseAdvanced = { ...(base.advanced ?? {}) } as Record<string, unknown>;
+  const nextAdvanced = { ...(next.advanced ?? {}) } as Record<string, unknown>;
+  const markerKeys = ["environmentTemplateKeys", "buildArgTemplateKeys"] as const;
+  const addsMarker = markerKeys.some(
+    (key) => !Object.hasOwn(baseAdvanced, key) && Object.hasOwn(nextAdvanced, key),
+  );
+  if (!addsMarker) return false;
+  for (const key of markerKeys) {
+    delete baseAdvanced[key];
+    delete nextAdvanced[key];
+  }
+  const envKeys = (value: Record<string, string>) => Object.keys(value).sort();
+  const comparable = (spec: ComposeServiceSpec, advanced: Record<string, unknown>) => ({
+    ...spec,
+    environment: envKeys(spec.environment ?? {}),
+    advanced,
+  });
+  return (
+    JSON.stringify(canonicalize(comparable(base, baseAdvanced))) ===
+    JSON.stringify(canonicalize(comparable(next, nextAdvanced)))
+  );
+}
+
+/**
  * The compose-owned fields as an UPDATE payload, with `advanced` MERGED onto the
  * stored blob rather than replacing it.
  *
@@ -731,6 +788,7 @@ export function createServiceRepo(db: Database) {
      * values ("ours"):
      *   • repo unchanged             → keep ours (clear any stale drift)
      *   • repo changed, not edited   → auto-apply theirs, advance baseline
+     *   • repo deletes env keys       → keep ours, require explicit approval
      *   • repo changed, edited       → keep ours, set `driftSpec` (needs approval)
      *   • new upstream service       → create (baseline = theirs)
      *   • removed upstream, unedited → remove; edited/unknown baseline → keep
@@ -823,6 +881,15 @@ export function createServiceRepo(db: Database) {
           continue;
         }
 
+        // Parser provenance was introduced after many compose baselines were
+        // stored. Advance that legacy baseline silently while preserving the
+        // live row; treating metadata as a repo edit creates an unresolvable,
+        // false-positive drift banner on every redeploy.
+        if (isComposeProvenanceUpgrade(base, theirs)) {
+          await this.update(ex.id, { importedSpec: theirs, driftSpec: null });
+          continue;
+        }
+
         // Repo unchanged → keep ours. Only write to clear a stale drift (repo
         // reverted to base). A pre-#689 baseline also gets normalized once: its
         // missing `buildArgs` key is the deployment layer's version marker for
@@ -833,6 +900,20 @@ export function createServiceRepo(db: Database) {
           } else if (ex.driftSpec) {
             await this.update(ex.id, { driftSpec: null });
           }
+          continue;
+        }
+
+        // Environment deletion is deliberately destructive even when the row is
+        // otherwise untouched. Compose env used to be the only storage layer for
+        // many legacy installs (including credentials); silently applying a repo
+        // deletion here can erase the last durable copy BEFORE the deployment
+        // reaches runtime preflight. Keep the current row and route the proposed
+        // deletion through the existing explicit drift-approval UI instead.
+        if (removedComposeEnvironmentKeys(base, theirs).length > 0) {
+          if (!ex.driftSpec || !composeSpecsEqual(ex.driftSpec, theirs)) {
+            await this.update(ex.id, { driftSpec: theirs });
+          }
+          driftedNames.push(p.name);
           continue;
         }
 

@@ -100,6 +100,8 @@ function parseUpstreams(config: string): Map<string, string[]> {
   return map;
 }
 
+const HTTP_PROXY_TARGET_RE = /^(https?:\/\/)([^/?#]+)([/?#].*)?$/i;
+
 /**
  * Turn a raw proxy_pass value into a concrete Openship route target, or reject
  * it (so the caller warns and skips) when it can't be resolved to a real
@@ -109,11 +111,21 @@ function parseUpstreams(config: string): Map<string, string[]> {
 function resolveProxyTarget(
   proxyPass: string,
   upstreams: Map<string, string[]>,
+  opts: { allowVariablesAfterAuthority?: boolean } = {},
 ): { url: string } | { reason: string } {
   const raw = proxyPass.replace(/;$/, "").trim();
-  if (raw.includes("$")) return { reason: `proxy_pass "${raw}" uses an nginx variable` };
+  const parsed = raw.match(HTTP_PROXY_TARGET_RE);
+  if (raw.includes("$")) {
+    // Variables in the authority can select an arbitrary upstream, so strict port
+    // inventory must fail closed. Variables after it only rewrite the request URI:
+    // nginx still dials the concrete host:port, which is all inventory needs.
+    const authority = parsed?.[2];
+    if (!opts.allowVariablesAfterAuthority || !authority || authority.includes("$")) {
+      return { reason: `proxy_pass "${raw}" uses an nginx variable` };
+    }
+  }
   if (/\/\/unix:/i.test(raw)) return { reason: `proxy_pass "${raw}" targets a unix socket` };
-  const m = raw.match(/^(https?:\/\/)([^/]+)(\/.*)?$/i);
+  const m = parsed;
   if (!m) return { reason: `unrecognized proxy_pass "${raw}"` };
   const scheme = m[1];
   const authority = m[2];
@@ -152,7 +164,7 @@ function strictLoopbackUpstreamPorts(config: string): Set<number> {
   for (const match of normalized.matchAll(/(?:^|[;{}\s])proxy_pass\s+([^;]+);/g)) {
     const raw = match[1]?.trim();
     if (!raw) continue;
-    const resolved = resolveProxyTarget(raw, upstreams);
+    const resolved = resolveProxyTarget(raw, upstreams, { allowVariablesAfterAuthority: true });
     if ("reason" in resolved) {
       // Unix sockets never consume a TCP port and therefore cannot collide with
       // Docker's loopback publishing. Every other unresolved target is unknown.
@@ -164,8 +176,9 @@ function strictLoopbackUpstreamPorts(config: string): Set<number> {
     // upstream because one Openship route has one target. Collision inventory
     // has a stricter job: every member can receive traffic from the stale vhost,
     // so every concrete loopback member must protect its port.
-    const authority = raw.match(/^https?:\/\/([^/]+)/i)?.[1];
-    const scheme = raw.match(/^(https?:\/\/)/i)?.[1];
+    const parsed = raw.match(HTTP_PROXY_TARGET_RE);
+    const authority = parsed?.[2];
+    const scheme = parsed?.[1];
     const targets =
       authority && scheme && upstreams.has(authority)
         ? upstreams.get(authority)!.map((target) => `${scheme}${target}`)

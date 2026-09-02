@@ -1052,6 +1052,23 @@ class MigrationOrchestratorImpl {
               // and recreate the reuse set — so the caller refuses to get here with one
               // (see the guard above this block).
               serviceIds: deployRowIds,
+            },
+            /**
+             * EXCLUSIVE scope, not just "prefer these".
+             *
+             * `serviceIds` on its own means "build these, CARRY the rest forward", and carry
+             * reads `project.activeDeploymentId` — which is null here: a freshly adopted
+             * project has no previous release, and this run's own runtime rows are written by
+             * `attachLiveRuntime` AFTER the deploy. So without this the reuse rows would be
+             * neither carried nor skipped: enabled and holding a real image, they'd deploy
+             * normally and put a SECOND container on the still-running originals' bare
+             * volumes (reuse rows keep `namespaceVolumes: false`) — two writers on one
+             * dataset, the exact opposite of what reuse mode promises.
+             */
+            {
+              strictServiceScope: true,
+              // Internal-only artifact provenance. A public deploy request must
+              // never be able to bypass build/pull with an arbitrary host ref.
               // One-time cutover: native `build:` rows reuse the transferred/running
               // image on THIS deploy (no rebuild); a later Redeploy has no handover
               // and rebuilds from the repo.
@@ -1067,25 +1084,12 @@ class MigrationOrchestratorImpl {
                * image across, then rebuilding it from git anyway: minutes of wasted work whose only
                * visible symptom was a migration that looked stuck on its last step.
                *
-               * Set only when the workload IS one service, so a compose project keeps using the map.
+               * Set only when the workload IS one service, so compose keeps using the map.
                */
               ...(Object.keys(adopt.handover).length === 1
                 ? { handoverAppImage: Object.values(adopt.handover)[0] }
                 : {}),
             },
-            /**
-             * EXCLUSIVE scope, not just "prefer these".
-             *
-             * `serviceIds` on its own means "build these, CARRY the rest forward", and carry
-             * reads `project.activeDeploymentId` — which is null here: a freshly adopted
-             * project has no previous release, and this run's own runtime rows are written by
-             * `attachLiveRuntime` AFTER the deploy. So without this the reuse rows would be
-             * neither carried nor skipped: enabled and holding a real image, they'd deploy
-             * normally and put a SECOND container on the still-running originals' bare
-             * volumes (reuse rows keep `namespaceVolumes: false`) — two writers on one
-             * dataset, the exact opposite of what reuse mode promises.
-             */
-            { strictServiceScope: true },
           );
           deploymentId = dep.deployment_id;
           await this.transition(id, "deploying", { deploymentId });

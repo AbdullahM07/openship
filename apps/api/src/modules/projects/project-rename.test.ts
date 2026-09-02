@@ -68,6 +68,12 @@ const h = vi.hoisted(() => ({
     groupFields: Record<string, unknown>;
   }>,
   ensureSharedWebhook: vi.fn(async () => null as number | null),
+  webhookStrategy: "none" as "none" | "app",
+  authInstallationId: undefined as number | undefined,
+  resolveInstallUrl: vi.fn(async () => ({
+    url: "https://github.com/apps/operator-app/installations/new?state=workspace-nonce",
+    state: "workspace-nonce",
+  })),
 }));
 
 vi.mock("@repo/db", () => ({
@@ -138,11 +144,11 @@ vi.mock("../github/github.service", () => ({
   resolveDefaultBranch: async () => "main",
   listBranches: async () => [],
   getLatestCommit: async () => null,
-  resolveWebhookStrategy: async () => "none",
+  resolveWebhookStrategy: async () => h.webhookStrategy,
 }));
 vi.mock("../github/github.auth", () => ({
-  getInstallationIdByOrg: async () => undefined,
-  getInstallUrl: () => "",
+  getInstallationIdByOrg: async () => h.authInstallationId,
+  resolveInstallUrl: h.resolveInstallUrl,
 }));
 vi.mock("./project-git-webhook", () => ({
   ensureSharedWebhook: h.ensureSharedWebhook,
@@ -173,6 +179,9 @@ describe("project rename — the slug is immutable", () => {
     h.projectUpdates = [];
     h.groupUpdates = [];
     h.routeSyncs = [];
+    h.webhookStrategy = "none";
+    h.authInstallationId = undefined;
+    h.resolveInstallUrl.mockClear();
     h.liveRouteReapplies = 0;
     h.sourceUpdates = [];
     h.project.deletionInProgress = false;
@@ -260,6 +269,10 @@ describe("project source transitions", () => {
   beforeEach(() => {
     h.projectUpdates = [];
     h.sourceUpdates = [];
+    h.project.deletionInProgress = false;
+    h.webhookStrategy = "none";
+    h.authInstallationId = undefined;
+    h.resolveInstallUrl.mockClear();
     Object.assign(h.project, {
       gitProvider: "github",
       gitOwner: "acme",
@@ -488,5 +501,28 @@ describe("project source transitions", () => {
     expect(h.ensureSharedWebhook).not.toHaveBeenCalled();
     expect(h.sourceUpdates).toEqual([]);
     expect(h.projectUpdates).toEqual([]);
+  });
+
+  it("returns the workspace-bound install URL when App strategy has no installation", async () => {
+    h.webhookStrategy = "app";
+    const { linkProjectRepo } = await load();
+
+    await expect(
+      linkProjectRepo({ userId: "user_1", organizationId: "org_1" } as never, "proj_1", {
+        owner: "acme",
+        repo: "private-app",
+        branch: "main",
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      code: "app_not_installed",
+      owner: "acme",
+      installUrl: "https://github.com/apps/operator-app/installations/new?state=workspace-nonce",
+    });
+    expect(h.resolveInstallUrl).toHaveBeenCalledWith(expect.objectContaining({
+      userId: "user_1",
+      organizationId: "org_1",
+    }));
+    expect(h.sourceUpdates).toEqual([]);
   });
 });

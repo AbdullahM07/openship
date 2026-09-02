@@ -52,8 +52,8 @@ import {
   getInstallationId,
   getInstallationIdByOrg,
   getGitHubAuthMode,
-  getInstallUrl,
   resolveGitHubAuthMode,
+  resolveInstallUrl,
 } from "../github/github.auth";
 import { canResolveTokenFor } from "../github/github.token";
 import { canResolveServerGitCredential } from "../github/server-github.service";
@@ -226,6 +226,7 @@ async function checkGitHubAppInstallation(
   if (installationId) {
     return { ...baseCheck, status: "pass" };
   }
+  const install = await resolveInstallUrl(ctx);
   return {
     ...baseCheck,
     status: "fail",
@@ -233,7 +234,7 @@ async function checkGitHubAppInstallation(
     message:
       `The Openship GitHub App is not installed on "${owner}". ` +
       `Deploys need it to mint a scoped token for cloning the repo. ` +
-      `Install it at ${getInstallUrl()} and deploy again.`,
+      `Install it at ${install.url} and deploy again.`,
   };
 }
 

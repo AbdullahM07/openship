@@ -433,6 +433,28 @@ export function createDeploymentRepo(db: Database) {
     },
 
     /**
+     * Atomically make cancellation the terminal outcome only while the work is
+     * actually in flight. A read followed by updateStatus is not sufficient:
+     * the worker can become ready between those calls, and a late cancel would
+     * then overwrite a successful live release and clean up its resources.
+     * Conversely, once this transition wins, updateStatus's cancelled guard
+     * prevents the worker from publishing ready/failure over the user's cancel.
+     */
+    async cancelInFlight(id: string, extra?: Partial<NewDeployment>): Promise<boolean> {
+      const rows = await db
+        .update(deployment)
+        .set({ ...extra, status: "cancelled", updatedAt: new Date() })
+        .where(
+          and(
+            eq(deployment.id, id),
+            inArray(deployment.status, ["queued", "building", "deploying"]),
+          ),
+        )
+        .returning();
+      return rows.length > 0;
+    },
+
+    /**
      * Flip meta.composeDeployment.decision "pending" → "superseded" for every
      * OTHER deployment of the project — a newer release makes a held keep/reject
      * moot. Atomic via jsonb_set; status left as-is (historical).

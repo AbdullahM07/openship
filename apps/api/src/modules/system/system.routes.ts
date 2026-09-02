@@ -14,10 +14,13 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { internalAuth, requireInstanceAdmin } from "../../middleware";
 import { AgentExecBody } from "../../lib/agent-exec.schema";
-import { rateLimiterFor } from "../../middleware/rate-limiter";
 import { secureRouter } from "../../lib/secure-router";
 import * as fs from "./filesystem.controller";
 import * as setup from "./setup.controller";
+import {
+  invitationSignupBodyLimit,
+  inviteSignup,
+} from "../auth/invitation-signup.controller";
 import * as selfApp from "./self-app.controller";
 import * as serverCheck from "./server-check.controller";
 import * as serversCtrl from "./servers.controller";
@@ -49,7 +52,16 @@ r.public("get", "/setup", { reason: "Electron desktop client setup read - protec
 r.public("get", "/health", { reason: "CLI `openship doctor` — internal-token gated deep health rollup (DB liveness/migrations + project/service counts); the public /api/health is only a liveness stub" }, internalAuth, systemHealth.systemHealth);
 r.public("post", "/bootstrap-admin", { reason: "CLI first-admin creation — internal-token gated, one-shot before any admin exists (openship setup)" }, internalAuth, setup.bootstrapAdmin);
 r.public("post", "/reset-admin-password", { reason: "CLI password recovery — internal-token gated; resets the local admin login for a locked-out operator (openship reset-admin-password)" }, internalAuth, setup.resetAdminPassword);
-r.public("post", "/invite-signup", { reason: "Self-host invited signup — authorized by the unguessable invitation id (token) in the emailed link, NOT a session; creates the account for the invitation's own email. Public + rate-limited because the invitee isn't logged in yet." }, rateLimiterFor("auth-tight"), setup.inviteSignup);
+r.public(
+  "post",
+  "/invite-signup",
+  {
+    reason: "Self-host invited signup — authorized by the unguessable invitation id (token) in the emailed link, NOT a session; creates the account for the invitation's own email.",
+    rateLimit: "auth-tight",
+  },
+  invitationSignupBodyLimit,
+  inviteSignup,
+);
 
 /* ── Control-plane self-registration (CLI setup wizard) ─────────────
  * After bootstrap-admin, the wizard registers Openship itself as an app
