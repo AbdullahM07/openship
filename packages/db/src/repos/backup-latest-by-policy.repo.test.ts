@@ -1,25 +1,13 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import { migrate } from "drizzle-orm/pglite/migrator";
 import * as schema from "../schema";
-import type { Database } from "../client";
-import {
-  createBackupPolicyRepo,
-  createBackupRunRepo,
-  type BackupPolicyRepo,
-  type BackupRunRepo,
-} from "./backup.repo";
+import { createBackupRunRepo } from "./backup.repo";
 
 const MIGRATIONS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "../../drizzle");
-
-interface TestRepos {
-  db: Database;
-  policy: BackupPolicyRepo;
-  run: BackupRunRepo;
-}
 
 async function freshRepos() {
   const client = new PGlite("memory://");
@@ -57,44 +45,60 @@ async function freshRepos() {
   });
 
   return {
+    client,
     db,
-    policy: createBackupPolicyRepo(db),
     run: createBackupRunRepo(db),
   };
 }
 
 describe("repos.backupRun.latestByPolicy", () => {
-  let repos: {
-    db: Database;
-    policy: BackupPolicyRepo;
-    run: BackupRunRepo;
-  };
+  let repos: Awaited<ReturnType<typeof freshRepos>>;
 
   beforeEach(async () => {
     repos = await freshRepos();
   }, 30_000);
+
+  afterEach(async () => {
+    await repos.client.close();
+  });
+
   it("returns undefined when policy has no runs", async () => {
     const res = await repos.run.latestByPolicy("pol1");
     expect(res).toBeUndefined();
   });
 
-  it("returns single run metrics for a single-service run", async () => {
+  it("returns one legacy run without inferring a batch from its timestamp", async () => {
     const started = new Date("2026-08-26T10:00:00Z");
     const finished = new Date("2026-08-26T10:01:00Z");
 
-    await repos.db.insert(schema.backupRun).values({
-      id: "run-single",
-      policyId: "pol1",
-      destinationId: "dest1",
-      projectId: "p1",
-      serviceId: "svc1",
-      organizationId: "org1",
-      status: "succeeded",
-      triggeredBy: "manual",
-      startedAt: started,
-      finishedAt: finished,
-      bytesTransferred: 50_000,
-    });
+    await repos.db.insert(schema.backupRun).values([
+      {
+        id: "run-older",
+        policyId: "pol1",
+        destinationId: "dest1",
+        projectId: "p1",
+        serviceId: "svc1",
+        organizationId: "org1",
+        status: "succeeded",
+        triggeredBy: "manual",
+        startedAt: new Date(started.getTime() - 5_000),
+        finishedAt: new Date(finished.getTime() - 5_000),
+        bytesTransferred: 100_000,
+      },
+      {
+        id: "run-single",
+        policyId: "pol1",
+        destinationId: "dest1",
+        projectId: "p1",
+        serviceId: "svc1",
+        organizationId: "org1",
+        status: "succeeded",
+        triggeredBy: "manual",
+        startedAt: started,
+        finishedAt: finished,
+        bytesTransferred: 50_000,
+      },
+    ]);
 
     const res = await repos.run.latestByPolicy("pol1");
     expect(res).toBeDefined();
@@ -112,6 +116,7 @@ describe("repos.backupRun.latestByPolicy", () => {
     await repos.db.insert(schema.backupRun).values([
       {
         id: "run-api",
+        batchId: "batch-project",
         policyId: "pol1",
         destinationId: "dest1",
         projectId: "p1",
@@ -125,6 +130,7 @@ describe("repos.backupRun.latestByPolicy", () => {
       },
       {
         id: "run-dashboard",
+        batchId: "batch-project",
         policyId: "pol1",
         destinationId: "dest1",
         projectId: "p1",
@@ -138,6 +144,7 @@ describe("repos.backupRun.latestByPolicy", () => {
       },
       {
         id: "run-edge",
+        batchId: "batch-project",
         policyId: "pol1",
         destinationId: "dest1",
         projectId: "p1",
@@ -151,6 +158,7 @@ describe("repos.backupRun.latestByPolicy", () => {
       },
       {
         id: "run-postgres",
+        batchId: "batch-project",
         policyId: "pol1",
         destinationId: "dest1",
         projectId: "p1",
@@ -164,6 +172,7 @@ describe("repos.backupRun.latestByPolicy", () => {
       },
       {
         id: "run-redis",
+        batchId: "batch-project",
         policyId: "pol1",
         destinationId: "dest1",
         projectId: "p1",
@@ -179,6 +188,7 @@ describe("repos.backupRun.latestByPolicy", () => {
 
     const res = await repos.run.latestByPolicy("pol1");
     expect(res).toBeDefined();
+    expect(res?.id).toBe("run-redis");
     // Sum of transferred bytes: 26_988 + 31_059_009 + 124_923 = 31_210_920 (~29.8 MB)
     expect(res?.bytesTransferred).toBe(31_210_920);
     // Since some runs failed, overall batch status is failed
@@ -193,6 +203,7 @@ describe("repos.backupRun.latestByPolicy", () => {
     await repos.db.insert(schema.backupRun).values([
       {
         id: "run-db",
+        batchId: "batch-success",
         policyId: "pol1",
         destinationId: "dest1",
         projectId: "p1",
@@ -206,6 +217,7 @@ describe("repos.backupRun.latestByPolicy", () => {
       },
       {
         id: "run-cache",
+        batchId: "batch-success",
         policyId: "pol1",
         destinationId: "dest1",
         projectId: "p1",
@@ -231,6 +243,7 @@ describe("repos.backupRun.latestByPolicy", () => {
     await repos.db.insert(schema.backupRun).values([
       {
         id: "run-db",
+        batchId: "batch-running",
         policyId: "pol1",
         destinationId: "dest1",
         projectId: "p1",
@@ -244,6 +257,7 @@ describe("repos.backupRun.latestByPolicy", () => {
       },
       {
         id: "run-uploading",
+        batchId: "batch-running",
         policyId: "pol1",
         destinationId: "dest1",
         projectId: "p1",
@@ -264,14 +278,16 @@ describe("repos.backupRun.latestByPolicy", () => {
     expect(res?.bytesTransferred).toBe(12_000_000);
   });
 
-  it("isolates latest batch from historical older runs", async () => {
-    const oldTime = new Date("2026-08-20T03:00:00.000Z");
-    const newTime = new Date("2026-08-26T03:00:00.000Z");
+  it("does not combine independent batches fired seconds apart", async () => {
+    const oldTime = new Date("2026-08-26T03:00:00.000Z");
+    const newTime = new Date("2026-08-26T03:00:05.000Z");
 
-    // Old batch from 6 days ago
+    // This earlier trigger is inside the submitted PR's 60-second window. It
+    // must still remain separate from the newer trigger.
     await repos.db.insert(schema.backupRun).values([
       {
         id: "old-run-1",
+        batchId: "batch-old",
         policyId: "pol1",
         destinationId: "dest1",
         projectId: "p1",
@@ -285,6 +301,7 @@ describe("repos.backupRun.latestByPolicy", () => {
       },
       {
         id: "old-run-2",
+        batchId: "batch-old",
         policyId: "pol1",
         destinationId: "dest1",
         projectId: "p1",
@@ -298,10 +315,11 @@ describe("repos.backupRun.latestByPolicy", () => {
       },
     ]);
 
-    // New batch from today
+    // A distinct trigger of the same policy.
     await repos.db.insert(schema.backupRun).values([
       {
         id: "new-run-1",
+        batchId: "batch-new",
         policyId: "pol1",
         destinationId: "dest1",
         projectId: "p1",
@@ -315,6 +333,7 @@ describe("repos.backupRun.latestByPolicy", () => {
       },
       {
         id: "new-run-2",
+        batchId: "batch-new",
         policyId: "pol1",
         destinationId: "dest1",
         projectId: "p1",
@@ -330,7 +349,7 @@ describe("repos.backupRun.latestByPolicy", () => {
 
     const res = await repos.run.latestByPolicy("pol1");
     expect(res).toBeDefined();
-    // Only today's runs should be included (500_000 + 700_000 = 1_200_000), not old 300_000
+    // Only the latest exact batch is included, not the nearby 300_000 bytes.
     expect(res?.bytesTransferred).toBe(1_200_000);
     expect(res?.startedAt.toISOString()).toBe(new Date(newTime.getTime() + 10).toISOString());
   });

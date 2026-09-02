@@ -8,7 +8,7 @@
  *   restore      — restore history (sibling of run)
  */
 
-import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, lt, notInArray, or, sql } from "drizzle-orm";
 import type { Database } from "../client";
 import { backupDestination, backupPolicy, backupRestore, backupRun } from "../schema";
 import { detailOf } from "./storable-detail";
@@ -275,8 +275,6 @@ export function createBackupDestinationRepo(db: Database) {
   };
 }
 
-export type BackupDestinationRepo = ReturnType<typeof createBackupDestinationRepo>;
-
 // ─── Policy repo ─────────────────────────────────────────────────────────────
 
 export function createBackupPolicyRepo(db: Database) {
@@ -485,8 +483,6 @@ export function createBackupPolicyRepo(db: Database) {
   };
 }
 
-export type BackupPolicyRepo = ReturnType<typeof createBackupPolicyRepo>;
-
 // ─── Run repo ────────────────────────────────────────────────────────────────
 
 export function createBackupRunRepo(db: Database) {
@@ -533,87 +529,77 @@ export function createBackupRunRepo(db: Database) {
      * and the Destination detail page to show last-run state.
      *
      * When a policy targets an entire project, triggering it fans out into multiple child
-     * runs spawned concurrently within the same execution batch. This method finds the newest
-     * run, gathers all sibling runs in the same execution batch (within a 60-second window),
-     * and returns a consolidated summary with total transferred bytes and batch status.
+     * runs with the same batchId. This method finds the newest run, gathers only its exact
+     * siblings, and returns a consolidated summary with total transferred bytes and batch
+     * status. Legacy rows have no batchId and retain the former single-run behavior because
+     * timestamp proximity cannot safely distinguish concurrent triggers.
      */
     async latestByPolicy(policyId: string): Promise<PolicyLastRunSummary | undefined> {
       const latest = await db.query.backupRun.findFirst({
         where: and(eq(backupRun.policyId, policyId), isNull(backupRun.deletedAt)),
-        orderBy: (t, { desc }) => [desc(t.startedAt)],
+        orderBy: (t, { desc }) => [desc(t.startedAt), desc(t.id)],
       });
       if (!latest) return undefined;
 
-      const windowMs = 60 * 1000;
-      const batchStartCutoff = new Date(latest.startedAt.getTime() - windowMs);
-      const batchEndCutoff = new Date(latest.startedAt.getTime() + windowMs);
+      const singleRunSummary = (): PolicyLastRunSummary => ({
+        id: latest.id,
+        status: latest.status,
+        startedAt: latest.startedAt,
+        finishedAt: latest.finishedAt,
+        bytesTransferred: latest.bytesTransferred,
+      });
+      const batchId = latest.batchId;
+      if (!batchId) return singleRunSummary();
 
       const batchRuns = await db.query.backupRun.findMany({
         where: and(
           eq(backupRun.policyId, policyId),
+          eq(backupRun.batchId, batchId),
           isNull(backupRun.deletedAt),
-          gte(backupRun.startedAt, batchStartCutoff),
-          lte(backupRun.startedAt, batchEndCutoff),
         ),
-        orderBy: (t, { desc }) => [desc(t.startedAt)],
       });
 
-      if (batchRuns.length <= 1) {
-        return {
-          id: latest.id,
-          status: latest.status,
-          startedAt: latest.startedAt,
-          finishedAt: latest.finishedAt,
-          bytesTransferred: latest.bytesTransferred,
-        };
-      }
+      if (batchRuns.length <= 1) return singleRunSummary();
 
-      const earliestStartedAt = new Date(
-        Math.min(...batchRuns.map((r) => r.startedAt.getTime())),
+      const earliestStartedAt = new Date(Math.min(...batchRuns.map((r) => r.startedAt.getTime())));
+
+      // Pick the least-advanced live child so the summary does not imply that
+      // the whole batch has progressed farther than its slowest member.
+      const inFlightStatus = IN_FLIGHT_RUN_STATUSES.find((status) =>
+        batchRuns.some((r) => r.status === status),
       );
+      const hasUnfinishedRun = !!inFlightStatus || batchRuns.some((r) => !r.finishedAt);
 
-      const hasInFlight = batchRuns.some((r) =>
-        IN_FLIGHT_RUN_STATUSES.includes(r.status as BackupRunStatus) || !r.finishedAt,
-      );
-
-      const latestFinishedAt = hasInFlight
+      const latestFinishedAt = hasUnfinishedRun
         ? null
-        : new Date(
-            Math.max(...batchRuns.map((r) => r.finishedAt?.getTime() ?? 0)),
-          );
+        : new Date(Math.max(...batchRuns.map((r) => r.finishedAt!.getTime())));
 
       let batchStatus: string;
-      const inFlightRun = batchRuns.find((r) =>
-        IN_FLIGHT_RUN_STATUSES.includes(r.status as BackupRunStatus),
-      );
-      if (inFlightRun) {
-        batchStatus = inFlightRun.status;
-      } else if (
-        batchRuns.some((r) =>
-          ["failed", "server_error", "cancelled"].includes(r.status),
-        )
-      ) {
-        batchStatus =
-          batchRuns.find((r) =>
-            ["failed", "server_error", "cancelled"].includes(r.status),
-          )?.status ?? "failed";
+      if (inFlightStatus) {
+        batchStatus = inFlightStatus;
       } else if (batchRuns.every((r) => r.status === "succeeded")) {
         batchStatus = "succeeded";
       } else {
-        batchStatus = latest.status;
+        batchStatus =
+          (["server_error", "failed", "cancelled"] as const).find((status) =>
+            batchRuns.some((r) => r.status === status),
+          ) ?? latest.status;
       }
 
-      const totalBytes = batchRuns.reduce(
-        (sum, r) => sum + (r.bytesTransferred ? Number(r.bytesTransferred) : 0),
-        0,
-      );
+      const knownByteCounts = batchRuns
+        .map((r) => r.bytesTransferred)
+        .filter((bytes): bytes is number => bytes !== null);
+      const totalBytes =
+        knownByteCounts.length > 0
+          ? knownByteCounts.reduce((sum, bytes) => sum + Number(bytes), 0)
+          : null;
 
       return {
         id: latest.id,
         status: batchStatus,
         startedAt: earliestStartedAt,
         finishedAt: latestFinishedAt,
-        bytesTransferred: totalBytes > 0 ? totalBytes : latest.bytesTransferred,
+        bytesTransferred: totalBytes,
       };
     },
 
@@ -1014,8 +1000,6 @@ export function createBackupRunRepo(db: Database) {
   };
 }
 
-export type BackupRunRepo = ReturnType<typeof createBackupRunRepo>;
-
 // ─── Restore repo ────────────────────────────────────────────────────────────
 
 export function createBackupRestoreRepo(db: Database) {
@@ -1082,7 +1066,6 @@ export function createBackupRestoreRepo(db: Database) {
      * match against the stored value and the route rejects an empty one before it gets
      * that far, so the row is prepared and unappliable. The update is conditional on
      * the column still being null, so a concurrent prepare cannot swap the token out
-
      * from under a client already holding one — hence the read-back for the losing
      * caller, which needs the winner's value, not its own.
      */
@@ -1212,5 +1195,3 @@ export function createBackupRestoreRepo(db: Database) {
     },
   };
 }
-
-export type BackupRestoreRepo = ReturnType<typeof createBackupRestoreRepo>;

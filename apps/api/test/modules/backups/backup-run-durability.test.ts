@@ -156,6 +156,9 @@ describe("backupRun.transition — status must not ride a payload that can fail"
 
 const h = vi.hoisted(() => ({
   run: null as Record<string, unknown> | null,
+  policy: null as Record<string, unknown> | null,
+  services: [] as Array<{ id: string; enabled: boolean }>,
+  createdRuns: [] as Array<Record<string, unknown>>,
   executionRow: null as Record<string, unknown> | null,
   claimResults: ["claimed"] as Array<"claimed" | "project_unavailable" | "state_changed">,
   claimCalls: 0,
@@ -173,6 +176,10 @@ const h = vi.hoisted(() => ({
 vi.mock("@repo/db", () => ({
   repos: {
     backupRun: {
+      create: async (data: Record<string, unknown>) => {
+        h.createdRuns.push(data);
+        return data;
+      },
       findById: async () => h.run,
       claimExecution: async () => {
         h.claimCalls++;
@@ -188,18 +195,7 @@ vi.mock("@repo/db", () => ({
         h.transition!(id, status, patch),
     },
     backupPolicy: {
-      findById: async () => ({
-        id: "pol_1",
-        destinationId: "dst_1",
-        sourceKind: "mail_server",
-        mailServerId: "mail_1",
-        projectId: null,
-        payloadKind: "auto",
-        preHook: "pg_dump > /tmp/d.sql",
-        postHook: null,
-        hookTimeoutSeconds: 30,
-        payloadConfig: {},
-      }),
+      findById: async () => h.policy,
     },
     backupDestination: {
       findById: async () => ({
@@ -211,6 +207,12 @@ vi.mock("@repo/db", () => ({
       setLastVerified: async (_id: string, _ok: boolean, note?: string) => {
         h.verifyNotes.push(note);
       },
+    },
+    project: {
+      findById: async () => ({ id: "proj_1", organizationId: "org_1" }),
+    },
+    service: {
+      listByProject: async () => h.services,
     },
     mailServer: { get: async () => ({ id: "mail_1", domain: "mail.example.com" }) },
   },
@@ -323,6 +325,22 @@ function wireRun(): PgFake {
 
 beforeEach(() => {
   h.executionRow = null;
+  h.policy = {
+    id: "pol_1",
+    enabled: true,
+    destinationId: "dst_1",
+    sourceKind: "mail_server",
+    mailServerId: "mail_1",
+    projectId: null,
+    serviceId: null,
+    payloadKind: "auto",
+    preHook: "pg_dump > /tmp/d.sql",
+    postHook: null,
+    hookTimeoutSeconds: 30,
+    payloadConfig: {},
+  };
+  h.services = [];
+  h.createdRuns.length = 0;
   h.claimResults = ["claimed"];
   h.claimCalls = 0;
   h.acknowledgements.length = 0;
@@ -331,6 +349,43 @@ beforeEach(() => {
   h.artifactMetadata = {};
   h.notifications.length = 0;
   h.verifyNotes.length = 0;
+});
+
+describe("BackupOrchestrator.enqueue — durable batch identity", () => {
+  it("shares one batch id across fan-out children and rotates it per trigger", async () => {
+    h.policy = {
+      ...(h.policy ?? {}),
+      sourceKind: "service",
+      projectId: "proj_1",
+      mailServerId: null,
+    };
+    h.services = [
+      { id: "svc_api", enabled: true },
+      { id: "svc_db", enabled: true },
+    ];
+    const orchestrator = new BackupOrchestrator();
+
+    await orchestrator.enqueue({
+      policyId: "pol_1",
+      trigger: { source: "cron", userId: "system" },
+    });
+    const firstBatch = h.createdRuns.slice();
+
+    await orchestrator.enqueue({
+      policyId: "pol_1",
+      trigger: { source: "cron", userId: "system" },
+    });
+    const secondBatch = h.createdRuns.slice(2);
+
+    expect(firstBatch).toHaveLength(2);
+    expect(secondBatch).toHaveLength(2);
+    expect(firstBatch[0]!.batchId).toMatch(/^bkb_/);
+    expect(firstBatch[0]!.startedAt).toBeInstanceOf(Date);
+    expect(new Set(firstBatch.map((run) => run.batchId)).size).toBe(1);
+    expect(new Set(firstBatch.map((run) => run.startedAt)).size).toBe(1);
+    expect(new Set(secondBatch.map((run) => run.batchId)).size).toBe(1);
+    expect(secondBatch[0]!.batchId).not.toBe(firstBatch[0]!.batchId);
+  });
 });
 
 describe("a terminal status is final — one owner per verdict", () => {
