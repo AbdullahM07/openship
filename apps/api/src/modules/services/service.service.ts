@@ -35,6 +35,7 @@ import {
 } from "@repo/adapters";
 import { scopedVolumeName, type CommandExecutor } from "@repo/adapters";
 import { isArtifactRef } from "../../lib/container-ref";
+import { assertValidGeneratedConfigFiles } from "../../lib/generated-config-files";
 import { execInContainer } from "../../lib/agent-exec";
 import { encrypt, decrypt } from "../../lib/encryption";
 import {
@@ -75,7 +76,12 @@ import { bounded, duBytes, volumeBytes } from "../migration/migration-size";
 import { deployComposeServices } from "../deployments/compose/deploy.service";
 import { ServiceConfigStaleError, resolveStaleEnvKeysForService } from "../deployments/env-drift";
 import { deploymentWorkload } from "../deployments/deployment-class";
-import { hasSourceBuildRecipe } from "../../lib/deployable-service";
+import {
+  hasSourceBuildRecipe,
+  isStaticService,
+  resolveSubAppRecipe,
+} from "../../lib/deployable-service";
+import { inferComposeEnvironmentTemplates } from "../../lib/compose-parser";
 import { deriveProjectRouteState } from "../domains/project-route.service";
 import { registerStartupHook } from "../../lib/startup";
 import {
@@ -646,6 +652,9 @@ export async function createService(
   // strips the `null`-means-remove sentinels the update path accepts, so a
   // caller can send one payload shape to both.
   const advanced = mergeAdvanced(null, data.advanced);
+  if (advanced.files !== undefined) {
+    assertValidGeneratedConfigFiles(advanced.files);
+  }
   if (data.buildArgs !== undefined && !Object.hasOwn(data.advanced ?? {}, "buildArgTemplateKeys")) {
     // Direct/manual values are literal. Raw Compose parsing supplies its own
     // non-empty marker when interpolation is required.
@@ -758,6 +767,9 @@ export async function updateService(
   // deep merge would make a partially-specified healthcheck inherit stale fields.
   if ("advanced" in patch) {
     patch.advanced = mergeAdvanced(svc.advanced as ComposeAdvanced | null, patch.advanced);
+    if ((patch.advanced as ComposeAdvanced).files !== undefined) {
+      assertValidGeneratedConfigFiles((patch.advanced as ComposeAdvanced).files);
+    }
     await validateServiceAlias(
       projectId,
       serviceId,
@@ -1316,6 +1328,9 @@ export async function syncComposeServices(
     ports?: string[];
     dependsOn?: string[];
     environment?: Record<string, string>;
+    /** Optional explicit provenance from a trusted parser. When absent, this
+     * compose-sync boundary derives it with the canonical parser helper. */
+    environmentTemplates?: Record<string, string>;
     volumes?: string[];
     command?: string;
     commandArgv?: string[] | null;
@@ -1357,11 +1372,39 @@ export async function syncComposeServices(
   // resolveCommandArgv) is the ONE place that decides whether an unchanged string
   // keeps the stored argv or a changed one re-derives — so every writer into that
   // path, including the deploy request's own service list, gets the same rule.
-  const reconciled = parsed.map((svc) =>
-    svc.environment
-      ? { ...svc, environment: unmaskEnv(svc.environment, storedEnvByName.get(svc.name) ?? null) }
-      : svc,
-  );
+  const reconciled = parsed.map((svc) => {
+    const environment = svc.environment
+      ? unmaskEnv(svc.environment, storedEnvByName.get(svc.name) ?? null)
+      : svc.environment;
+    const advanced = svc.advanced as ComposeAdvanced | undefined;
+    const hasExplicitTemplateMarker = Object.hasOwn(advanced ?? {}, "environmentTemplateKeys");
+    const markedTemplateKeys = advanced?.environmentTemplateKeys ?? [];
+    // Three provenance levels, in priority order:
+    //   1. a trusted parser sent the exact raw expressions;
+    //   2. a normalized producer (notably `docker compose config`) sent a
+    //      names-only marker, where [] explicitly means "all values are final";
+    //   3. a manual/raw sync sent only environment values, so infer Compose
+    //      expressions with the canonical parser helper.
+    // This avoids both literal `${VAR}` containers and double-expanding `$$`.
+    const environmentTemplates =
+      svc.environmentTemplates ??
+      (hasExplicitTemplateMarker
+        ? Object.fromEntries(
+            markedTemplateKeys
+              .filter((key) => environment && Object.hasOwn(environment, key))
+              .map((key) => [key, environment![key]!]),
+          )
+        : inferComposeEnvironmentTemplates(environment));
+    const persistTemplateProvenance =
+      svc.environmentTemplates !== undefined ||
+      (!hasExplicitTemplateMarker && environment !== undefined);
+
+    return {
+      ...svc,
+      ...(environment && { environment }),
+      ...(persistTemplateProvenance && { environmentTemplates }),
+    };
+  });
 
   // composeAuthoritative: this endpoint's contract is "the FULL service list from
   // the compose file" — it already removes services missing from it. So an absent
@@ -1951,6 +1994,17 @@ async function provisionServiceContainer(
     await repos.service.update(serviceId, { enabled: true });
   }
 
+  // Direct Start has no build result to establish artifact provenance. It may
+  // classify the target as static, but deployComposeServices will accept a host
+  // path only when the prior successful row also owns the exact canonical
+  // release directory. Resolve row inheritance from the active snapshot just
+  // like the normal compose build path; raw nullable row fields are incomplete.
+  const staticServiceIds = isStaticService(
+    resolveSubAppRecipe(service, (dep.meta ?? {}) as Record<string, string | null | undefined>),
+  )
+    ? new Set([serviceId])
+    : undefined;
+
   const resolved = await resolveServicePlatform(project, dep);
   const runtime = resolved.platform.runtime;
   if (!isMultiServiceRuntime(runtime)) {
@@ -1983,6 +2037,7 @@ async function provisionServiceContainer(
       // unrelated one. Full compose deploys (Mode 2) don't pass this flag.
       targetServiceIds: new Set([serviceId]),
       strictScope: true,
+      staticServiceIds,
       routing: resolved.platform.routing,
       ssl: resolved.platform.ssl,
       system: resolved.platform.system,

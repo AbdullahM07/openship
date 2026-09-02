@@ -290,8 +290,16 @@ export class SystemSshExecutor implements CommandExecutor {
     });
   }
 
-  async writeFile(path: string, content: string): Promise<void> {
-    const remoteCommand = `mkdir -p ${sq(remoteDirname(path))} && cat > ${sq(path)}`;
+  async writeFile(path: string, content: string, opts?: { mode?: number }): Promise<void> {
+    const target = sq(path);
+    // Truncate first, tighten next, stream last. For an existing permissive file
+    // this means there may briefly be an empty file at the old mode, but secret
+    // bytes are not sent until chmod has succeeded.
+    const prepare =
+      opts?.mode === undefined
+        ? `cat > ${target}`
+        : `: > ${target} && chmod ${opts.mode.toString(8)} ${target} && cat > ${target}`;
+    const remoteCommand = `mkdir -p ${sq(remoteDirname(path))} && ${prepare}`;
     const res = await this.runSsh(remoteCommand, { input: content });
     if (res.code !== 0) {
       throw new Error(res.stderr.trim() || `Failed to write ${path} (exit ${res.code})`);

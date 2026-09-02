@@ -443,6 +443,68 @@ describe("runDeployPipeline routing is best-effort", () => {
   });
 });
 
+describe("runDeployPipeline cancellation", () => {
+  it("does not activate when cancelled before the worker starts", async () => {
+    const events: string[] = [];
+    const controller = new AbortController();
+    controller.abort();
+
+    const res = await runDeployPipeline(
+      recordingEnv(events),
+      makeInput({ signal: controller.signal }),
+      fakeLogger(),
+    );
+
+    expect(res.status).toBe("cancelled");
+    expect(events).toEqual([]);
+  });
+
+  it("unwinds a cancelled preflight without activating the new workload", async () => {
+    const events: string[] = [];
+    const controller = new AbortController();
+    const env = recordingEnv(events, {
+      preflight: async () => {
+        controller.abort();
+      },
+    });
+
+    const res = await runDeployPipeline(
+      env,
+      makeInput({ signal: controller.signal }),
+      fakeLogger(),
+    );
+
+    expect(res.status).toBe("cancelled");
+    expect(events).toEqual([]);
+  });
+
+  it("record-only cancellation performs no compensating runtime mutation", async () => {
+    const events: string[] = [];
+    const controller = new AbortController();
+    const env = recordingEnv(events, {
+      deactivateRetaining: async () => {
+        events.push("stop-retaining");
+        controller.abort();
+      },
+      reactivatePrevious: async () => {
+        events.push("reactivate");
+      },
+    });
+
+    const res = await runDeployPipeline(
+      env,
+      makeInput({
+        signal: controller.signal,
+        keepProvisionedOnCancel: true,
+      }),
+      fakeLogger(),
+    );
+
+    expect(res.status).toBe("cancelled");
+    expect(events).toEqual(["stop-retaining"]);
+  });
+});
+
 // ─── Teardown of the previous deployment is BOUNDED (#629) ───────────────────
 
 /**

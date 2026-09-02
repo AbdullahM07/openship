@@ -273,8 +273,9 @@ const WEBHOOK_LOCATION_PREFIX = "/_openship/hooks/";
  * rewrites. `httpsUpgrade` adds {@link HTTPS_UPGRADE} ahead of that chain, for the one
  * block that must bounce plain HTTP.
  *
- * The emitted set is unique BY NAME, built through `claimed`: nginx's duplicate check
- * compares location names and `^~` only sets `noregex`, so a `pathPrefix: "/"` — which a
+ * The emitted set is unique BY MATCH TYPE + NAME, built through `claimed`: nginx permits
+ * an exact and inclusive location for the same path, but compares inclusive location
+ * names without regard to `^~`. Thus a prefix `pathPrefix: "/"` — which a
  * capture-free `vercel.json` rewrite produces, one of Vercel's own documented shapes —
  * sat next to `location /` as `[emerg] duplicate location "/"`. The whole vhost is then
  * refused, and since a routing failure never fails a deploy the domain went dark behind
@@ -288,7 +289,13 @@ const WEBHOOK_LOCATION_PREFIX = "/_openship/hooks/";
 function renderProxyLocations(route: RouteConfig, opts: { httpsUpgrade: boolean }): string {
   if (!route.proxyLocations || route.proxyLocations.length === 0) return "";
   const head = `${opts.httpsUpgrade ? HTTPS_UPGRADE : ""}${renderRedirectRules(route, "        ")}`;
-  const claimed = new Set<string>(["/", WEBHOOK_LOCATION_PREFIX]);
+  const claimed = new Set<string>([
+    "prefix:/",
+    `prefix:${WEBHOOK_LOCATION_PREFIX}`,
+    // An exact webhook match would not be a duplicate, but it would outrank and
+    // hijack the edge-owned delivery endpoint just as surely as a prefix would.
+    `exact:${WEBHOOK_LOCATION_PREFIX}`,
+  ]);
   const blocks: string[] = [];
   for (const loc of route.proxyLocations) {
     assertValidUpstream(loc.targetUrl);
@@ -296,10 +303,12 @@ function renderProxyLocations(route: RouteConfig, opts: { httpsUpgrade: boolean 
     const headers = loc.external ? externalProxyHeaders(loc.targetUrl) : PROXY_HEADERS;
     if (!loc.pattern || !loc.upstreamPath) {
       assertValidLiteralPath(loc.pathPrefix, "proxy location prefix");
-      if (claimed.has(loc.pathPrefix)) continue;
-      claimed.add(loc.pathPrefix);
+      const kind = loc.exact ? "exact" : "prefix";
+      const key = `${kind}:${loc.pathPrefix}`;
+      if (claimed.has(key)) continue;
+      claimed.add(key);
       blocks.push(`
-    location ^~ ${loc.pathPrefix} {
+    location ${loc.exact ? "=" : "^~"} ${loc.pathPrefix} {
         ${head}proxy_pass ${loc.targetUrl};
         ${headers}
     }`);
@@ -312,8 +321,8 @@ function renderProxyLocations(route: RouteConfig, opts: { httpsUpgrade: boolean 
     // only the pattern's own captures may be `$…` there.
     assertNoRuntimeVariable(loc.upstreamPath, "rewrite upstream path", true);
     const match = `^${toNginxPattern(loc.pattern)}$`;
-    if (claimed.has(`~ ${match}`)) continue;
-    claimed.add(`~ ${match}`);
+    if (claimed.has(`regex:${match}`)) continue;
+    claimed.add(`regex:${match}`);
     blocks.push(`
     location ~ ${match} {
         ${head}rewrite ${match} ${loc.upstreamPath} break;

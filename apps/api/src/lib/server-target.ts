@@ -1,9 +1,28 @@
 import { repos, type Project } from "@repo/db";
-import { isLoopbackHost as isCoreLoopbackHost } from "@repo/core";
+import { AppError, isLoopbackHost as isCoreLoopbackHost } from "@repo/core";
 import { env } from "../config/env";
 
 interface DeploymentSnapshotLike {
   serverId?: string;
+}
+
+/**
+ * Resolve an explicit registered-server capability inside one organization.
+ * This is the shared write-path guard for project creation and deployment
+ * requests; callers must run it before they persist or reconcile anything.
+ */
+export async function requireOrgServer(serverId: string, organizationId: string) {
+  const server = await repos.server.getInOrganization(serverId, organizationId);
+  if (!server) {
+    // Deliberately org-agnostic: do not reveal whether the submitted id exists
+    // for another tenant.
+    throw new AppError(
+      "This deploy target is not available in the active organization. Reselect the server or switch organizations and retry.",
+      404,
+      "SERVER_TARGET_UNAVAILABLE",
+    );
+  }
+  return server;
 }
 
 /**

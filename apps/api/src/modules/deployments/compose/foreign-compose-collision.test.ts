@@ -3,7 +3,7 @@ import type { DockerContainerSummary } from "@repo/adapters";
 import { findForeignComposeCollisions } from "./foreign-compose-collision";
 
 const container = (over: Partial<DockerContainerSummary> & { id: string }) =>
-  ({ names: [], labels: {}, ports: [], mounts: [], ...over }) as DockerContainerSummary;
+  ({ names: [], labels: {}, ports: [], mounts: [], state: "running", ...over }) as DockerContainerSummary;
 
 describe("foreign Compose collision gate", () => {
   it("finds the old CLI stack before a normal same-slug deploy creates duplicates", () => {
@@ -79,5 +79,30 @@ describe("foreign Compose collision gate", () => {
         ],
       }),
     ).toEqual([]);
+  });
+
+  it("ignores an exited legacy container after the old stack was stopped", () => {
+    expect(
+      findForeignComposeCollisions({
+        slug: "openship",
+        serviceNames: ["api", "dashboard"],
+        containers: [
+          container({
+            id: "old_api",
+            state: "exited",
+            names: ["openship-api-1"],
+            composeProject: "openship",
+            composeService: "api",
+          }),
+          container({
+            id: "new_api",
+            state: "created",
+            names: ["openship-api-2"],
+            composeProject: "openship",
+            composeService: "api",
+          }),
+        ],
+      }),
+    ).toEqual([{ serviceName: "api", containerName: "openship-api-2" }]);
   });
 });

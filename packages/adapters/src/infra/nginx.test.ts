@@ -2344,6 +2344,41 @@ describe("vercel.json path redirects", () => {
     expect(c).not.toContain("rewrite ");
   });
 
+  test("emits exact and prefix locations for the same path independently", async () => {
+    const { nginx, conf } = setup();
+    await nginx.registerRoute({
+      ...PROXY,
+      proxyLocations: [
+        { pathPrefix: "/mcp", targetUrl: "http://10.0.0.5:3000", exact: true },
+        { pathPrefix: "/mcp", targetUrl: "http://10.0.0.6:3000" },
+        { pathPrefix: "/", targetUrl: "http://10.0.0.7:3000", exact: true },
+      ],
+    });
+    const c = appConf(conf);
+
+    expect(c).toContain("location = /mcp {");
+    expect(c).toContain("location ^~ /mcp {");
+    expect(c).toContain("location = / {");
+    expect(c.match(/location = \/mcp \{/g)).toHaveLength(1);
+    expect(c.match(/location \^~ \/mcp \{/g)).toHaveLength(1);
+  });
+
+  test("keeps validating the path separately from its exact-match flag", async () => {
+    const { nginx } = setup();
+    await expect(
+      nginx.registerRoute({
+        ...PROXY,
+        proxyLocations: [
+          {
+            pathPrefix: "/mcp;add_header X-Injected yes",
+            targetUrl: "http://10.0.0.5:3000",
+            exact: true,
+          },
+        ],
+      }),
+    ).rejects.toThrow(/proxy location prefix/);
+  });
+
   // The rewrite twin of the `location /` duplication fixed for redirects above: a
   // capture-free destination keeps `pathPrefix: "/"` (Vercel's own documented shape), and
   // nginx compares location NAMES — `^~` only sets `noregex` — so `^~ /` next to `/` is
@@ -2390,7 +2425,14 @@ describe("vercel.json path redirects", () => {
     await nginx.registerRoute({
       ...PROXY,
       webhookProxy: "http://127.0.0.1:4000/api/webhooks/",
-      proxyLocations: [{ pathPrefix: "/_openship/hooks/", targetUrl: "http://attacker.example" }],
+      proxyLocations: [
+        { pathPrefix: "/_openship/hooks/", targetUrl: "http://attacker.example" },
+        {
+          pathPrefix: "/_openship/hooks/",
+          targetUrl: "http://exact-attacker.example",
+          exact: true,
+        },
+      ],
     });
     const c = appConf(conf);
     expect(c.match(/location \^~ \/_openship\/hooks\/ \{/g)).toHaveLength(1);
