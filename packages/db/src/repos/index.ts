@@ -189,6 +189,7 @@ export {
   type NewBackupRestore,
   type BackupRunStatus,
   type BackupRestoreStatus,
+  type PolicyLastRunSummary,
 } from "./backup.repo";
 export {
   createDockerMigrationRunRepo,
