@@ -104,6 +104,7 @@ vi.mock("../../../src/modules/deployments/smart-route", () => ({
 
 import {
   applyReleaseSourceToSnapshot,
+  buildConfigSnapshot,
   redeployBuildSession,
   requestBuildAccess,
   resolveSnapshotTarget,
@@ -228,6 +229,20 @@ function releaseSnapshot(
     ...overrides,
   };
 }
+
+describe("buildConfigSnapshot", () => {
+  it("clones git snapshots instead of packaging their saved checkout path (#748)", () => {
+    const snapshot = buildConfigSnapshot(
+      baseProject({ gitProvider: "github", gitUrl: "https://github.com/acme/app.git" }) as never,
+    );
+
+    expect(snapshot).toMatchObject({ source: "git", localPath: undefined });
+  });
+
+  it("keeps the source path for local folder snapshots", () => {
+    expect(buildConfigSnapshot(baseProject() as never).localPath).toBe("/srv/my-stack");
+  });
+});
 
 describe("applyReleaseSourceToSnapshot", () => {
   it("freezes the normalized version, raw tag, and rendered image without repurposing buildImage", async () => {
