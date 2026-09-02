@@ -62,7 +62,12 @@ import {
 } from "../../lib/plan-guard";
 import { type RequestContext } from "../../lib/request-context";
 import { type PortCheckResult } from "../../lib/deployment-runtime";
+import { requireOrgServer } from "../../lib/server-target";
 import * as sessionManager from "./session-manager";
+import {
+  requestDeploymentCancellation,
+  waitForDeploymentQuiescence,
+} from "./deployment-cancellation";
 import {
   collectDeploymentManifest,
   executeCleanup,
@@ -83,6 +88,7 @@ import {
   syncProjectRouteState,
 } from "../domains/project-route.service";
 import { kickoffBuild, resolveServicePipelineMode } from "./build-pipeline";
+import { assertExactServiceTargets } from "./exact-service-targets";
 import {
   resolveReleaseDist,
   resolveReleaseVersion,
@@ -334,6 +340,10 @@ export interface DeploymentConfigSnapshot {
    * with `status='skipped'` so the fan-out has a complete record.
    */
   targetServiceIds?: string[];
+  /** Force registry-backed images to be pulled even when the same mutable tag
+   * already exists locally. This is deployment intent, not durable project
+   * configuration, and is cleared when a snapshot is reused. */
+  forcePullImages?: boolean;
   /**
    * `targetServiceIds` is an EXCLUSIVE scope, not just a build subset: a service outside
    * it is never deployed, never failed and never reaped.
@@ -388,7 +398,7 @@ function toRuntimeMode(value: string | null | undefined): "bare" | "docker" | un
 /** Build a config snapshot from the project - pure pass-through, no fallbacks.
  *  All values must be set by prepare / ensureProject before this is called. */
 export function buildConfigSnapshot(project: Project, branch?: string): DeploymentConfigSnapshot {
-  const runtimeImage = resolveRuntimeImage(project);
+  const deploymentClass = projectToClass(project);
 
   return {
     // Owning org — needed by every downstream that does an org-scoped
@@ -403,7 +413,7 @@ export function buildConfigSnapshot(project: Project, branch?: string): Deployme
     branch: branch || project.gitBranch || (project.localPath ? "main" : ""),
     framework: project.framework!,
     buildImage: project.buildImage!,
-    runtimeImage,
+    runtimeImage: resolveRuntimeImage(project),
     packageManager: project.packageManager!,
     installCommand: project.installCommand!,
     buildCommand: project.buildCommand!,
@@ -421,8 +431,8 @@ export function buildConfigSnapshot(project: Project, branch?: string): Deployme
     // it via snapshotToClass and never re-derives — a redeploy of THIS release
     // classifies as it did the day it was built, even after the project's flags
     // change.
-    ...projectToClass(project),
-    localPath: project.localPath || undefined,
+    ...deploymentClass,
+    localPath: deploymentClass.source === "upload" ? project.localPath || undefined : undefined,
     // Per packages/db/src/schema/project.ts:231 — `cloudWorkspaceId IS
     // NOT NULL` is THE canonical "is this a cloud project?" test.
     // Default the snapshot's deployTarget from that so preflight,
@@ -530,8 +540,8 @@ async function resolveLatestCommitInfo(ctx: RequestContext, project: Project, br
 
   const head = await getLatestCommit(ctx, project.gitOwner, project.gitRepo, branch);
   if (head?.sha && branch === projectBranch(project)) {
-    await Promise.resolve(
-      repos.updateStatus?.upsert?.({
+    try {
+      await repos.updateStatus.upsert({
         organizationId: project.organizationId,
         projectId: project.id,
         kind: "commit",
@@ -541,8 +551,11 @@ async function resolveLatestCommitInfo(ctx: RequestContext, project: Project, br
           latestSha: head.sha,
           latestMessage: head.message ?? null,
         },
-      }),
-    ).catch(() => {});
+      });
+    } catch {
+      // Cache persistence is best-effort; a deploy must not fail after GitHub
+      // already returned a usable commit merely because this write failed.
+    }
   }
   return head ? { commitSha: head.sha, commitMessage: head.message } : {};
 }
@@ -590,13 +603,14 @@ async function resolveProjectBranch(ctx: RequestContext, project: Project, branc
 }
 
 /**
- * Re-parse the repo's current docker-compose and 3-way reconcile it against the
+ * Re-parse the project's current docker-compose source and 3-way reconcile it against the
  * stored service rows (repos.service.reconcileFromCompose): services the user
  * hasn't edited auto-update to the repo; edited services are preserved and flagged
  * (`driftSpec`) for review. Existing rows reconcile best-effort. Bootstrapping an
  * explicitly compose-shaped project is strict: a bad/empty declared file must
  * block instead of silently falling through to the generic single-app builder.
- * Non-compose and local-source projects are unchanged. GitHub source only.
+ * Non-compose projects are unchanged. GitHub and local-path sources converge on
+ * resolveProjectInfo, so deploy has one parser and one 3-way merge policy.
  *
  * `changedPaths` (webhook only) is an optimization: when we have a definite,
  * non-empty changed-file list that does NOT include a compose file, skip drift
@@ -630,15 +644,17 @@ function composeRowsNeedBaselineUpgrade(
   });
 }
 
-async function reconcileComposeDrift(
+async function reconcileComposeSource(
   ctx: RequestContext,
   project: Project,
   branch: string,
   changedPaths?: string[] | null,
 ) {
   let bootstrapping = false;
+  const localPath = project.localPath?.trim();
+  const isLocalSource = Boolean(localPath);
   try {
-    if (!project.gitOwner || !project.gitRepo) return; // local/no-git source → nothing to re-parse
+    if (!isLocalSource && (!project.gitOwner || !project.gitRepo)) return;
     const composeRows = await listProjectComposeServices(project.id);
     const hasComposeRows = composeRows.some((s) => s.kind === "compose");
     bootstrapping = !hasComposeRows && isMultiServiceProject(project);
@@ -651,23 +667,32 @@ async function reconcileComposeDrift(
     if (
       !bootstrapping &&
       !needsBaselineUpgrade &&
+      !isLocalSource &&
       changedPaths &&
       changedPaths.length > 0 &&
       !composeCouldHaveChanged(project, changedPaths)
     ) {
       return; // this push didn't touch the compose file → no drift possible
     }
-    const info = await resolveProjectInfo({
-      source: "github",
-      owner: project.gitOwner,
-      repo: project.gitRepo,
-      branch,
-      ctx,
-      // Without this, a subpath compose project re-scans at the DETECTED root and
-      // finds no compose (or the wrong one), so `services` comes back empty and
-      // the reconcile below silently stops tracking upstream changes forever.
-      composePath: project.composePath ?? undefined,
-    });
+    const composePath = project.composePath ?? undefined;
+    // Without composePath, a subpath project re-scans at the detected root and
+    // finds no compose (or the wrong one), so reconciliation silently stops.
+    // Local wins when present because that is the build source transferred to a
+    // remote server; any stale Git metadata must not change what gets parsed.
+    const info = isLocalSource
+      ? await resolveProjectInfo({
+          source: "local",
+          path: localPath!,
+          composePath,
+        })
+      : await resolveProjectInfo({
+          source: "github",
+          owner: project.gitOwner!,
+          repo: project.gitRepo!,
+          branch,
+          ctx,
+          composePath,
+        });
     const services = info.services ?? [];
     if (services.length === 0) {
       if (bootstrapping) {
@@ -684,13 +709,14 @@ async function reconcileComposeDrift(
       );
     }
   } catch (err) {
-    if (bootstrapping) {
+    if (bootstrapping || isLocalSource) {
+      const action = bootstrapping ? "initialize" : "refresh";
       throw new AppError(
-        `Could not initialize compose services from "${project.composePath ?? "repository root"}": ${safeErrorMessage(err)}`,
+        `Could not ${action} compose services from "${project.composePath ?? "repository root"}": ${safeErrorMessage(err)}`,
         400,
       );
     }
-    // A transient repository/API failure may safely keep the last imported
+    // A transient GitHub/API failure may safely keep the last imported
     // shape for an existing project. A file we did read but cannot represent
     // must fail closed: otherwise this deploy silently runs the stale service
     // definition after the author changed a build target, secret, SSH option,
@@ -701,7 +727,7 @@ async function reconcileComposeDrift(
         400,
       );
     }
-    console.warn(`[compose-drift] reconcile skipped for ${project.id}:`, err);
+    console.warn(`[compose-source] reconcile skipped for ${project.id}:`, err);
   }
 }
 
@@ -879,8 +905,12 @@ export async function checkNoActiveBuild(projectId: string) {
   // neither prove worker completion nor guarantee the active row is on page 1.
   const [active] = await repos.deployment.listInFlightByProject(projectId);
   if (active) {
+    const cancelling = active.status === "cancelled";
     throw new ForbiddenError(
-      `A deployment is already in progress (${active.id}). Cancel it first or wait for it to complete.`,
+      cancelling
+        ? `The previous deployment is still finishing cancellation (${active.id}). ` +
+            "Wait a few seconds and retry; a parallel redeploy is blocked until its worker stops."
+        : `A deployment is already in progress (${active.id}). Cancel it first or wait for it to complete.`,
     );
   }
 }
@@ -1073,11 +1103,17 @@ export async function requestBuildAccess(
   input: BuildAccessInput,
   /**
    * INTERNAL-only options — deliberately a second argument rather than fields on
-   * `BuildAccessInput`, which is the wire body. `strictServiceScope` decides whether a
-   * service OUTSIDE the requested scope may be touched, so a client that could set it
-   * could scope any project's deploy exclusively; only server-side callers get to say it.
+   * `BuildAccessInput`, which is the wire body. These values can change which services
+   * are touched or bypass normal artifact acquisition, so only server-side callers get
+   * to set them.
    */
-  internal?: { strictServiceScope?: boolean },
+  internal?: {
+    strictServiceScope?: boolean;
+    /** One-time migration image pins, keyed by canonical service name. */
+    handoverImages?: Record<string, string>;
+    /** Single-app counterpart to `handoverImages`. */
+    handoverAppImage?: string;
+  },
 ) {
   const {
     projectId,
@@ -1093,7 +1129,6 @@ export async function requestBuildAccess(
     services,
     serviceIds,
     refreshServiceIds,
-    handoverImages,
     cloudResourceTier,
     cloudResourceCustom,
     cloneStrategy,
@@ -1103,6 +1138,11 @@ export async function requestBuildAccess(
   if (!project) {
     throw new NotFoundError("Project", projectId);
   }
+  // Validate an explicit host-root capability before compose reconciliation,
+  // route persistence, or deployment-row creation. Runtime/preflight reuse the
+  // same guard; this early call makes invalid/foreign targeting atomic even for
+  // public repositories and folder uploads that need no Git credential probe.
+  if (serverId) await requireOrgServer(serverId, ctx.organizationId);
   // Org-membership is verified by the route-level requirePermission
   // middleware before this is reached.
   // GitHub access gate: default-deny for everyone but the org owner —
@@ -1156,14 +1196,48 @@ export async function requestBuildAccess(
   // authoritative topology choice: do not parse, materialize, or validate the
   // declared compose file behind the caller's back.
   if (serviceDeploymentMode !== "single") {
-    await reconcileComposeDrift(ctx, project, resolvedBranch);
+    await reconcileComposeSource(ctx, project, resolvedBranch);
+  }
+
+  // Migration handover refs bypass build/pull, so they are both internal-only
+  // and validated before any route or deployment write. The map is
+  // keyed by the canonical service name consumed by pinnedServiceImage; a typo
+  // must fail closed instead of silently rebuilding a transferred image.
+  const handoverImages = internal?.handoverImages;
+  const handoverAppImage = internal?.handoverAppImage?.trim();
+  if (
+    (handoverImages && Object.keys(handoverImages).length > 0) ||
+    internal?.handoverAppImage !== undefined
+  ) {
+    const persistedServices = await listProjectComposeServices(project.id);
+    const knownServiceNames = new Set([
+      ...persistedServices.map((service) => service.name),
+      ...(effectiveServices ?? []).map((service) => service.name),
+    ]);
+    const invalidEntries = Object.entries(handoverImages ?? {}).filter(
+      ([name, ref]) => !knownServiceNames.has(name) || !ref.trim() || ref.trim().startsWith("/"),
+    );
+    if (invalidEntries.length > 0) {
+      throw new AppError(
+        `Invalid migration image handover for service${invalidEntries.length === 1 ? "" : "s"}: ${invalidEntries
+          .map(([name]) => name)
+          .join(", ")}`,
+        400,
+      );
+    }
+    if (
+      internal?.handoverAppImage !== undefined &&
+      (!handoverAppImage || handoverAppImage.startsWith("/"))
+    ) {
+      throw new AppError("Invalid migration application image handover", 400);
+    }
   }
 
   // #336: the wizard sees compose env MASKED, so a deploy request can echo the
   // "••••••••" sentinel back. Recover the real values before they're persisted
   // to the snapshot / service rows (else containers launch with KEY=••••••••).
   // Recovery sources, all plaintext: the staged upload's scan (session.services,
-  // captured pre-mask) and the stored service rows — which reconcileComposeDrift
+  // captured pre-mask) and the stored service rows — which reconcileComposeSource
   // above just refreshed from a git repo's compose, so this also covers a git
   // first-deploy. A revealed-and-edited value arrives real and passes through.
   if (effectiveServices?.length && effectiveServices.some((s) => hasMaskedValue(s.environment))) {
@@ -1253,8 +1327,11 @@ export async function requestBuildAccess(
   // transferred/running image with no build/pull. Only ever set by the migration
   // orchestrator's first deploy; a normal deploy leaves it unset → native build/pull.
   if (handoverImages && Object.keys(handoverImages).length > 0) {
-    snapshot.handoverImages = handoverImages;
+    snapshot.handoverImages = Object.fromEntries(
+      Object.entries(handoverImages).map(([name, ref]) => [name, ref.trim()]),
+    );
   }
+  if (handoverAppImage) snapshot.handoverAppImage = handoverAppImage;
   if (requestedServiceMode === "services" && effectiveServices?.length) {
     snapshot.composeServices = effectiveServices;
     // Persist compose services to the canonical service table NOW, at
@@ -1516,6 +1593,33 @@ export async function cancelBuildSession(
 
   const buildSession = await repos.deployment.findBuildSessionByDeploymentId(deploymentId);
 
+  // Win the outcome in the database BEFORE cleanup or transport cancellation.
+  // This closes the read→cancel race where the worker could publish `ready`
+  // while this handler was still collecting its cleanup manifest. The repo
+  // transition only accepts queued/building/deploying; a release that became
+  // ready first is left untouched.
+  const cancellationMeta = opts.keepProvisioned
+    ? {
+        ...((dep.meta as Record<string, unknown> | null) ?? {}),
+        cancellation: { keepProvisioned: true },
+      }
+    : undefined;
+  if (
+    !(await repos.deployment.cancelInFlight(
+      dep.id,
+      cancellationMeta ? { meta: cancellationMeta } : undefined,
+    ))
+  ) {
+    throw new ForbiddenError("Cannot cancel a deployment that is no longer in progress");
+  }
+
+  // Cancel the OUTER deployment worker as well as the adapter's build command.
+  // The image may already be complete while the worker is blocked in a prompt,
+  // preflight, or a host-scoped provisioning lock; changing the DB row alone
+  // leaves that worker holding the project lease indefinitely.
+  requestDeploymentCancellation(dep.id, { keepProvisioned: opts.keepProvisioned });
+  sessionManager.cancelPendingPrompt(dep.id);
+
   // 1. Abort the running build process. Best-effort - if the build already
   //    finished or never started this is a no-op.
   const { runtime } = platform();
@@ -1523,14 +1627,15 @@ export async function cancelBuildSession(
     await runtime.cancelBuild(buildSession.id).catch(() => {});
   }
 
-  // 2. Tear down whatever the deploy had already provisioned. The shared
-  //    deployment manifest enumerates ALL containers (deployment + each
-  //    service) and ALL images (deployment + each service's built image),
-  //    deduplicated. Volumes are deliberately NOT cleaned - cancel !=
+  // 2. Exactly ONE owner tears runtime resources down. A claimed worker owns
+  //    its build artifacts and containers and performs cancellation cleanup as
+  //    it unwinds; racing it here can delete a resource between its activate and
+  //    bookkeeping steps. Only a queued/unstarted deployment has no worker, so
+  //    the handler owns that manifest. Volumes are never cleaned: cancel !=
   //    delete, and the user may retry.
   if (opts.keepProvisioned) {
     console.log(`[CANCEL] ${dep.id}: keeping provisioned resources (record-only delete)`);
-  } else {
+  } else if (!buildSession?.startedAt) {
     // protectRetained: a cancelled compose deploy carries the LIVE release's
     // containerId/imageRef onto its own service rows for every service it hadn't
     // replaced yet, so an unprotected manifest tears down the running app.
@@ -1545,6 +1650,8 @@ export async function cancelBuildSession(
         console.error(`[CANCEL] Cleanup crashed for ${dep.id}:`, err);
       });
     }
+  } else {
+    console.log(`[CANCEL] ${dep.id}: worker owns runtime cleanup while cancellation unwinds`);
   }
 
   // 3. Surface service-level cancellation in the SSE stream so the UI stops
@@ -1566,7 +1673,6 @@ export async function cancelBuildSession(
   // INVARIANT: cancel writes the DEPLOYMENT row only — NEVER the project row.
   // activeDeploymentId (the last successful release) is left untouched, so a
   // cancelled redeploy has zero effect on the project's live state.
-  await repos.deployment.updateStatus(dep.id, "cancelled");
   if (buildSession) {
     // Record the time the build actually consumed, not 0. This is metered
     // (build_session.duration_ms is what the build-minute allowance sums), so a
@@ -1587,7 +1693,29 @@ export async function cancelBuildSession(
   // Broadcast cancelled AFTER service statuses so UI receives the service updates first
   sessionManager.updateStatus(dep.id, "cancelled");
 
-  return { success: true, message: "Deployment cancelled" };
+  // A terminal-looking deployment row is not proof that its worker stopped.
+  // Wait briefly for the outer pipeline finally to close the durable execution
+  // lease. If it cannot do so in the cooperative window, keep the result
+  // explicitly pending: callers must not claim cancellation completed or offer
+  // an immediate redeploy while the old worker may still touch the target host.
+  const quiescent = await waitForDeploymentQuiescence(dep.id, dep.projectId);
+  if (!quiescent) {
+    return {
+      success: false,
+      pending: true,
+      status: "cancelling" as const,
+      message:
+        "Cancellation was requested, but the deployment worker is still stopping. " +
+        "Redeploy remains blocked until cancellation finishes.",
+    };
+  }
+
+  return {
+    success: true,
+    pending: false,
+    status: "cancelled" as const,
+    message: "Deployment cancelled",
+  };
 }
 
 export async function redeployBuildSession(
@@ -1707,11 +1835,11 @@ export async function redeployBuildSession(
   // override an explicit user choice on the original deployment.
   // Reconcile upstream compose drift BEFORE reading the rows, so this redeploy
   // picks up repo changes on unedited services (and flags edited ones). See
-  // reconcileComposeDrift. A composePath bootstrap is intentionally strict;
+  // reconcileComposeSource. A composePath bootstrap is intentionally strict;
   // an explicitly frozen single-app deployment must remain single and must not
   // materialize compose rows as a side effect of redeploying it.
   if (meta.serviceDeploymentMode !== "single") {
-    await reconcileComposeDrift(ctx, project, branch);
+    await reconcileComposeSource(ctx, project, branch);
   }
 
   const currentComposeRows = await listProjectComposeServices(project.id).catch(() => []);
@@ -1818,6 +1946,12 @@ export async function triggerDeployment(
   ctx: RequestContext,
   data: {
     projectId: string;
+    /**
+     * Explicit registered-server target for CLI/API deploys. It is resolved by
+     * the same snapshot-target and org-scoped preflight path as the dashboard;
+     * omit it to retain the project's durable/active target.
+     */
+    serverId?: string;
     branch?: string;
     commitSha?: string;
     commitMessage?: string;
@@ -1830,6 +1964,14 @@ export async function triggerDeployment(
      * has a complete fan-out record for this deployment.
      */
     serviceIds?: string[];
+    /** Internal deployment intent used by scoped incoming webhooks. Persisted
+     * on this deployment's worker snapshot; deliberately not exposed by the
+     * HTTP deployment controller. */
+    forcePullImages?: boolean;
+    /** Internal exclusive target scope. When true, services outside an
+     * explicit serviceIds set are never started as a fallback when there is no
+     * prior deployment to carry forward. */
+    strictServiceScope?: boolean;
     /**
      * How the rollback artifact for THIS deployment is preserved.
      * `'snapshot'` (default) → archive image + workspace.
@@ -1851,7 +1993,7 @@ export async function triggerDeployment(
     forceAll?: boolean;
     /**
      * Repo-root-relative paths changed in this push (webhook only). Passed to
-     * the compose-drift reconciler so it can skip the repo scan when the compose
+     * the compose-source reconciler so it can skip the GitHub scan when the compose
      * file wasn't among them. Absent on manual triggers → reconcile runs.
      */
     changedPaths?: string[] | null;
@@ -1896,6 +2038,7 @@ export async function triggerDeployment(
   if (!project) {
     throw new NotFoundError("Project", data.projectId);
   }
+  if (data.serverId) await requireOrgServer(data.serverId, ctx.organizationId);
   // The Openship control plane IS the running host service, not a redeployable
   // workload — it updates itself via the CLI. It's a release-provider project, so
   // the git/localPath 403 below would NOT catch it; guard it explicitly.
@@ -1983,8 +2126,25 @@ export async function triggerDeployment(
   // repo scan when the push didn't touch the compose file. Existing projects
   // reconcile best-effort; a declared compose project with no rows is strict so
   // it cannot silently fall through with an empty service set.
+  if (data.strictServiceScope && !data.serviceIds?.length) {
+    throw new AppError("An exact deployment scope requires at least one service ID", 400);
+  }
+
   if (!data.reuseSnapshot && data.trigger !== "rollback") {
-    await reconcileComposeDrift(ctx, project, branch, data.changedPaths);
+    await reconcileComposeSource(ctx, project, branch, data.changedPaths);
+  }
+
+  // Scoped internal callers (incoming deploy hooks) require an exact target
+  // set. Re-check after compose reconciliation because that step can remove,
+  // replace, or disable service rows after the hook-level validation ran. A
+  // stale ID must fail before a deployment row is queued, never degrade into a
+  // partial or broader deployment.
+  if (data.strictServiceScope && data.serviceIds?.length) {
+    try {
+      assertExactServiceTargets(await repos.service.listByProject(project.id), data.serviceIds);
+    } catch (err) {
+      throw new AppError(safeErrorMessage(err), 400);
+    }
   }
 
   // ATOMIC rollback path: reuse the target deployment's frozen snapshot verbatim
@@ -1994,6 +2154,11 @@ export async function triggerDeployment(
   const snapshot = reuse
     ? ({ ...reuse.meta } as DeploymentConfigSnapshot)
     : buildConfigSnapshot(project, branch);
+  // This is an instruction for THIS run, not release configuration. In
+  // particular, a rollback that reuses a snapshot from an incoming webhook
+  // must not inherit its force-pull behavior.
+  if (data.forcePullImages) snapshot.forcePullImages = true;
+  else delete snapshot.forcePullImages;
   const routeState = await resolveProjectRouteState(project);
 
   // Resolve the snapshot's target (deployTarget + serverId + runtimeMode) from
@@ -2005,7 +2170,10 @@ export async function triggerDeployment(
   // gates serverId on target==="server" so a non-server deploy can't carry a stale
   // serverId. (reuse/rollback already carries the frozen target — leave it.)
   if (!reuse) {
-    const resolvedTarget = await resolveSnapshotTarget(project);
+    const resolvedTarget = await resolveSnapshotTarget(
+      project,
+      data.serverId ? { deployTarget: "server", serverId: data.serverId } : undefined,
+    );
     snapshot.deployTarget = resolvedTarget.deployTarget;
     snapshot.serverId = resolvedTarget.serverId;
     snapshot.runtimeMode = resolvedTarget.runtimeMode;
@@ -2220,6 +2388,7 @@ export async function triggerDeployment(
     forceAll: finalForceAll,
     serviceIds: finalServiceIds,
     refreshServiceIds,
+    strictServiceScope: data.strictServiceScope,
     changedPaths: resolvedChangedPaths ?? null,
   });
 

@@ -78,7 +78,8 @@ function detectPackageManager(dir: string): string | undefined {
 function detectStack(dir: string): string | undefined {
   if (existsSync(join(dir, "go.mod"))) return "go";
   if (existsSync(join(dir, "Cargo.toml"))) return "rust";
-  if (existsSync(join(dir, "requirements.txt")) || existsSync(join(dir, "pyproject.toml"))) return "python";
+  if (existsSync(join(dir, "requirements.txt")) || existsSync(join(dir, "pyproject.toml")))
+    return "python";
   if (existsSync(join(dir, "package.json"))) return "node";
   return undefined;
 }
@@ -98,6 +99,8 @@ export async function deployFolder(opts: {
   /** Reuse/update an existing project instead of creating one. */
   projectId?: string;
   environment?: string;
+  /** Explicit registered-server target. */
+  serverId?: string;
   /** Scope a folder REDEPLOY to a subset of services; others carry forward
    *  untouched (no needless stateful recreate). Ignored on a first deploy. */
   serviceIds?: string[];
@@ -111,7 +114,11 @@ export async function deployFolder(opts: {
   step("Creating upload session");
   const session = await apiRequest<FolderSessionRes>("/projects/folder/session", {
     method: "POST",
-    body: JSON.stringify({ name, packageManager: detectPackageManager(cwd), stack: detectStack(cwd) }),
+    body: JSON.stringify({
+      name,
+      packageManager: detectPackageManager(cwd),
+      stack: detectStack(cwd),
+    }),
   });
   if (!session.sessionId || !session.upload) {
     throw new Error(session.error || "Failed to open upload session");
@@ -183,6 +190,7 @@ export async function deployFolder(opts: {
     method: "POST",
     body: JSON.stringify({
       projectId: opts.projectId,
+      ...(opts.serverId ? { serverId: opts.serverId } : {}),
       name: scan.name || name,
       gitProvider: "upload",
       framework: scan.stack,
@@ -210,6 +218,7 @@ export async function deployFolder(opts: {
     body: JSON.stringify({
       projectId: ensured.project_id,
       uploadSessionId: session.sessionId,
+      ...(opts.serverId ? { deployTarget: "server", serverId: opts.serverId } : {}),
       ...(opts.environment ? { environment: opts.environment } : {}),
       // Carry the scanned compose services so a multi-service folder deploys as
       // a services project (persisted rows + services-mode preflight). Absent for

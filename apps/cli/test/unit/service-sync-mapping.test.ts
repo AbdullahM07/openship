@@ -66,6 +66,26 @@ describe("service sync — compose config JSON mapping", () => {
     expect(errors).toEqual([]);
   });
 
+  it("marks normalized environment as final so escaped dollars are not expanded twice (#751)", () => {
+    const errors: string[] = [];
+    const svc = mapComposeService(
+      "web",
+      {
+        image: "nginx",
+        // docker compose config has already turned `$${APP_HOST}` into this.
+        environment: { ESCAPED_LITERAL: "${APP_HOST}", NODE_ENV: "production" },
+      },
+      "/repo",
+      errors,
+    );
+
+    expect(svc).toMatchObject({
+      environment: { ESCAPED_LITERAL: "${APP_HOST}", NODE_ENV: "production" },
+      advanced: { environmentTemplateKeys: [] },
+    });
+    expect(errors).toEqual([]);
+  });
+
   it("refuses unsupported build behavior instead of silently dropping it", () => {
     const errors: string[] = [];
     mapComposeService(

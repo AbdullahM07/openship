@@ -110,7 +110,11 @@ const upstream = (p: Project, latestSha: string | null): UpstreamDrift => ({
 });
 
 /** A cache row as `updates:scan` would have written it. */
-const cachedRow = (over: { key: string; latestSha: string | null; ageMs: number }): UpdateStatus =>
+const cachedRow = (over: {
+  key: string;
+  latestSha: string | null;
+  ageMs: number;
+}): UpdateStatus =>
   ({
     id: "ups_1",
     organizationId: "org_1",

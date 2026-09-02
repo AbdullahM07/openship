@@ -43,6 +43,8 @@ const h = vi.hoisted(() => ({
   activePointer: [] as string[],
   notifications: [] as string[],
   deletedUpdateStatuses: [] as string[],
+  deleteUpdateStatusError: null as Error | null,
+  finishedLogs: [] as unknown[][],
 }));
 
 vi.mock("@repo/db", () => ({
@@ -65,8 +67,14 @@ vi.mock("@repo/db", () => ({
         if (rejection) throw new Error(rejection);
       },
       supersedePendingDecisions: async () => {},
-      finishBuildSession: async () => {
+      finishBuildSession: async (
+        _id: string,
+        _status: string,
+        _durationMs: number,
+        logs?: unknown[],
+      ) => {
         if (h.finishError) throw h.finishError;
+        h.finishedLogs.push(logs ?? []);
       },
     },
     project: {
@@ -78,6 +86,7 @@ vi.mock("@repo/db", () => ({
     service: { listByDeployment: async () => [] },
     updateStatus: {
       deleteByProject: async (projectId: string) => {
+        if (h.deleteUpdateStatusError) throw h.deleteUpdateStatusError;
         h.deletedUpdateStatuses.push(projectId);
       },
     },
@@ -155,6 +164,8 @@ beforeEach(() => {
   h.activePointer = [];
   h.notifications = [];
   h.deletedUpdateStatuses = [];
+  h.deleteUpdateStatusError = null;
+  h.finishedLogs = [];
 });
 
 describe("lifecycle: a rejected log payload cannot invert the outcome", () => {
@@ -185,6 +196,48 @@ describe("lifecycle: a rejected log payload cannot invert the outcome", () => {
     expect(h.sessionStatuses.map((s) => s.status)).toEqual(["failed"]);
     expect(h.notifications).toEqual(["deployment.failed"]);
     expect(ctx.settled).toBe("failed");
+  });
+
+  it("writes a direct pipeline failure into the persisted terminal log exactly once (#751)", async () => {
+    const ctx = ctxFor();
+    const { lines, logger } = loggerSpy();
+    ctx.logger = logger;
+    ctx.persistLogs = () =>
+      lines.map((line) => ({
+        timestamp: "2026-08-31T00:00:00.000Z",
+        message: line.message,
+        level: line.level as "error" | "info" | "warn" | undefined,
+      }));
+
+    await onFailure(ctx, "No services were found for this project", 99);
+
+    expect(lines).toEqual([
+      { message: "Error: No services were found for this project", level: "error" },
+    ]);
+    expect(h.finishedLogs.at(-1)).toEqual([
+      expect.objectContaining({
+        message: "Error: No services were found for this project",
+        level: "error",
+      }),
+    ]);
+  });
+
+  it("does not duplicate a terminal reason already emitted by a lower layer", async () => {
+    const ctx = ctxFor();
+    const { lines, logger } = loggerSpy();
+    logger.log("Error: docker build failed", "error");
+    ctx.logger = logger;
+    ctx.persistLogs = () =>
+      lines.map((line) => ({
+        timestamp: "2026-08-31T00:00:00.000Z",
+        message: line.message,
+        level: line.level as "error" | "info" | "warn" | undefined,
+      }));
+
+    await onFailure(ctx, "docker build failed", 99);
+
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.message).toBe("Error: docker build failed");
   });
 
   it("sanitizes the writes that land BEFORE the outcome (text + jsonb)", async () => {
@@ -321,6 +374,17 @@ describe("lifecycle: no write before settlement may tear down a live deploy", ()
     const ctx = ctxFor();
     await expect(onSuccess(ctx, { containerId: "c1", durationMs: 1 })).resolves.toBeUndefined();
     expect(h.deletedUpdateStatuses).toEqual(["prj_1"]);
+  });
+
+  it("keeps a successful deploy ready when cache invalidation fails", async () => {
+    h.deleteUpdateStatusError = new Error("database unavailable");
+    const ctx = ctxFor();
+
+    await expect(onSuccess(ctx, { containerId: "c1", durationMs: 1 })).resolves.toBeUndefined();
+
+    expect(statusPairs()).toEqual(["dep_1:ready"]);
+    expect(ctx.settled).toBe("ready");
+    expect(h.sessionStatuses.map((status) => status.status)).toEqual(["ready"]);
   });
 });
 

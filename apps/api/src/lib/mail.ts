@@ -5,6 +5,7 @@ import { safeErrorMessage, withTimeout } from "@repo/core";
 import { repos } from "@repo/db";
 import { cloudClient } from "./cloud/client";
 import { decrypt } from "./encryption";
+import { isSmtpAuthFailure } from "../modules/mail/smtp-auth-error";
 
 /**
  * Email sender with three transport sources, tried in this order for "auto":
@@ -138,7 +139,7 @@ async function resolveContainerReachableSmtpHost(reportedHost: string): Promise<
  *
  * Cached for 60s per serverId so we don't hit ensure* on every send.
  */
-async function getPlatformTransport(): Promise<{
+async function getPlatformTransport(options?: { rotate?: boolean }): Promise<{
   transport: Transporter;
   from: string;
 } | null> {
@@ -167,13 +168,15 @@ async function getPlatformTransport(): Promise<{
   if (!installed) return null;
 
   const cacheKey = installed.serverId;
-  const cached = platformTransportCache.get(cacheKey);
-  if (cached && Date.now() - cached.fetchedAt < PLATFORM_TRANSPORT_TTL_MS) {
-    return { transport: cached.transport, from: cached.from };
-  }
-  const failedAt = platformTransportFailures.get(cacheKey);
-  if (failedAt && Date.now() - failedAt < PLATFORM_TRANSPORT_FAILURE_TTL_MS) {
-    return null; // known-bad within the window — don't re-probe (or re-log)
+  if (!options?.rotate) {
+    const cached = platformTransportCache.get(cacheKey);
+    if (cached && Date.now() - cached.fetchedAt < PLATFORM_TRANSPORT_TTL_MS) {
+      return { transport: cached.transport, from: cached.from };
+    }
+    const failedAt = platformTransportFailures.get(cacheKey);
+    if (failedAt && Date.now() - failedAt < PLATFORM_TRANSPORT_FAILURE_TTL_MS) {
+      return null; // known-bad within the window — don't re-probe (or re-log)
+    }
   }
 
   try {
@@ -181,7 +184,9 @@ async function getPlatformTransport(): Promise<{
       "../modules/mail/admin/platform-mailbox.service"
     );
     const creds = await withTimeout(
-      ensureOpenshipPlatformMailbox(installed.serverId),
+      ensureOpenshipPlatformMailbox(installed.serverId, {
+        rotate: options?.rotate === true,
+      }),
       PLATFORM_ENSURE_TIMEOUT_MS,
       `platform mailbox lookup on ${installed.serverId}`,
     );
@@ -486,6 +491,30 @@ export async function sendMail(opts: SendMailOptions): Promise<boolean> {
       return true;
     } catch (err) {
       lastErr = err;
+      // A deleted/out-of-band-modified platform mailbox can invalidate a
+      // transporter that was cached before the vmail row changed. EAUTH means
+      // SMTP rejected before DATA, so it is safe to rotate once and retry the
+      // same message without risking duplicate delivery. This keeps the normal
+      // path cheap while making the stale-cache case self-healing immediately.
+      if (active.source === "platform" && isSmtpAuthFailure(err)) {
+        invalidatePlatformTransport();
+        const repaired = await getPlatformTransport({ rotate: true });
+        if (repaired) {
+          try {
+            await repaired.transport.sendMail({
+              from: repaired.from,
+              to: opts.to,
+              subject: opts.subject,
+              html: opts.html,
+              ...(opts.text ? { text: opts.text } : {}),
+            });
+            return true;
+          } catch (retryErr) {
+            lastErr = retryErr;
+            console.warn("[mail] send via repaired platform transport failed:", retryErr);
+          }
+        }
+      }
       const more = i < chain.length - 1;
       console.warn(
         `[mail] send via ${active.source} transport failed${more ? " - trying next source" : ""}:`,
@@ -509,13 +538,4 @@ function stripHtmlForText(html: string): string {
     .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-}
-
-/**
- * Invalidate the cached platform transport. Call after a mail-server
- * rotate / uninstall so the next sendMail re-runs ensure* and picks up
- * fresh creds (or correctly drops back to env).
- */
-export function invalidatePlatformTransportCache(): void {
-  platformTransportCache.clear();
 }

@@ -14,7 +14,7 @@
 
 import type Dockerode from "dockerode";
 import { PassThrough, Readable } from "node:stream";
-import { withTimeout, shellQuote } from "@repo/core";
+import { safeErrorMessage, withTimeout, shellQuote } from "@repo/core";
 import { DockerRuntime, resolveExecExitCode } from "../../runtime/docker";
 import { demuxDockerStream } from "../../runtime/docker-demux";
 import {
@@ -37,6 +37,15 @@ import type {
 } from "../types";
 
 const HELPER_IMAGE = "alpine:3";
+const BIND_PROBE_TARGET = "/__openship_bind_source";
+
+/** Docker's archive stat header encodes Go's os.FileMode; its top bit is ModeDir. */
+const DOCKER_MODE_DIRECTORY = 2 ** 31;
+
+type ArchiveInfoResponse = {
+  headers?: Record<string, string | string[] | undefined>;
+  resume?: () => unknown;
+};
 
 /**
  * How many artifact bytes may sit between the daemon and OUR writer.
@@ -182,6 +191,36 @@ function parseVolumeSpec(
   return { source, target, type };
 }
 
+/** Read the path type returned by Docker's HEAD /containers/:id/archive endpoint. */
+function archivePathIsDirectory(response: ArchiveInfoResponse, path: string): boolean {
+  const rawHeader = response.headers?.["x-docker-container-path-stat"];
+  const encoded = Array.isArray(rawHeader) ? rawHeader[0] : rawHeader;
+  if (!encoded) {
+    throw new Error(`Docker returned no path-stat header while inspecting ${path}`);
+  }
+
+  let stat: unknown;
+  try {
+    stat = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+  } catch (err) {
+    throw new Error(`Docker returned an invalid path-stat header while inspecting ${path}`, {
+      cause: err,
+    });
+  }
+  const mode = (stat as { mode?: unknown } | null)?.mode;
+  if (typeof mode !== "number" || !Number.isSafeInteger(mode)) {
+    throw new Error(`Docker returned no valid path mode while inspecting ${path}`);
+  }
+  return mode >= DOCKER_MODE_DIRECTORY;
+}
+
+function isMissingBindSourceError(err: unknown): boolean {
+  return (
+    (err as { statusCode?: number } | null)?.statusCode === 400 &&
+    /bind source path does not exist/i.test(safeErrorMessage(err))
+  );
+}
+
 export class DockerBackupExecutor implements BackupExecutor {
   readonly runtimeName = "docker" as const;
 
@@ -217,6 +256,65 @@ export class DockerBackupExecutor implements BackupExecutor {
     }
   }
 
+  /**
+   * Ask the Docker daemon about a path in a container's mount namespace.
+   *
+   * The API may itself run in a container or connect to Docker over SSH/TLS, so
+   * `node:fs` would inspect the wrong filesystem. Docker's archive-info endpoint
+   * returns the daemon-side path's Go FileMode without copying any archive bytes.
+   */
+  private async containerPathIsDirectory(
+    container: Dockerode.Container,
+    path: string,
+  ): Promise<boolean> {
+    let response: ArchiveInfoResponse | undefined;
+    try {
+      response = (await container.infoArchive({ path })) as ArchiveInfoResponse;
+      return archivePathIsDirectory(response, path);
+    } finally {
+      // dockerode exposes the HEAD response as a stream. Drain it so the daemon
+      // connection can be reused, including through the SSH/TLS transports.
+      response?.resume?.();
+    }
+  }
+
+  /**
+   * Classify a recorded bind source when there is no service container to inspect.
+   * A never-started helper gives Docker a mount namespace, and archive-info reports
+   * the source type from the daemon host. `Mounts` (rather than legacy `Binds`) is
+   * deliberate: a missing source is rejected instead of being created as a directory.
+   */
+  private async declaredBindIsDirectory(sourcePath: string): Promise<boolean> {
+    try {
+      return await this.withHelper(
+        {
+          Image: HELPER_IMAGE,
+          NetworkDisabled: true,
+          HostConfig: {
+            Mounts: [
+              {
+                Type: "bind",
+                Source: sourcePath,
+                Target: BIND_PROBE_TARGET,
+                ReadOnly: true,
+              },
+            ],
+          },
+        },
+        (helper) => this.containerPathIsDirectory(helper, BIND_PROBE_TARGET),
+      );
+    } catch (err) {
+      // Preserve the existing restore behavior for a declared directory that does
+      // not exist yet: streamPath/receiveStream may create and populate it later.
+      if (isMissingBindSourceError(err)) return true;
+      throw new Error(
+        `Could not inspect bind mount source "${sourcePath}" on the Docker host: ` +
+          safeErrorMessage(err),
+        { cause: err },
+      );
+    }
+  }
+
   async listSources(service: ServiceHandle): Promise<BackupSource[]> {
     // Two sources of truth:
     //  1. Live container's actual Mounts (authoritative when the
@@ -225,30 +323,42 @@ export class DockerBackupExecutor implements BackupExecutor {
     //  2. service.volumes from the DB (fallback when the container
     //     isn't running or doesn't exist yet).
     if (service.containerId) {
+      const container = this.dockerode.getContainer(service.containerId);
+      let data: Awaited<ReturnType<typeof container.inspect>> | null = null;
       try {
-        const data = await this.dockerode.getContainer(service.containerId).inspect();
+        data = await container.inspect();
+      } catch {
+        // Container gone — fall through to the DB-declared volumes.
+      }
+      if (data) {
         const mounts = (data.Mounts ?? []) as Array<{
           Type?: string;
           Name?: string;
           Source?: string;
           Destination?: string;
         }>;
-        return mounts
-          .filter((m) => m.Type === "volume" || m.Type === "bind")
-          .map(
-            (m, i): BackupSource => ({
-              id: m.Name ?? m.Source ?? `mount-${i}`,
-              target: m.Destination ?? "",
-              source: m.Name ?? m.Source ?? "",
-              type: (m.Type as BackupSource["type"]) ?? "volume",
-            }),
-          );
-      } catch {
-        // Container gone — fall through to the DB-declared volumes.
+        const sources: BackupSource[] = [];
+        for (const [i, mount] of mounts.entries()) {
+          if (mount.Type !== "volume" && mount.Type !== "bind") continue;
+          if (
+            mount.Type === "bind" &&
+            (!mount.Destination ||
+              !(await this.containerPathIsDirectory(container, mount.Destination)))
+          ) {
+            continue;
+          }
+          sources.push({
+            id: mount.Name ?? mount.Source ?? `mount-${i}`,
+            target: mount.Destination ?? "",
+            source: mount.Name ?? mount.Source ?? "",
+            type: mount.Type,
+          });
+        }
+        return sources;
       }
     }
 
-    return service.volumes
+    const sources = service.volumes
       .map((spec, i): BackupSource | null => {
         const parsed = parseVolumeSpec(spec);
         if (!parsed || !parsed.source) return null;
@@ -275,6 +385,17 @@ export class DockerBackupExecutor implements BackupExecutor {
         };
       })
       .filter((x): x is BackupSource => x !== null);
+
+    if (!sources.some((source) => source.type === "bind")) return sources;
+    await this.ensureImage(HELPER_IMAGE);
+
+    const backupable: BackupSource[] = [];
+    for (const source of sources) {
+      if (source.type !== "bind" || (await this.declaredBindIsDirectory(source.source))) {
+        backupable.push(source);
+      }
+    }
+    return backupable;
   }
 
   /**

@@ -9,6 +9,15 @@ describe("dashboard proxy middleware", () => {
     expect(res.headers.get("location")).toBeNull();
   });
 
+  it("allows Better Auth's error page without a session", () => {
+    const req = new NextRequest(
+      "http://localhost:3001/auth/error?error=invalid_client&error_description=Unknown+client",
+    );
+    const res = proxy(req);
+
+    expect(res.headers.get("location")).toBeNull();
+  });
+
   it("redirects unauthenticated access to private dashboard route to /login", () => {
     const req = new NextRequest("http://localhost:3001/projects");
     const res = proxy(req);

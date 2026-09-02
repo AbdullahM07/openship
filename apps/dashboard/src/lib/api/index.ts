@@ -35,6 +35,7 @@ export type {
   ObjectStorageProviderSpec,
   ObjectStorageView,
 } from "./projects";
+export type { ProjectResourcesResponse } from "./project-resources";
 export type { ReleaseImageSource } from "../release-image-source";
 export { appsApi } from "./apps";
 export type { AppCatalogEntry, AppCatalogField, InstallAppResult } from "./apps";
@@ -63,8 +64,15 @@ export {
 } from "./jobs";
 export { tokensApi } from "./tokens";
 export type { AccessToken, CreatedAccessToken, McpClient, McpClientDetail } from "./tokens";
-export { githubApi } from "./github";
-export type { RepoTreeEntry } from "./github";
+export { githubApi, GITHUB_SOURCES_CHANGED_EVENT } from "./github";
+export type {
+  RepoTreeEntry,
+  GitHubSource,
+  GitHubSourceConfiguration,
+  GitHubSourceInstallation,
+  ManualGitHubSourceInput,
+  UpdateGitHubSourceInput,
+} from "./github";
 export { iconsApi } from "./icons";
 export { imagesApi } from "./images";
 export type { ImageCatalogEntry, ListImagesResponse } from "./images";
@@ -91,6 +99,9 @@ export type {
   IssueResolution,
   IssueInfraFix,
   RescanResult,
+  WorkloadHealthRow,
+  MonitoringScanSession,
+  MonitoringScanStage,
 } from "./issues";
 export { migrationApi } from "./migration";
 export { dockerMigrationApi, isScanStreamStalled } from "./server-migration";
@@ -200,6 +211,9 @@ export type {
   MailHealthResponse,
   MailDeliveryHealth,
   MailDeliveryStatus,
+  MailPortReachability,
+  MailPortReachabilityCheck,
+  MailPortReachabilityStatus,
   MailDeferral,
   MailDeferralKind,
   MailOutboundMode,

@@ -60,12 +60,13 @@ vi.mock("../github/github.service", () => ({
   resolveDefaultBranch: async () => "main",
   listBranches: async () => [],
   getLatestCommit: async () => null,
+  getWebhookStrategy: () => h.strategy,
   // The seam the state depends on: which delivery mechanism this instance can use.
   resolveWebhookStrategy: async () => h.strategy,
 }));
 vi.mock("../github/github.auth", () => ({
   getInstallationIdByOrg: async () => h.installationId,
-  getInstallUrl: () => "",
+  resolveInstallUrl: async () => ({ url: "", state: "" }),
 }));
 vi.mock("./project-git-webhook", () => ({
   ensureSharedWebhook: async () => null,
@@ -156,6 +157,22 @@ describe("resolveProjectWebhookState", () => {
 
     expect(state.installationInstalled).toBe(true);
     expect(state.webhookActive).toBe(true);
+  });
+
+  it("uses the local App delivery path for a local target too", async () => {
+    h.strategy = "app";
+    h.installationId = "inst_1";
+    const { resolveProjectWebhookState } = await load();
+
+    const state = await resolveProjectWebhookState("org_1", {
+      ...gitProject,
+      webhookId: null,
+      deployTarget: "local",
+    });
+
+    expect(state.installationInstalled).toBe(true);
+    expect(state.webhookActive).toBe(true);
+    expect(state.sharedWebhookId).toBeNull();
   });
 
   it("app strategy with the App uninstalled reports no delivery path", async () => {

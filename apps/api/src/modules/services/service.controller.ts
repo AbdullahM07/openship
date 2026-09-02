@@ -252,6 +252,7 @@ export async function syncFromCompose(c: Context) {
       ports?: string[];
       dependsOn?: string[];
       environment?: Record<string, string>;
+      environmentTemplates?: Record<string, string>;
       volumes?: string[];
       command?: string;
       /** #332: exact argv — no `sh -c`. Wins over the lossy `command` string. */
