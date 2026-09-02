@@ -1326,6 +1326,7 @@ export function useDeploymentBuild(
             screenshots: data.screenshots,
             project_id: data.project_id,
             warningMessage: data.warningMessage,
+            decisionPending: data.decisionPending,
           });
           if (data.warningMessage) {
             showToast(data.warningMessage, "success", "Deployment Ready With Warnings");
