@@ -42,6 +42,8 @@ const h = vi.hoisted(() => ({
   sessionStatuses: [] as Array<{ id: string; status: string; detail?: Record<string, unknown> }>,
   activePointer: [] as string[],
   notifications: [] as string[],
+  deletedUpdateStatuses: [] as string[],
+  deleteUpdateStatusError: null as Error | null,
   finishedLogs: [] as unknown[][],
 }));
 
@@ -82,6 +84,12 @@ vi.mock("@repo/db", () => ({
       setCloudWorkspaceId: async () => {},
     },
     service: { listByDeployment: async () => [] },
+    updateStatus: {
+      deleteByProject: async (projectId: string) => {
+        if (h.deleteUpdateStatusError) throw h.deleteUpdateStatusError;
+        h.deletedUpdateStatuses.push(projectId);
+      },
+    },
   },
 }));
 
@@ -155,6 +163,8 @@ beforeEach(() => {
   h.sessionStatuses = [];
   h.activePointer = [];
   h.notifications = [];
+  h.deletedUpdateStatuses = [];
+  h.deleteUpdateStatusError = null;
   h.finishedLogs = [];
 });
 
@@ -358,6 +368,23 @@ describe("lifecycle: no write before settlement may tear down a live deploy", ()
 
     expect(statusPairs()).toEqual(["dep_1:ready"]);
     expect(ctx.settled).toBe("ready");
+  });
+
+  it("onSuccess invalidates cached update_status for the project", async () => {
+    const ctx = ctxFor();
+    await expect(onSuccess(ctx, { containerId: "c1", durationMs: 1 })).resolves.toBeUndefined();
+    expect(h.deletedUpdateStatuses).toEqual(["prj_1"]);
+  });
+
+  it("keeps a successful deploy ready when cache invalidation fails", async () => {
+    h.deleteUpdateStatusError = new Error("database unavailable");
+    const ctx = ctxFor();
+
+    await expect(onSuccess(ctx, { containerId: "c1", durationMs: 1 })).resolves.toBeUndefined();
+
+    expect(statusPairs()).toEqual(["dep_1:ready"]);
+    expect(ctx.settled).toBe("ready");
+    expect(h.sessionStatuses.map((status) => status.status)).toEqual(["ready"]);
   });
 });
 

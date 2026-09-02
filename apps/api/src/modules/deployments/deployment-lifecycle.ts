@@ -850,6 +850,14 @@ export async function onSuccess(
       );
   }
 
+  // Invalidate any cached update_status for this project so subsequent drift checks
+  // poll fresh upstream state rather than comparing the newly deployed version
+  // against a stale pre-deploy cache entry.
+  try {
+    await repos.updateStatus.deleteByProject(project.id);
+  } catch {
+    // Cache invalidation is best-effort bookkeeping after a successful deploy.
+  }
   await finishSession(buildSessionId, "ready", result.durationMs, collectLogs(ctx));
   sessionManager.updateStatus(dep.id, "ready", {
     // The deploy WORKED whether or not the row took the write, and the terminal

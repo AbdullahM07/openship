@@ -76,6 +76,12 @@ update-experience work accumulated since 0.6.9.
   of repeating the GitHub Release body. The native update panel keeps advisory
   copy separate from a resizable, scrollable changelog, and all changelog actions
   open the version page on `openship.io` rather than GitHub (#752).
+- **Successful deploys no longer re-advertise stale updates** — resolving the
+  tracked branch head refreshes its upstream cache while a deployment is in
+  progress, and successful deployments invalidate cached upstream state before
+  the UI refreshes. The update banner and issues feed therefore compare the live
+  deployment against a fresh upstream version instead of an older cached commit
+  or image digest (#726).
 
 ### Catalog apps
 
