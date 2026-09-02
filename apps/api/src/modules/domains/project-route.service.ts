@@ -3,6 +3,7 @@ import { safeErrorMessage } from "@repo/core";
 import { edgeProxyFor, resolveServedStaticPath } from "@repo/adapters";
 import { compileProjectRoutingFields } from "../../lib/project-routing-fields";
 import {
+  comparePublicRouteRows,
   isLoopbackHost,
   isReservedLoopbackPort,
   managedHostnameToSlug,
@@ -88,19 +89,7 @@ export function deriveEnvironmentPublicEndpoints(
 }
 
 function normalizeProjectRouteRows(projectDomains: Domain[]): Domain[] {
-  return projectDomains
-    .filter((domain) => !domain.serviceId)
-    .sort((left, right) => {
-      if (left.isPrimary !== right.isPrimary) {
-        return left.isPrimary ? -1 : 1;
-      }
-
-      if (left.domainType !== right.domainType) {
-        return left.domainType === "custom" ? -1 : 1;
-      }
-
-      return left.hostname.localeCompare(right.hostname);
-    });
+  return projectDomains.filter((domain) => !domain.serviceId).sort(comparePublicRouteRows);
 }
 
 function draftEndpointsWithIds(
