@@ -242,13 +242,41 @@ function locationBlocks(serverBody: string): { path: string; body: string }[] {
  * order. `proxy_pass` is only valid inside a location (or `if`) in nginx, so
  * this — not a server-level scan — is where real routes live.
  */
-function extractLocationProxies(serverBody: string): { path: string; proxyPass: string }[] {
-  const out: { path: string; proxyPass: string }[] = [];
+function extractLocationProxies(serverBody: string): {
+  routes: { path: string; proxyPass: string; exact?: boolean }[];
+  unsupported: string[];
+  sawProxyLocation: boolean;
+} {
+  const routes: { path: string; proxyPass: string; exact?: boolean }[] = [];
+  const unsupported: string[] = [];
+  let sawProxyLocation = false;
   for (const loc of locationBlocks(serverBody)) {
     const pp = firstDirective(loc.body, "proxy_pass");
-    if (pp) out.push({ path: loc.path, proxyPass: pp });
+    if (!pp) continue;
+    sawProxyLocation = true;
+
+    // Keep nginx's match mode separate from the path. Feeding the raw selector
+    // (`= /mcp`) to the route writer makes its injection guard correctly reject
+    // the whitespace, while stripping `=` without remembering it silently widens
+    // an exact route into a prefix. Regex and named locations have no equivalent
+    // in the imported route model, so drop only that location, not the whole vhost.
+    const exact = loc.path.match(/^=\s+(.+)$/);
+    if (exact) {
+      routes.push({ path: exact[1].trim(), proxyPass: pp, exact: true });
+      continue;
+    }
+    const strongPrefix = loc.path.match(/^\^~\s+(.+)$/);
+    if (strongPrefix) {
+      routes.push({ path: strongPrefix[1].trim(), proxyPass: pp });
+      continue;
+    }
+    if (/^~\*?(?:\s|$)/.test(loc.path) || loc.path.startsWith("@")) {
+      unsupported.push(loc.path);
+      continue;
+    }
+    routes.push({ path: loc.path, proxyPass: pp });
   }
-  return out;
+  return { routes, unsupported, sawProxyLocation };
 }
 
 /** Blank out quoted tokens so a directive-shaped word inside a VALUE can't be read
@@ -450,26 +478,34 @@ function parseServer(
 
   // All routes for this vhost. Locations are the real source; fall back to a
   // (technically-invalid but seen-in-the-wild) server-level proxy_pass.
-  const rawTargets = extractLocationProxies(body);
-  if (rawTargets.length === 0) {
+  const extracted = extractLocationProxies(body);
+  const rawTargets = extracted.routes;
+  for (const selector of extracted.unsupported) {
+    warnings.push(
+      `nginx: ${names[0]} location "${selector}" uses an unsupported regex or named selector (skipped)`,
+    );
+  }
+  if (rawTargets.length === 0 && !extracted.sawProxyLocation) {
     const serverLevel = firstDirective(body, "proxy_pass");
     if (serverLevel) rawTargets.push({ path: "/", proxyPass: serverLevel });
   }
 
-  const resolved: { path: string; url: string }[] = [];
+  const resolved: { path: string; url: string; exact?: boolean }[] = [];
   for (const t of rawTargets) {
     const r = resolveProxyTarget(t.proxyPass, upstreams);
     if ("reason" in r) warnings.push(`nginx: ${names[0]} ${t.path} — ${r.reason} (skipped)`);
-    else resolved.push({ path: t.path, url: r.url });
+    else resolved.push({ path: t.path, url: r.url, ...(t.exact ? { exact: true } : {}) });
   }
 
   let target: ImportedSite["target"];
-  let routes: { path: string; url: string }[] | undefined;
+  let routes: ImportedSite["routes"];
   if (resolved.length > 0) {
-    // Primary = the root location ("/") if present, else the first resolved.
+    // Primary = the inclusive root location ("/") if present, else the first
+    // resolved route. An exact `location = /` is an extra match, not the prefix
+    // fallback that serves every other path.
     // `routes` carries the FULL per-path set so a path-fan-out vhost (e.g.
     // `/ → :1010`, `/v3 → :1020`) is preserved — the edge can path-route it.
-    const primary = resolved.find((r) => r.path === "/") ?? resolved[0];
+    const primary = resolved.find((r) => r.path === "/" && !r.exact) ?? resolved[0];
     target = { kind: "proxy", url: primary.url };
     routes = resolved;
   } else if (isHttpsUpgradeForSelf(body, names)) {

@@ -177,6 +177,8 @@ export interface PublicEndpoint {
   id: string;
   port: string;
   targetPath: string;
+  /** Preserve an imported nginx `location = <path>` route during migration. */
+  exact?: boolean;
   domain: string;
   customDomain: string;
   domainType: "free" | "custom";
@@ -566,6 +568,7 @@ export function createPublicEndpoint(
     id: overrides.id ?? randomUUID(),
     port: overrides.port ?? "",
     targetPath: overrides.targetPath ?? "",
+    ...(overrides.exact ? { exact: true } : {}),
     domain: overrides.domain ?? "",
     customDomain: overrides.customDomain ?? "",
     domainType: overrides.domainType ?? "free",
