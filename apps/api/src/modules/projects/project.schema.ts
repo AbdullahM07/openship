@@ -171,10 +171,13 @@ const ComposeServiceSchema = Type.Object({
   ports: Type.Optional(Type.Array(Type.String({ maxLength: 100 }), { maxItems: 50 })),
   dependsOn: Type.Optional(Type.Array(Type.String({ maxLength: 100 }), { maxItems: 50 })),
   environment: Type.Optional(Type.Record(Type.String(), Type.String())),
+  environmentTemplates: Type.Optional(Type.Record(Type.String(), Type.String())),
   volumes: Type.Optional(Type.Array(Type.String({ maxLength: 500 }), { maxItems: 50 })),
   command: Type.Optional(Type.String({ maxLength: 2000 })),
   // #332: structured argv passed through from folder/scan (compose Cmd, no `sh -c`).
-  commandArgv: Type.Optional(Type.Array(Type.String({ maxLength: 2000 }), { maxItems: 100 })),
+  commandArgv: Type.Optional(
+    Type.Union([Type.Array(Type.String({ maxLength: 2000 }), { maxItems: 100 }), Type.Null()]),
+  ),
   restart: Type.Optional(Type.String({ maxLength: 50 })),
   advanced: Type.Optional(
     Type.Object(
@@ -345,6 +348,18 @@ export const SetReleaseSourceBody = Type.Object({
 
 export const CreateProjectBody = Type.Object({
   name: Type.String({ minLength: 1, maxLength: 100 }),
+  /**
+   * Durable deploy-target binding for a newly created project. The generic
+   * project PATCH deliberately omits this field: changing a target is a deploy
+   * operation, and the successful deployment lifecycle promotes that target
+   * atomically after the workload is live.
+   */
+  serverId: Type.Optional(
+    Type.String({
+      minLength: 1,
+      description: "Registered server to bind this new project to.",
+    }),
+  ),
   /** Override the auto-generated slug (used as free subdomain: slug.opsh.io) */
   slug: Type.Optional(
     Type.String({ minLength: 1, maxLength: 63, pattern: "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" }),
@@ -495,7 +510,9 @@ export const CreateProjectBody = Type.Object({
   internalAlias: Type.Optional(Type.Union([Type.String({ maxLength: 100 }), Type.Null()])),
 });
 
-export const UpdateProjectBody = Type.Partial(CreateProjectBody);
+// `serverId` is create/ensure-only. Keeping it out of the generic PATCH body is
+// also what keeps PROJECT_UPDATE_KEYS from becoming a target-retargeting path.
+export const UpdateProjectBody = Type.Partial(Type.Omit(CreateProjectBody, ["serverId"]));
 
 /**
  * POST /projects/ensure — CreateProjectBody plus an optional `projectId` to

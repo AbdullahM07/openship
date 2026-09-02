@@ -291,6 +291,7 @@ type ServerRouteSpec = {
   domain?: string;
   customDomain?: string;
   targetPath?: string;
+  exact?: boolean;
 };
 function toServerRoutes(
   routes: Record<string, PublicEndpoint[]> | undefined,
@@ -307,7 +308,8 @@ function toServerRoutes(
       domainType: ep.domainType === "custom" ? "custom" : "free",
       ...(ep.domainType === "custom" ? { customDomain: domain } : { domain }),
       ...(ep.port ? { exposedPort: String(ep.port) } : {}),
-      ...(targetPath && targetPath !== "/" ? { targetPath } : {}),
+      ...(targetPath && (targetPath !== "/" || ep.exact) ? { targetPath } : {}),
+      ...(ep.exact ? { exact: true } : {}),
     };
   }
   return Object.keys(out).length > 0 ? out : undefined;
@@ -993,7 +995,8 @@ export function ServerMigrationWizard({
                 port: firstContainerPort(s),
                 domainType: "custom",
                 customDomain: r.domains[0],
-                ...(r.path && r.path !== "/" ? { targetPath: r.path } : {}),
+                ...(r.path && (r.path !== "/" || r.exact) ? { targetPath: r.path } : {}),
+                ...(r.exact ? { exact: true } : {}),
               }),
             );
         } else if (mode === "free" || mode === "custom") {
@@ -3766,7 +3769,7 @@ function ServiceConfigCard({
   // Flat {domain, path} pairs the foreign proxy already serves for this service —
   // a path-fan-out vhost yields several (e.g. api.onvo.me `/`, api.onvo.me `/v3`).
   const keptRoutes = (existing ?? []).flatMap((r) =>
-    r.domains.map((domain) => ({ domain, path: r.path })),
+    r.domains.map((domain) => ({ domain, path: r.path, exact: r.exact })),
   );
   const keptDomain0 = keptRoutes[0]?.domain;
   const volumeNames = service.volumes
@@ -3951,9 +3954,9 @@ function ServiceConfigCard({
                     >
                       {r.domain}
                     </a>
-                    {r.path !== "/" && (
+                    {(r.path !== "/" || r.exact) && (
                       <span className="rounded bg-muted px-1 py-px text-[11px] font-mono text-muted-foreground">
-                        {r.path}
+                        {r.exact ? `= ${r.path}` : r.path}
                       </span>
                     )}
                   </div>

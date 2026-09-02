@@ -9,6 +9,10 @@ import type {
 } from "@repo/core";
 import { endpoints } from "./endpoints";
 import type { ReleaseImageSource } from "../release-image-source";
+import {
+  normalizeProjectResourcesResponse,
+  type ProjectResourcesResponse,
+} from "./project-resources";
 
 /* ------------------------------------------------------------------ */
 /*  Projects API                                                      */
@@ -639,7 +643,8 @@ export const projectsApi = {
 
   /** Read resources + the target machine's probed capacity (the ceiling for a
    *  custom value) + whether this target requires an explicit limit (cloud). */
-  getResources: (id: string | number) => api.get<any>(endpoints.projects.resources(id)),
+  getResources: async (id: string | number): Promise<ProjectResourcesResponse> =>
+    normalizeProjectResourcesResponse(await api.get<unknown>(endpoints.projects.resources(id))),
 
   /** Rollback retention: the window in force (explicit or disk-sized), the
    *  measured per-release size, and the deploy host's free disk. Everything is
@@ -649,13 +654,23 @@ export const projectsApi = {
     api.get<{ data: RollbackCapacityUI }>(endpoints.projects.rollbackCapacity(id)),
 
   /** Set resources (POST - tier-based) */
-  setResources: (id: string | number, resources: Record<string, any>) =>
-    api.post<any>(endpoints.projects.resources(id), resources),
+  setResources: async (
+    id: string | number,
+    resources: Record<string, unknown>,
+  ): Promise<ProjectResourcesResponse> =>
+    normalizeProjectResourcesResponse(
+      await api.post<unknown>(endpoints.projects.resources(id), resources),
+    ),
 
   /** Update resources (PATCH - raw values). Backend registers PATCH/POST for
    *  /:id/resources (both bound to ctrl.updateResources); there is no PUT. */
-  updateResources: (id: string | number, resources: Record<string, any>) =>
-    api.patch<any>(endpoints.projects.resources(id), resources),
+  updateResources: async (
+    id: string | number,
+    resources: Record<string, unknown>,
+  ): Promise<ProjectResourcesResponse> =>
+    normalizeProjectResourcesResponse(
+      await api.patch<unknown>(endpoints.projects.resources(id), resources),
+    ),
 
   /** Set sleep-mode */
   setSleepMode: (id: string | number, sleep_mode: string) =>

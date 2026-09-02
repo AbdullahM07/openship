@@ -419,7 +419,7 @@ function parseEnvironment(
         const rawValue = item.slice(eqIdx + 1);
         const resolved = resolveComposeValue(rawValue, interpolationEnv);
         values[key] = resolved.value;
-        if (rawValue.includes("$")) templates[key] = rawValue;
+        recordComposeEnvironmentTemplate(templates, key, rawValue);
         if (resolved.meta) metadata[key] = resolved.meta;
       } else {
         const key = interpolateComposeString(item, interpolationEnv);
@@ -449,13 +449,41 @@ function parseEnvironment(
       const rawValue = String(val);
       const resolved = resolveComposeValue(rawValue, interpolationEnv);
       values[key] = resolved.value;
-      if (rawValue.includes("$")) templates[key] = rawValue;
+      recordComposeEnvironmentTemplate(templates, key, rawValue);
       if (resolved.meta) metadata[key] = resolved.meta;
     }
     return { values, templates, metadata };
   }
 
   return { values: {}, templates: {}, metadata: {} };
+}
+
+/**
+ * Compose interpolation provenance for an already-parsed environment map.
+ *
+ * The parser and the manual services/sync boundary both use this helper so a
+ * value such as `${APP_KEY}` has exactly one meaning everywhere: resolve it from
+ * the deployment-scoped environment. Compose's `$$` escape remains correct —
+ * `$${APP_KEY}` is recorded as a template and resolves once to the literal
+ * `${APP_KEY}`. Keeping the dollar check here prevents the import parser and the
+ * sync endpoint from growing two subtly different interpolation detectors.
+ */
+function recordComposeEnvironmentTemplate(
+  templates: Record<string, string>,
+  key: string,
+  expression: string,
+): void {
+  if (expression.includes("$")) templates[key] = expression;
+}
+
+export function inferComposeEnvironmentTemplates(
+  environment: Record<string, string> | null | undefined,
+): Record<string, string> {
+  const templates: Record<string, string> = {};
+  for (const [key, expression] of Object.entries(environment ?? {})) {
+    recordComposeEnvironmentTemplate(templates, key, expression);
+  }
+  return templates;
 }
 
 function parseVolumes(vols: unknown, env: Record<string, string>): string[] {

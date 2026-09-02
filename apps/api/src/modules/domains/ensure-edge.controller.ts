@@ -39,6 +39,7 @@ import { withLiveProjectRuntimeMutation } from "../../lib/project-runtime-lock";
 import { applyProjectRouting } from "./routing-apply.service";
 import { reapplyProjectLiveRoutes } from "./project-route.service";
 import { resolveProjectLiveDeployTarget } from "../projects/project-deploy-target";
+import { findLocalServer } from "../../lib/startup/self-server";
 import {
   createEdgeConsentSession,
   getEdgeConsentSession,
@@ -87,7 +88,7 @@ export async function resolveProjectServer(
   // The active deployment snapshot is where the live edge actually runs. The
   // mutable project binding is only the canonical resolver's fallback for a
   // legacy/partial snapshot, never the first choice.
-  const { deployTarget, serverId } = await resolveProjectLiveDeployTarget(project);
+  let { deployTarget, serverId } = await resolveProjectLiveDeployTarget(project);
   if (deployTarget === "cloud") {
     return {
       error: "Cloud projects manage routing at the edge automatically",
@@ -97,6 +98,13 @@ export async function resolveProjectServer(
   }
   if (!project.activeDeploymentId)
     return { error: "Deploy the project before setting up its edge", status: 400 };
+  if (!serverId && deployTarget === "local") {
+    // A derived local target is represented by the absence of a durable server
+    // binding. Resolve its canonical row for the edge executor, but do not write
+    // it back to the project: edge-status is read-only, and doing so would change
+    // the destination of the project's next deployment from local to server.
+    serverId = (await findLocalServer().catch(() => null))?.id ?? null;
+  }
   if (!serverId) return { error: "Project is not deployed to a server", status: 400 };
   // Snapshot metadata is historical input, not an authorization boundary.
   // Reject a stale/foreign id before any reachability or SSH operation uses it.

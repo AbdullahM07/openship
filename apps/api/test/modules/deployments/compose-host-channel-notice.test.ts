@@ -184,6 +184,8 @@ async function demotedExecutor(): Promise<CommandExecutor> {
 beforeEach(() => {
   vi.unstubAllEnvs();
   vi.clearAllMocks();
+  h.allocateAndReservePinnedHostPort.mockReset();
+  h.releaseNewPinnedHostPortClaims.mockReset();
   h.services = [
     {
       id: "svc-web",
@@ -264,6 +266,621 @@ function addDisabledPreviousService() {
 }
 
 describe("compose deploy — host channel unavailable", () => {
+  it("aborts an exact cohort before activation when a later service is missing required env", async () => {
+    const runtime = startingRuntime();
+    const deployServiceWorkload = vi.mocked(runtime.deployServiceWorkload);
+    h.services = [
+      {
+        id: "svc-api",
+        projectId: "p1",
+        name: "api",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: [],
+        image: "ghcr.io/acme/api:staging",
+        environment: {},
+        exposed: false,
+      },
+      {
+        id: "svc-worker",
+        projectId: "p1",
+        name: "worker",
+        enabled: true,
+        dependsOn: [],
+        advanced: { environmentTemplateKeys: ["TOKEN"] },
+        ports: [],
+        image: "ghcr.io/acme/worker:staging",
+        environment: { TOKEN: "${TOKEN:?TOKEN is required}" },
+        exposed: false,
+      },
+    ];
+    h.previousServiceRows = [];
+
+    const { logger } = recordingLogger();
+    await expect(
+      deployComposeServices(
+        { ...project, activeDeploymentId: "d-old", routeStrategy: "container-ip" } as never,
+        dep,
+        runtime,
+        logger,
+        {
+          targetServiceIds: new Set(["svc-api", "svc-worker"]),
+          strictScope: true,
+        },
+      ),
+    ).rejects.toThrow(/aborted before cutover.*worker.*TOKEN/s);
+
+    expect(deployServiceWorkload).not.toHaveBeenCalled();
+  });
+
+  it("reserves every exact-cohort host port before activation and rolls back on failure", async () => {
+    const runtime = startingRuntime();
+    const deployServiceWorkload = vi.mocked(runtime.deployServiceWorkload);
+    h.services = [
+      {
+        id: "svc-api",
+        projectId: "p1",
+        name: "api",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: ["3000"],
+        image: "ghcr.io/acme/api:staging",
+        exposed: true,
+        exposedPort: "3000",
+        domainType: "custom",
+        customDomain: "api.example.com",
+      },
+      {
+        id: "svc-worker",
+        projectId: "p1",
+        name: "worker",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: ["4000"],
+        image: "ghcr.io/acme/worker:staging",
+        exposed: true,
+        exposedPort: "4000",
+        domainType: "custom",
+        customDomain: "worker.example.com",
+      },
+    ];
+    h.previousServiceRows = [];
+    const firstAllocation = {
+      port: 30_000,
+      scanned: true,
+      claim: {
+        id: "hpc-api",
+        targetKey: "local",
+        projectId: "p1",
+        serviceId: "svc-api",
+        containerPort: 3000,
+        port: 30_000,
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      },
+    };
+    h.allocateAndReservePinnedHostPort
+      .mockResolvedValueOnce(firstAllocation)
+      .mockRejectedValueOnce(new Error("no host port available"));
+
+    const { logger } = recordingLogger();
+    await expect(
+      deployComposeServices(
+        { ...project, activeDeploymentId: "d-old", routeStrategy: "loopback-port" } as never,
+        dep,
+        runtime,
+        logger,
+        {
+          executor: {} as CommandExecutor,
+          hostPortTarget: localHostPortTarget,
+          targetServiceIds: new Set(["svc-api", "svc-worker"]),
+          strictScope: true,
+          routing: {
+            registerRoute: vi.fn(async () => undefined),
+            removeRoute: vi.fn(async () => undefined),
+          } as never,
+          ssl: {
+            provisionCert: vi.fn(async () => ({ verified: false })),
+            renewCert: vi.fn(),
+            verifyCert: vi.fn(),
+            installCert: vi.fn(),
+          } as never,
+          usesManagedRouting: true,
+        },
+      ),
+    ).rejects.toThrow(/aborted before cutover.*no host port available/s);
+
+    expect(h.allocateAndReservePinnedHostPort).toHaveBeenCalledTimes(2);
+    expect(h.releaseNewPinnedHostPortClaims).toHaveBeenCalledWith(localHostPortTarget, [
+      firstAllocation,
+    ]);
+    expect(deployServiceWorkload).not.toHaveBeenCalled();
+  });
+
+  it("releases a target's preallocated host port when earlier carried bookkeeping throws", async () => {
+    const runtime = startingRuntime();
+    const deployServiceWorkload = vi.mocked(runtime.deployServiceWorkload);
+    h.services = [
+      {
+        id: "svc-carried",
+        projectId: "p1",
+        name: "carried",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: [],
+        image: "redis:7",
+        exposed: false,
+      },
+      {
+        id: "svc-target",
+        projectId: "p1",
+        name: "target",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: ["4000"],
+        image: "ghcr.io/acme/target:staging",
+        exposed: true,
+        exposedPort: "4000",
+        domainType: "custom",
+        customDomain: "target.example.com",
+      },
+    ];
+    h.previousServiceRows = [
+      {
+        id: "sd-carried",
+        deploymentId: "d-old",
+        serviceId: "svc-carried",
+        serviceName: "carried",
+        containerId: "container-carried",
+        status: "success",
+        imageRef: "redis:7",
+      },
+    ];
+    const targetAllocation = {
+      port: 30_001,
+      scanned: true,
+      claim: {
+        id: "hpc-target",
+        targetKey: "local",
+        projectId: "p1",
+        serviceId: "svc-target",
+        containerPort: 4000,
+        port: 30_001,
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      },
+    };
+    h.allocateAndReservePinnedHostPort.mockResolvedValueOnce(targetAllocation);
+    h.upsertServiceDeployment.mockRejectedValueOnce(new Error("database unavailable"));
+
+    const { logger } = recordingLogger();
+    await expect(
+      deployComposeServices(
+        {
+          ...project,
+          activeDeploymentId: "d-old",
+          routeStrategy: "loopback-port",
+        } as never,
+        dep,
+        runtime,
+        logger,
+        {
+          executor: {} as CommandExecutor,
+          hostPortTarget: localHostPortTarget,
+          targetServiceIds: new Set(["svc-target"]),
+          strictScope: true,
+          routing: {
+            registerRoute: vi.fn(async () => undefined),
+            removeRoute: vi.fn(async () => undefined),
+          } as never,
+          ssl: {
+            provisionCert: vi.fn(async () => ({ verified: false })),
+            renewCert: vi.fn(),
+            verifyCert: vi.fn(),
+            installCert: vi.fn(),
+          } as never,
+          usesManagedRouting: true,
+        },
+      ),
+    ).rejects.toThrow("database unavailable");
+
+    expect(h.releaseNewPinnedHostPortClaims).toHaveBeenCalledWith(localHostPortTarget, [
+      targetAllocation,
+    ]);
+    expect(deployServiceWorkload).not.toHaveBeenCalled();
+  });
+
+  it("retains an activated claim but releases later preallocations when cancelled", async () => {
+    const controller = new AbortController();
+    const runtime = startingRuntime();
+    const deployServiceWorkload = vi.mocked(runtime.deployServiceWorkload);
+    deployServiceWorkload.mockImplementationOnce(async () => {
+      controller.abort();
+      return {
+        status: "running",
+        containerId: "container-api",
+        ip: "172.18.0.3",
+      };
+    });
+    h.services = [
+      {
+        id: "svc-api",
+        projectId: "p1",
+        name: "api",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: ["3000"],
+        image: "ghcr.io/acme/api:staging",
+        exposed: true,
+        exposedPort: "3000",
+        domainType: "custom",
+        customDomain: "api.example.com",
+      },
+      {
+        id: "svc-worker",
+        projectId: "p1",
+        name: "worker",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: ["4000"],
+        image: "ghcr.io/acme/worker:staging",
+        exposed: true,
+        exposedPort: "4000",
+        domainType: "custom",
+        customDomain: "worker.example.com",
+      },
+    ];
+    h.previousServiceRows = [];
+    const apiAllocation = {
+      port: 30_000,
+      scanned: true,
+      claim: {
+        id: "hpc-api",
+        targetKey: "local",
+        projectId: "p1",
+        serviceId: "svc-api",
+        containerPort: 3000,
+        port: 30_000,
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      },
+    };
+    const workerAllocation = {
+      port: 30_001,
+      scanned: true,
+      claim: {
+        id: "hpc-worker",
+        targetKey: "local",
+        projectId: "p1",
+        serviceId: "svc-worker",
+        containerPort: 4000,
+        port: 30_001,
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      },
+    };
+    h.allocateAndReservePinnedHostPort
+      .mockResolvedValueOnce(apiAllocation)
+      .mockResolvedValueOnce(workerAllocation);
+
+    const { logger } = recordingLogger();
+    await expect(
+      deployComposeServices(
+        {
+          ...project,
+          activeDeploymentId: null,
+          routeStrategy: "loopback-port",
+        } as never,
+        dep,
+        runtime,
+        logger,
+        {
+          executor: {} as CommandExecutor,
+          hostPortTarget: localHostPortTarget,
+          targetServiceIds: new Set(["svc-api", "svc-worker"]),
+          strictScope: true,
+          routing: {
+            registerRoute: vi.fn(async () => undefined),
+            removeRoute: vi.fn(async () => undefined),
+          } as never,
+          ssl: {
+            provisionCert: vi.fn(async () => ({ verified: false })),
+            renewCert: vi.fn(),
+            verifyCert: vi.fn(),
+            installCert: vi.fn(),
+          } as never,
+          usesManagedRouting: true,
+          signal: controller.signal,
+        },
+      ),
+    ).rejects.toThrow("Deployment cancelled");
+
+    expect(deployServiceWorkload).toHaveBeenCalledTimes(1);
+    expect(runtime.destroy).toHaveBeenCalledWith("container-api");
+    expect(h.releaseNewPinnedHostPortClaims).not.toHaveBeenCalledWith(localHostPortTarget, [
+      apiAllocation,
+    ]);
+    expect(h.releaseNewPinnedHostPortClaims).toHaveBeenCalledWith(localHostPortTarget, [
+      workerAllocation,
+    ]);
+  });
+
+  it("pre-pulls the entire selected image cohort before touching any running service", async () => {
+    const { DockerRuntime } = await import("@repo/adapters");
+    const runtime = await DockerRuntime.create({
+      dockerSocketPath: "/tmp/openship-test-absent.sock",
+    });
+    const pullImage = vi
+      .spyOn(runtime, "pullImage")
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("registry unavailable"));
+    const deployServiceWorkload = vi
+      .spyOn(runtime, "deployServiceWorkload")
+      .mockResolvedValue({ status: "running", containerId: "new" });
+    const destroy = vi.spyOn(runtime, "destroy").mockResolvedValue(undefined);
+    vi.spyOn(runtime, "ensureServiceGroup").mockResolvedValue({ id: "group-1" });
+    h.services = [
+      {
+        id: "svc-db",
+        projectId: "p1",
+        name: "db",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: [],
+        image: "postgres:17",
+        exposed: false,
+      },
+      {
+        id: "svc-api",
+        projectId: "p1",
+        name: "api",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: [],
+        image: "ghcr.io/acme/api:staging",
+        exposed: false,
+      },
+      {
+        id: "svc-worker",
+        projectId: "p1",
+        name: "worker",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: [],
+        image: "ghcr.io/acme/worker:staging",
+        exposed: false,
+      },
+    ];
+
+    const { logger } = recordingLogger();
+    await expect(
+      deployComposeServices(
+        { ...project, activeDeploymentId: "d-old", routeStrategy: "container-ip" } as never,
+        dep,
+        runtime,
+        logger,
+        {
+          targetServiceIds: new Set(["svc-api", "svc-worker"]),
+          strictScope: true,
+          forcePullImages: true,
+        },
+      ),
+    ).rejects.toThrow("registry unavailable");
+
+    expect(pullImage).toHaveBeenNthCalledWith(1, "ghcr.io/acme/api:staging", { force: true });
+    expect(pullImage).toHaveBeenNthCalledWith(2, "ghcr.io/acme/worker:staging", { force: true });
+    expect(pullImage).toHaveBeenCalledTimes(2);
+    expect(pullImage).not.toHaveBeenCalledWith("postgres:17", expect.anything());
+    expect(deployServiceWorkload).not.toHaveBeenCalled();
+    expect(destroy).not.toHaveBeenCalled();
+  });
+
+  it("does not try to pull a static sub-app's host artifact as a Docker image", async () => {
+    const { DockerRuntime } = await import("@repo/adapters");
+    const runtime = await DockerRuntime.create({
+      dockerSocketPath: "/tmp/openship-test-absent.sock",
+    });
+    const pullImage = vi
+      .spyOn(runtime, "pullImage")
+      .mockRejectedValueOnce(new Error("stop after cohort classification"));
+    const deployServiceWorkload = vi.spyOn(runtime, "deployServiceWorkload");
+    vi.spyOn(runtime, "ensureServiceGroup").mockResolvedValue({ id: "group-1" });
+    h.services = [
+      {
+        id: "svc-web",
+        projectId: "p1",
+        name: "web",
+        kind: "monorepo",
+        // A valid inherited sub-app can keep these fields on the project
+        // snapshot rather than the row. The absolute build result remains the
+        // authoritative signal that this is a host artifact, not an image.
+        framework: null,
+        startCommand: null,
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: [],
+        image: null,
+        exposed: true,
+      },
+      {
+        id: "svc-api",
+        projectId: "p1",
+        name: "api",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: [],
+        image: "ghcr.io/acme/api:staging",
+        exposed: false,
+      },
+    ];
+
+    const { logger } = recordingLogger();
+    await expect(
+      deployComposeServices(
+        { ...project, activeDeploymentId: "d-old", routeStrategy: "container-ip" } as never,
+        dep,
+        runtime,
+        logger,
+        {
+          builtImages: new Map([["svc-web", "/opt/openship/static/.builds/web"]]),
+          staticArtifactRefs: new Map([["svc-web", "/opt/openship/static/.builds/web"]]),
+          staticServiceIds: new Set(["svc-web"]),
+          targetServiceIds: new Set(["svc-web", "svc-api"]),
+          strictScope: true,
+          forcePullImages: true,
+        },
+      ),
+    ).rejects.toThrow("stop after cohort classification");
+
+    expect(pullImage).toHaveBeenCalledTimes(1);
+    expect(pullImage).toHaveBeenCalledWith("ghcr.io/acme/api:staging", { force: true });
+    expect(deployServiceWorkload).not.toHaveBeenCalled();
+  });
+
+  it("does not trust a failed prior row's matching host path as a static artifact", async () => {
+    const { DockerRuntime } = await import("@repo/adapters");
+    const runtime = await DockerRuntime.create({
+      dockerSocketPath: "/tmp/openship-test-absent.sock",
+    });
+    const pullImage = vi
+      .spyOn(runtime, "pullImage")
+      .mockRejectedValueOnce(new Error("invalid image reference"));
+    const deployServiceWorkload = vi.spyOn(runtime, "deployServiceWorkload");
+    vi.spyOn(runtime, "ensureServiceGroup").mockResolvedValue({ id: "group-1" });
+    const attempted = "/opt/openship/static/releases/d-old-svc-host-path";
+    h.services = [
+      {
+        id: "svc-host-path",
+        projectId: "p1",
+        name: "host-path",
+        kind: "monorepo",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: [],
+        image: attempted,
+        exposed: false,
+      },
+    ];
+    // Failed rows retain the attempted imageRef for diagnostics. Equality with
+    // service.image must not upgrade that untrusted input into a host artifact,
+    // even when it has the exact shape of a managed release directory.
+    h.previousServiceRows = [
+      {
+        id: "sd-failed",
+        deploymentId: "d-old",
+        serviceId: "svc-host-path",
+        serviceName: "host-path",
+        containerId: null,
+        status: "failure",
+        imageRef: attempted,
+      },
+    ];
+
+    const { logger } = recordingLogger();
+    await expect(
+      deployComposeServices(
+        { ...project, activeDeploymentId: "d-old", routeStrategy: "container-ip" } as never,
+        dep,
+        runtime,
+        logger,
+        {
+          forcePullImages: true,
+          staticServiceIds: new Set(["svc-host-path"]),
+          staticArtifactRefs: new Map(),
+        },
+      ),
+    ).rejects.toThrow("invalid image reference");
+
+    expect(pullImage).toHaveBeenCalledWith(attempted, { force: true });
+    expect(deployServiceWorkload).not.toHaveBeenCalled();
+  });
+
+  it("carries an untargeted static release into the new deployment without re-promoting it", async () => {
+    const { DockerRuntime } = await import("@repo/adapters");
+    const runtime = await DockerRuntime.create({
+      dockerSocketPath: "/tmp/openship-test-absent.sock",
+    });
+    vi.spyOn(runtime, "ensureServiceGroup").mockResolvedValue({ id: "group-1" });
+    vi.spyOn(runtime, "listAllContainers").mockResolvedValue([]);
+    const deployServiceWorkload = vi.spyOn(runtime, "deployServiceWorkload");
+    const release = "/opt/openship/static/releases/d-old-svc-web";
+    h.services = [
+      {
+        id: "svc-web",
+        projectId: "p1",
+        name: "web",
+        kind: "monorepo",
+        framework: "vite",
+        startCommand: "",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: [],
+        image: null,
+        exposed: false,
+      },
+    ];
+    h.previousServiceRows = [
+      {
+        id: "sd-static-old",
+        deploymentId: "d-old",
+        serviceId: "svc-web",
+        serviceName: "web",
+        containerId: null,
+        status: "success",
+        imageRef: release,
+      },
+    ];
+
+    const { logger } = recordingLogger();
+    const result = await deployComposeServices(
+      {
+        ...project,
+        activeDeploymentId: "d-old",
+        routeStrategy: "container-ip",
+      } as never,
+      dep,
+      runtime,
+      logger,
+      {
+        targetServiceIds: new Set(["some-other-service"]),
+        staticServiceIds: new Set(["svc-web"]),
+      },
+    );
+
+    expect(result.status).toBe("ready");
+    expect(result.summary).toMatchObject({ successful: 1, deployed: 0, failed: 0 });
+    expect(result.services).toContainEqual(
+      expect.objectContaining({
+        serviceId: "svc-web",
+        staticRoot: release,
+        carried: true,
+      }),
+    );
+    expect(h.upsertServiceDeployment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        deploymentId: "d1",
+        serviceId: "svc-web",
+        status: "success",
+        imageRef: release,
+      }),
+    );
+    expect(deployServiceWorkload).not.toHaveBeenCalled();
+  });
+
   it("states the skip, the reason and the reassurance, before any host touchpoint", async () => {
     // The real demotion path: host control off is the same typed error an
     // unprovisioned container channel raises, and it is the one a test can produce

@@ -12,6 +12,10 @@ const PUBLIC_ROUTES = [
   "/forgot-password",
   "/reset-password",
   "/verify-email",
+  // Better Auth redirects browser-flow failures here. It must remain visible
+  // without a session or the middleware turns the useful error back into a
+  // silent login redirect.
+  "/auth/error",
   "/authorize",
   "/onboarding",
   // The MCP OAuth consent page. It must reach its own render even without a
