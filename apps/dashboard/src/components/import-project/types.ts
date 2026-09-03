@@ -23,6 +23,8 @@ export interface EnvironmentVariable {
    * its stored ciphertext. Any key/value edit clears this marker.
    */
   preserveValue?: boolean;
+  /** Explicit secret flag: true = secret (masked on read), false = non-secret. */
+  isSecret?: boolean;
 }
 
 export type StartCommand = string;
