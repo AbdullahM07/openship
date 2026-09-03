@@ -94,7 +94,7 @@ describeDockerE2E("compose full-deploy host-port preflight", () => {
     await runtime?.dispose().catch(() => undefined);
   }, 120_000);
 
-  it("fails closed for a real conflict, then self-heals stale identity without moving the port", async () => {
+  it("fails closed for a real conflict and preserves the port across stale and stopped state", async () => {
     expect(ready, "daemon unusable or base image unavailable").toBe(true);
 
     const org = await seedOrg();
@@ -299,5 +299,78 @@ describeDockerE2E("compose full-deploy host-port preflight", () => {
         containerPort: 3000,
       }),
     );
+
+    // Docker's list endpoint can omit the publish rows after a container stops,
+    // while full inspect retains HostConfig.PortBindings. Reproduce that exact
+    // production shape against a real daemon: preflight must inspect only the
+    // incomplete container, replace quarantine with its verified owner, and
+    // reserve the same free port before touching any service.
+    await setActive(project.id, retry.id);
+    await runtime.stop(retryApi!.containerId!);
+    await expect(runtime.getContainerInfo(retryApi!.containerId!)).resolves.toMatchObject({
+      status: "stopped",
+      hostPortByContainerPort: { 3000: apiPort },
+    });
+    expect(
+      await repos.hostPortClaim.releaseHostPortClaim({
+        targetKey: LOCAL_HOST_PORT_TARGET.targetKey,
+        port: apiPort,
+        projectId: project.id,
+        serviceId: api.id,
+        containerPort: 3000,
+      }),
+    ).toBe(true);
+    await repos.hostPortClaim.reserveQuarantinedHostPortClaim({
+      targetKey: LOCAL_HOST_PORT_TARGET.targetKey,
+      port: apiPort,
+    });
+
+    const listAllContainers = runtime.listAllContainers.bind(runtime);
+    const inventory = vi
+      .spyOn(runtime, "listAllContainers")
+      .mockImplementation(async () =>
+        (await listAllContainers()).map((container) =>
+          container.id === retryApi!.containerId ? { ...container, ports: [] } : container,
+        ),
+      );
+    const inspect = vi.spyOn(runtime, "getContainerInfo");
+    const stoppedRetry = await seedDeployment(project, {
+      imageRef: "compose",
+      containerId: "compose",
+      meta: { runtimeMode: "docker", deployTarget: "local" },
+    });
+    const projectWithStoppedActive = (await repos.project.findById(project.id))!;
+    const stoppedRetryResult = await deployComposeServices(
+      projectWithStoppedActive,
+      stoppedRetry,
+      runtime,
+      logger,
+      {
+        preparedLocalImages: new Map([
+          [postgres.id, IMAGE],
+          [redis.id, IMAGE],
+          [api.id, IMAGE],
+        ]),
+        routing: new NoopInfraProvider(),
+        ssl: new NoopInfraProvider(),
+        usesManagedRouting: false,
+        executor: createHostExecutor(),
+        localHost: true,
+        hostPortTarget: LOCAL_HOST_PORT_TARGET,
+      },
+    );
+    inventory.mockRestore();
+
+    expect(stoppedRetryResult.status).toBe("ready");
+    expect(inspect).toHaveBeenCalledWith(retryApi!.containerId!);
+    const stoppedRetryApi = (await repos.service.listByDeployment(stoppedRetry.id)).find(
+      (row) => row.serviceId === api.id,
+    );
+    expect(stoppedRetryApi).toMatchObject({ status: "success", hostPort: apiPort });
+    expect(stoppedRetryApi?.hostPorts).toEqual({ 3000: apiPort });
+    await expect(runtime.getContainerInfo(stoppedRetryApi!.containerId!)).resolves.toMatchObject({
+      status: "running",
+      hostPortByContainerPort: { 3000: apiPort },
+    });
   }, 180_000);
 });

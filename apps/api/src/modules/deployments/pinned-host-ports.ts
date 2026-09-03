@@ -26,10 +26,12 @@ export interface ReusablePinnedHostPort extends PinnedHostPortOwner {
 }
 
 /**
- * A carried mapping which has been verified against the live container before
- * host-port inventory runs. This is deliberately stronger than a cached
+ * A carried mapping which has been verified against an existing container
+ * before host-port inventory runs. This is deliberately stronger than a cached
  * service_deployment value: the runtime must report the same container-port →
- * host-port binding on the stable physical target.
+ * host-port binding on the stable physical target. A stopped container's
+ * configured Docker binding is valid ownership evidence even though it is not
+ * evidence that a current listener on that port belongs to the container.
  */
 export interface VerifiedCarriedPinnedHostPort {
   owner: PinnedHostPortOwner;
@@ -144,9 +146,9 @@ export async function prepareTargetPinnedHostPorts(input: {
   target: HostPortTargetIdentity;
   edgeProxy: Pick<EdgeProxyApi, "listLoopbackUpstreamPortsStrict">;
   /**
-   * Optional live proofs for carried mappings whose durable canonical claim is
-   * missing. These are reconciled before orphan edge ports are quarantined, so
-   * a verified owner is never mistaken for an unknown workload.
+   * Optional Docker proofs for carried mappings whose durable canonical claim
+   * is missing. These are reconciled before orphan edge ports are quarantined,
+   * so a verified owner is never mistaken for an unknown workload.
    */
   verifiedCarriedHostPorts?: Iterable<VerifiedCarriedPinnedHostPort>;
   onCarriedHostPortReconciled?: (claim: HostPortClaim) => void;
@@ -470,6 +472,20 @@ export interface AllocateAndReservePinnedHostPortInput {
    * carried route before its first canonical claim is written.
    */
   lockPreferred?: { ownerLabel: string };
+  /**
+   * Explicit live-occupancy policy for the resolved preferred port. A running
+   * container with the exact published binding may reuse its occupied port;
+   * a stopped container may reuse the same configured port only while it is
+   * actually free. When omitted, durable exact ownership retains the existing
+   * behavior for callers that do not inspect container state themselves.
+   */
+  reuseOccupiedPreferred?: boolean;
+  /**
+   * Optional interactive recovery for a preferred port that the allocator
+   * found unavailable. It runs before any reservation is written, then the
+   * allocator must prove the port is available on a fresh scan.
+   */
+  recoverUnavailablePreferred?: (port: number) => Promise<void>;
   allowLegacyContainerPort?: boolean;
   additionalAvoid?: Iterable<number>;
   allocate: (options: AllocateHostPortOptions) => Promise<HostPortAllocation>;
@@ -537,13 +553,39 @@ export async function allocateAndReservePinnedHostPort(
   const avoid = pinnedHostPortsToAvoid(input.claims, reusable);
   for (const port of input.additionalAvoid ?? []) avoid.add(port);
 
-  const allocation = await input.allocate({
+  const reuseOccupiedPreferred =
+    input.reuseOccupiedPreferred ??
+    (reusable
+      ? ownsReusablePinnedHostPort(input.claims, reusable) && !avoid.has(reusable.port)
+      : false);
+  const allocationOptions: AllocateHostPortOptions = {
     preferred,
     avoid,
-    reuseOccupiedPreferred: reusable
-      ? ownsReusablePinnedHostPort(input.claims, reusable) && !avoid.has(reusable.port)
-      : false,
-  });
+    reuseOccupiedPreferred,
+  };
+  let allocation = await input.allocate(allocationOptions);
+  if (
+    input.lockPreferred &&
+    preferred !== undefined &&
+    allocation.port !== preferred &&
+    !reuseOccupiedPreferred &&
+    !avoid.has(preferred) &&
+    input.recoverUnavailablePreferred
+  ) {
+    await input.recoverUnavailablePreferred(preferred);
+    allocation = await input.allocate(allocationOptions);
+  }
+  if (
+    input.lockPreferred &&
+    preferred !== undefined &&
+    !reuseOccupiedPreferred &&
+    !allocation.scanned
+  ) {
+    throw new Error(
+      `Refusing to reuse the locked host port for ${input.lockPreferred.ownerLabel} at ` +
+        `${preferred} during a same-server redeploy because live port occupancy could not be verified.`,
+    );
+  }
   if (input.lockPreferred && preferred !== undefined && allocation.port !== preferred) {
     throw new Error(
       `Refusing to change the locked host port for ${input.lockPreferred.ownerLabel} from ` +

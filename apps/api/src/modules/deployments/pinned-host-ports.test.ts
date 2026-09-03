@@ -489,6 +489,108 @@ describe("pinnedHostPortsToAvoid", () => {
     );
   });
 
+  it("reuses a stopped container's configured port only when the live scan says it is free", async () => {
+    const owner = { projectId: "compose", serviceId: "api", containerPort: 3000 };
+    const allocation = await allocateAndReservePinnedHostPort({
+      target: remoteTarget,
+      claims,
+      owner,
+      reuseOccupiedPreferred: false,
+      allocate: async (options) => ({
+        port: pickHostPort(new Set(), options),
+        scanned: true,
+      }),
+    });
+
+    expect(allocation.port).toBe(20002);
+  });
+
+  it("refuses a stopped container's configured port when a foreign listener occupies it", async () => {
+    const owner = { projectId: "compose", serviceId: "api", containerPort: 3000 };
+    await expect(
+      allocateAndReservePinnedHostPort({
+        target: remoteTarget,
+        claims,
+        owner,
+        reuseOccupiedPreferred: false,
+        lockPreferred: { ownerLabel: "api" },
+        allocate: async (options) => ({
+          port: pickHostPort(new Set([20002]), options),
+          scanned: true,
+        }),
+      }),
+    ).rejects.toThrow(/locked host port.*20002.*20000/);
+    expect(claimRepo.reserve).not.toHaveBeenCalled();
+  });
+
+  it("retries a locked preferred port only after explicit conflict recovery", async () => {
+    const owner = { projectId: "compose", serviceId: "api", containerPort: 3000 };
+    let occupied = true;
+    const allocate = vi.fn(async (options) => ({
+      port: pickHostPort(occupied ? new Set([20002]) : new Set(), options),
+      scanned: true,
+    }));
+    const recoverUnavailablePreferred = vi.fn(async () => {
+      occupied = false;
+    });
+
+    const allocation = await allocateAndReservePinnedHostPort({
+      target: remoteTarget,
+      claims,
+      owner,
+      reuseOccupiedPreferred: false,
+      lockPreferred: { ownerLabel: "api" },
+      recoverUnavailablePreferred,
+      allocate,
+    });
+
+    expect(allocation.port).toBe(20002);
+    expect(recoverUnavailablePreferred).toHaveBeenCalledWith(20002);
+    expect(allocate).toHaveBeenCalledTimes(2);
+    expect(claimRepo.reserve).toHaveBeenCalledTimes(1);
+  });
+
+  it("never offers takeover when another durable owner also claims the preferred port", async () => {
+    const owner = { projectId: "compose", serviceId: "api", containerPort: 3000 };
+    const recoverUnavailablePreferred = vi.fn(async () => undefined);
+    await expect(
+      allocateAndReservePinnedHostPort({
+        target: remoteTarget,
+        claims: [
+          ...claims,
+          { projectId: "foreign", serviceId: "web", containerPort: 8080, port: 20002 },
+        ],
+        owner,
+        reuseOccupiedPreferred: false,
+        lockPreferred: { ownerLabel: "api" },
+        recoverUnavailablePreferred,
+        allocate: async (options) => ({
+          port: pickHostPort(new Set([20002]), options),
+          scanned: true,
+        }),
+      }),
+    ).rejects.toThrow(/locked host port.*20002.*20000/);
+    expect(recoverUnavailablePreferred).not.toHaveBeenCalled();
+    expect(claimRepo.reserve).not.toHaveBeenCalled();
+  });
+
+  it("does not treat a failed port scan as proof that an inactive binding is free", async () => {
+    await expect(
+      allocateAndReservePinnedHostPort({
+        target: remoteTarget,
+        claims,
+        owner: { projectId: "compose", serviceId: "api", containerPort: 3000 },
+        reuseOccupiedPreferred: false,
+        lockPreferred: { ownerLabel: "api" },
+        allocate: async (options) => ({
+          port: pickHostPort(new Set(), options),
+          scanned: false,
+        }),
+      }),
+    ).rejects.toThrow(/live port occupancy could not be verified/);
+    expect(claimRepo.reserve).not.toHaveBeenCalled();
+  });
+
   it("rejects a same-target legacy-cache renumber before reserving a new claim", async () => {
     await expect(
       allocateAndReservePinnedHostPort({
