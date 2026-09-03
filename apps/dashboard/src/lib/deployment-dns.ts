@@ -5,6 +5,7 @@ import type { DeploymentConfig, PublicEndpoint } from "@/context/deployment/type
 export interface DeploymentDnsTarget {
   hostname: string;
   includeWww: boolean;
+  domainId?: string | null;
 }
 
 function customHostname(endpoint: Pick<PublicEndpoint, "domainType" | "customDomain">) {

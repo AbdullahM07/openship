@@ -17,6 +17,7 @@ interface DnsRecordsModalProps {
   }>;
   /** Selected remote deployment target, so A records point at that server. */
   serverId?: string;
+  confirmLabel?: string;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -30,6 +31,7 @@ interface DnsRecordsModalProps {
 export default function DnsRecordsModal({
   targets,
   serverId,
+  confirmLabel,
   onConfirm,
   onCancel,
 }: DnsRecordsModalProps) {
@@ -160,7 +162,7 @@ export default function DnsRecordsModal({
           onClick={onConfirm}
           className="rounded-xl bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
         >
-          {d.deployAction}
+          {confirmLabel ?? d.deployAction}
         </button>
       </div>
     </div>

@@ -77,6 +77,7 @@ import { AppLogo } from "@/components/AppLogo";
 import { VerifiedBadge } from "@/components/apps/VerifiedBadge";
 import { HostingBadge } from "@/components/apps/HostingBadge";
 import { UnverifiedBadge } from "@/components/apps/UnverifiedBadge";
+import DnsRecordsModal from "@/components/domains/DnsRecordsModal";
 import { PageContainer } from "@/components/ui/PageContainer";
 import { encodeProjectSlug } from "@/utils/repoSlug";
 import { parseContainerPort } from "@/utils/compose-ports";
@@ -251,7 +252,7 @@ export default function AppInstallPage() {
   const { t, locale } = useI18n();
   const w = t.projectSettings.appInstall;
   const { showToast } = useToast();
-  const { baseDomain, deployMode } = usePlatform();
+  const { baseDomain, deployMode, selfHosted } = usePlatform();
   // Desktop mode → the "open on localhost / forward the port" hints are relevant
   // (a VPS is already public; a local app is already localhost).
   const isDesktop = deployMode === "desktop";
@@ -1019,34 +1020,103 @@ export default function AppInstallPage() {
         }
       }
 
-      const dep = await deployApi.buildAccess({
-        projectId: pid,
-        serviceDeploymentMode: "services",
-        // Where to install — reuses the deploy wizard's target selection.
-        // Undefined falls back to the project/meta default server-side.
-        deployTarget: destination?.deployTarget,
-        serverId: destination?.deployTarget === "server" ? destination.serverId : undefined,
-      });
-      const depId =
-        dep?.data?.deployment_id ?? dep?.data?.deploymentId ?? dep?.deployment_id ?? null;
-      setDeploymentId(depId);
-      started = true;
-      // Persist the deployment id in the URL so a hard refresh mid-install
-      // resumes the progress view (re-attaches to the same SSE stream) instead
-      // of dropping back to the form. Client-only; best-effort.
-      if (depId) {
+      const startDeploy = async (targetPid: string) => {
+        setBusy(true);
         try {
-          const url = new URL(window.location.href);
-          url.searchParams.set("deployment", depId);
-          if (pid) url.searchParams.set("projectId", pid);
-          window.history.replaceState(null, "", url.toString());
-        } catch {
-          /* resume just won't survive a reload */
+          const dep = await deployApi.buildAccess({
+            projectId: targetPid,
+            serviceDeploymentMode: "services",
+            // Where to install — reuses the deploy wizard's target selection.
+            // Undefined falls back to the project/meta default server-side.
+            deployTarget: destination?.deployTarget,
+            serverId: destination?.deployTarget === "server" ? destination.serverId : undefined,
+          });
+          const depId =
+            dep?.data?.deployment_id ?? dep?.data?.deploymentId ?? dep?.deployment_id ?? null;
+          setDeploymentId(depId);
+          started = true;
+          // Persist the deployment id in the URL so a hard refresh mid-install
+          // resumes the progress view (re-attaches to the same SSE stream) instead
+          // of dropping back to the form. Client-only; best-effort.
+          if (depId) {
+            try {
+              const url = new URL(window.location.href);
+              url.searchParams.set("deployment", depId);
+              url.searchParams.set("projectId", targetPid);
+              window.history.replaceState(null, "", url.toString());
+            } catch {
+              /* resume just won't survive a reload */
+            }
+          }
+          setPhaseLabel(w.phaseQueued);
+          setStartedAt(Date.now());
+          setPhase("installing");
+        } catch (err) {
+          const msg = getApiErrorMessage(err, w.installFailed).replace(
+            /^Pre-deploy checks failed:\s*/i,
+            "",
+          );
+          if (started) {
+            setErrorMsg(msg);
+            setPhase("error");
+          } else {
+            showToast(msg, "error");
+          }
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      // Pre-deploy DNS gate (self-hosted custom domain): surface the records to add
+      // or auto-configure BEFORE the deploy so DNS is pointed when the first-deploy
+      // SSL attempt runs.
+      const customRoutes = (routes ?? []).filter(
+        (r) => r.mode === "custom" && r.customDomain?.trim(),
+      );
+      if (selfHosted && customRoutes.length > 0) {
+        const projectInfo = await projectsApi.getInfo(pid).catch(() => null);
+        const domainRows = Array.isArray(projectInfo?.data?.project?.domains)
+          ? projectInfo.data.project.domains
+          : [];
+        const domainByHost = new Map<string, string>();
+        for (const d of domainRows) {
+          if (typeof d?.hostname === "string" && typeof d?.id === "string") {
+            domainByHost.set(d.hostname.toLowerCase(), d.id);
+          }
+        }
+        const dnsTargets = customRoutes.map((r) => {
+          const host = normalizeCustomHostname(r.customDomain!);
+          return {
+            hostname: host,
+            domainId: domainByHost.get(host.toLowerCase()) ?? null,
+          };
+        });
+        if (dnsTargets.length > 0) {
+          setBusy(false);
+          let modalId = "";
+          modalId = showModal({
+            customContent: (
+              <DnsRecordsModal
+                targets={dnsTargets}
+                serverId={destination?.deployTarget === "server" ? destination.serverId : undefined}
+                confirmLabel={w.install}
+                onConfirm={() => {
+                  hideModal(modalId);
+                  void startDeploy(pid);
+                }}
+                onCancel={() => {
+                  hideModal(modalId);
+                  setBusy(false);
+                }}
+              />
+            ),
+            maxWidth: "560px",
+          });
+          return;
         }
       }
-      setPhaseLabel(w.phaseQueued);
-      setStartedAt(Date.now());
-      setPhase("installing");
+
+      await startDeploy(pid);
     } catch (err) {
       // Strip the server's "Pre-deploy checks failed:" prefix for a cleaner
       // message. Nothing deployed yet → toast + stay on the form; a deploy that

@@ -245,6 +245,21 @@ const Sidebar: React.FC = () => {
     // deploy. Informational-blocking: Deploy proceeds, Cancel aborts.
     const dnsTargets = selfHosted ? deploymentDnsTargets(config) : [];
     if (dnsTargets.length > 0) {
+      if (config.projectId) {
+        const projectInfo = await projectsApi.getInfo(config.projectId).catch(() => null);
+        const domainRows = Array.isArray(projectInfo?.data?.project?.domains)
+          ? projectInfo.data.project.domains
+          : [];
+        const domainByHost = new Map<string, string>();
+        for (const d of domainRows) {
+          if (typeof d?.hostname === "string" && typeof d?.id === "string") {
+            domainByHost.set(d.hostname.toLowerCase(), d.id);
+          }
+        }
+        for (const target of dnsTargets) {
+          target.domainId = domainByHost.get(target.hostname.toLowerCase()) ?? null;
+        }
+      }
       let modalId = "";
       modalId = showModal({
         customContent: (

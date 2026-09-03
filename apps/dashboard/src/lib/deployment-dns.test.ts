@@ -97,4 +97,13 @@ describe("deploymentDnsTargets", () => {
     expect(sidebar).toContain("<DnsRecordsModal");
     expect(sidebar).toContain("targets={dnsTargets}");
   });
+
+  it("guards self-hosted custom domains with DnsRecordsModal in the app installer", () => {
+    const installPage = readFileSync(
+      new URL("../app/(dashboard)/apps/new/[appId]/page.tsx", import.meta.url),
+      "utf8",
+    );
+    expect(installPage).toContain("<DnsRecordsModal");
+    expect(installPage).toContain("selfHosted && customRoutes.length > 0");
+  });
 });
