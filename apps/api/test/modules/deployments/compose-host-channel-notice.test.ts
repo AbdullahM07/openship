@@ -29,7 +29,6 @@ const h = vi.hoisted(() => ({
   convergeTargetHostPortClaims: vi.fn(),
   convergeTargetHostPortClaimsUnlocked: vi.fn(),
   prepareTargetPinnedHostPorts: vi.fn(),
-  findOwnedPinnedHostPort: vi.fn(),
   allocateAndReservePinnedHostPort: vi.fn(),
   releaseNewPinnedHostPortClaims: vi.fn(),
   reserveResolvedLoopbackRoutes: vi.fn(),
@@ -95,7 +94,6 @@ vi.mock("../../../src/lib/provision-lock", () => ({
 vi.mock("../../../src/modules/deployments/pinned-host-ports", () => ({
   withHostPortTargetLock: (_target: unknown, fn: () => unknown) => fn(),
   prepareTargetPinnedHostPorts: (...args: unknown[]) => h.prepareTargetPinnedHostPorts(...args),
-  findOwnedPinnedHostPort: (...args: unknown[]) => h.findOwnedPinnedHostPort(...args),
   convergeTargetHostPortClaims: (...args: unknown[]) => h.convergeTargetHostPortClaims(...args),
   convergeTargetHostPortClaimsUnlocked: (...args: unknown[]) =>
     h.convergeTargetHostPortClaimsUnlocked(...args),
@@ -190,7 +188,6 @@ beforeEach(() => {
   vi.unstubAllEnvs();
   vi.clearAllMocks();
   h.allocateAndReservePinnedHostPort.mockReset();
-  h.findOwnedPinnedHostPort.mockReset().mockReturnValue(undefined);
   h.releaseNewPinnedHostPortClaims.mockReset();
   h.services = [
     {
@@ -228,6 +225,7 @@ beforeEach(() => {
   h.allocateAndReservePinnedHostPort.mockImplementation(async (input) => ({
     port: 30_000,
     scanned: true,
+    claimWasCreated: true,
     claim: {
       id: "hpc-web",
       targetKey: "local",
@@ -407,7 +405,7 @@ describe("compose deploy — host channel unavailable", () => {
     expect(deployServiceWorkload).not.toHaveBeenCalled();
   });
 
-  it("preflights a full redeploy's later routed port before replacing postgres or redis", async () => {
+  it("accepts a relocated port during full-redeploy preflight before replacing any service", async () => {
     const runtime = startingRuntime();
     const deployServiceWorkload = vi.mocked(runtime.deployServiceWorkload);
     const destroy = vi.mocked(runtime.destroy);
@@ -483,40 +481,62 @@ describe("compose deploy — host channel unavailable", () => {
         hostPorts: { 3000: 20_008 },
       },
     ];
-    h.allocateAndReservePinnedHostPort.mockRejectedValueOnce(
-      new Error(
-        "Refusing to change the locked host port for api from 20008 to 20001 during a same-server redeploy",
-      ),
-    );
+    h.allocateAndReservePinnedHostPort.mockResolvedValueOnce({
+      port: 20_001,
+      preferred: 20_008,
+      scanned: true,
+      claimWasCreated: true,
+      previousClaim: {
+        projectId: "p1",
+        serviceId: "svc-api",
+        containerPort: 3000,
+        port: 20_008,
+      },
+      claim: {
+        id: "hpc-api-replacement",
+        targetKey: "local",
+        projectId: "p1",
+        serviceId: "svc-api",
+        containerPort: 3000,
+        port: 20_001,
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      },
+    });
 
     const { logger } = recordingLogger();
-    await expect(
-      deployComposeServices(
-        { ...project, activeDeploymentId: "d-old", routeStrategy: "loopback-port" } as never,
-        dep,
-        runtime,
-        logger,
-        {
-          executor: {} as CommandExecutor,
-          hostPortTarget: localHostPortTarget,
-          routing: {
-            registerRoute: vi.fn(async () => undefined),
-            removeRoute: vi.fn(async () => undefined),
-          } as never,
-          ssl: {
-            provisionCert: vi.fn(async () => ({ verified: false })),
-            renewCert: vi.fn(),
-            verifyCert: vi.fn(),
-            installCert: vi.fn(),
-          } as never,
-          usesManagedRouting: true,
-        },
-      ),
-    ).rejects.toThrow(/aborted before cutover.*locked host port.*20008.*20001/s);
+    const result = await deployComposeServices(
+      { ...project, activeDeploymentId: "d-old", routeStrategy: "loopback-port" } as never,
+      dep,
+      runtime,
+      logger,
+      {
+        executor: {} as CommandExecutor,
+        hostPortTarget: localHostPortTarget,
+        routing: {
+          registerRoute: vi.fn(async () => undefined),
+          removeRoute: vi.fn(async () => undefined),
+        } as never,
+        ssl: {
+          provisionCert: vi.fn(async () => ({ verified: false })),
+          renewCert: vi.fn(),
+          verifyCert: vi.fn(),
+          installCert: vi.fn(),
+        } as never,
+        usesManagedRouting: true,
+      },
+    );
 
-    expect(deployServiceWorkload).not.toHaveBeenCalled();
-    expect(destroy).not.toHaveBeenCalled();
-    expect(h.upsertServiceDeployment).not.toHaveBeenCalled();
+    expect(result.status).toBe("ready");
+    expect(h.allocateAndReservePinnedHostPort.mock.invocationCallOrder[0]).toBeLessThan(
+      deployServiceWorkload.mock.invocationCallOrder[0]!,
+    );
+    const occupancyPolicy = h.allocateAndReservePinnedHostPort.mock.calls[0]![0]
+      .reuseOccupiedPreferred as (port: number) => boolean;
+    expect(occupancyPolicy(20_008)).toBe(false);
+    expect(deployServiceWorkload).toHaveBeenCalledTimes(3);
+    expect(destroy).toHaveBeenCalled();
+    expect(h.upsertServiceDeployment).toHaveBeenCalled();
   });
 
   it("recovers a stale active container id from one live Docker inventory before port reconciliation", async () => {
@@ -621,8 +641,11 @@ describe("compose deploy — host channel unavailable", () => {
       }),
     );
     expect(h.allocateAndReservePinnedHostPort).toHaveBeenCalledWith(
-      expect.objectContaining({ reuseOccupiedPreferred: true }),
+      expect.objectContaining({ reuseOccupiedPreferred: expect.any(Function) }),
     );
+    const occupancyPolicy = h.allocateAndReservePinnedHostPort.mock.calls[0]![0]
+      .reuseOccupiedPreferred as (port: number) => boolean;
+    expect(occupancyPolicy(20_008)).toBe(true);
     expect(getContainerInfo).not.toHaveBeenCalled();
     expect(base.deployServiceWorkload).not.toHaveBeenCalled();
   });
@@ -733,10 +756,12 @@ describe("compose deploy — host channel unavailable", () => {
     expect(h.allocateAndReservePinnedHostPort).toHaveBeenCalledWith(
       expect.objectContaining({
         cachedPreferred: 20_007,
-        reuseOccupiedPreferred: false,
-        recoverUnavailablePreferred: expect.any(Function),
+        reuseOccupiedPreferred: expect.any(Function),
       }),
     );
+    const occupancyPolicy = h.allocateAndReservePinnedHostPort.mock.calls[0]![0]
+      .reuseOccupiedPreferred as (port: number) => boolean;
+    expect(occupancyPolicy(20_007)).toBe(false);
     expect(base.deployServiceWorkload).not.toHaveBeenCalled();
   });
 

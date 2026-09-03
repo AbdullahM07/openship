@@ -36,9 +36,11 @@ export const hostPortClaim = pgTable(
   (t) => [
     // The database, not a preceding list query, is the final collision arbiter.
     uniqueIndex("uq_host_port_claim_target_port").on(t.targetKey, t.port),
-    // PostgreSQL treats nulls as distinct, so expression sentinels make the
-    // stable single-app/legacy owner identities genuinely unique too.
-    uniqueIndex("uq_host_port_claim_target_owner").on(
+    // One owner may temporarily hold both the currently-routed port and its
+    // replacement during a make-before-break route cutover. This remains an
+    // index (rather than a uniqueness constraint) so owner-scoped convergence
+    // stays cheap while target+port above remains the collision authority.
+    index("idx_host_port_claim_target_owner").on(
       t.targetKey,
       t.projectId,
       sql`coalesce(${t.serviceId}, '')`,

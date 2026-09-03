@@ -94,7 +94,7 @@ describeDockerE2E("compose full-deploy host-port preflight", () => {
     await runtime?.dispose().catch(() => undefined);
   }, 120_000);
 
-  it("fails closed for a real conflict and preserves the port across stale and stopped state", async () => {
+  it("relocates a real conflict and preserves verified ports across stale and stopped state", async () => {
     expect(ready, "daemon unusable or base image unavailable").toBe(true);
 
     const org = await seedOrg();
@@ -174,7 +174,7 @@ describeDockerE2E("compose full-deploy host-port preflight", () => {
       containerId: oldRedis.containerId,
       imageRef: IMAGE,
     });
-    const activeApiRow = await seedServiceDeployment(active.id, api, {
+    await seedServiceDeployment(active.id, api, {
       // Deliberately stale: live identity must recover oldApi before allocation.
       containerId: "0".repeat(64),
       imageRef: IMAGE,
@@ -208,36 +208,65 @@ describeDockerE2E("compose full-deploy host-port preflight", () => {
     });
     const currentProject = (await repos.project.findById(project.id))!;
     const logger = new BuildLogger(() => undefined);
+    const routing = new NoopInfraProvider();
+    vi.spyOn(routing, "registerRoute").mockImplementation(async (route) => {
+      if (!route.targetUrl) return;
+      const routedPort = Number(new URL(route.targetUrl).port);
+      if (!Number.isSafeInteger(routedPort) || routedPort < 1) return;
+      observedPorts.clear();
+      observedPorts.add(routedPort);
+    });
 
-    await expect(
-      deployComposeServices(currentProject, next, runtime, logger, {
-        preparedLocalImages: new Map([
-          [postgres.id, IMAGE],
-          [redis.id, IMAGE],
-          [api.id, IMAGE],
-        ]),
-        routing: new NoopInfraProvider(),
-        ssl: new NoopInfraProvider(),
-        usesManagedRouting: false,
-        executor: createHostExecutor(),
-        localHost: true,
-        hostPortTarget: LOCAL_HOST_PORT_TARGET,
-      }),
-    ).rejects.toThrow(/aborted before cutover.*locked host port/i);
+    const conflictResult = await deployComposeServices(currentProject, next, runtime, logger, {
+      preparedLocalImages: new Map([
+        [postgres.id, IMAGE],
+        [redis.id, IMAGE],
+        [api.id, IMAGE],
+      ]),
+      routing,
+      ssl: new NoopInfraProvider(),
+      usesManagedRouting: false,
+      executor: createHostExecutor(),
+      localHost: true,
+      hostPortTarget: LOCAL_HOST_PORT_TARGET,
+    });
 
-    for (const expected of [oldPostgres.containerId, oldRedis.containerId, oldApi.containerId]) {
-      await expect(runtime.getContainerInfo(expected)).resolves.toMatchObject({
-        containerId: expected,
-        status: "running",
+    expect(conflictResult.status).toBe("ready");
+    expect(conflictResult.summary).toMatchObject({ successful: 3, failed: 0, indeterminate: 0 });
+    const conflictRows = await repos.service.listByDeployment(next.id);
+    expect(conflictRows).toHaveLength(3);
+    const conflictApi = conflictRows.find((row) => row.serviceId === api.id)!;
+    expect(conflictApi.hostPort).not.toBe(apiPort);
+    expect(conflictApi.hostPorts).toEqual({ 3000: conflictApi.hostPort });
+    await expect(runtime.getContainerInfo(conflictApi.containerId!)).resolves.toMatchObject({
+      status: "running",
+      hostPortByContainerPort: { 3000: conflictApi.hostPort },
+    });
+    expect(observedPorts).toEqual(new Set([conflictApi.hostPort!]));
+    for (const previousId of [oldPostgres.containerId, oldRedis.containerId, oldApi.containerId]) {
+      await expect(runtime.getContainerInfo(previousId)).resolves.toMatchObject({
+        status: "missing",
       });
     }
-    expect(await repos.service.listByDeployment(next.id)).toEqual([]);
-    expect(
-      (await repos.service.listByDeployment(active.id)).find((row) => row.serviceId === api.id),
-    ).toMatchObject({ containerId: oldApi.containerId, hostPort: apiPort });
+    expect(await repos.hostPortClaim.listHostPortClaims(LOCAL_HOST_PORT_TARGET.targetKey)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          port: apiPort,
+          projectId: "foreign-project",
+          serviceId: "foreign-service",
+        }),
+        expect.objectContaining({
+          port: conflictApi.hostPort,
+          projectId: project.id,
+          serviceId: api.id,
+          containerPort: 3000,
+        }),
+      ]),
+    );
 
-    // The first half proves a genuinely conflicting owner fails closed. Now
-    // model the production state: the edge still routes this live binding, but
+    // The first half proves a genuinely conflicting owner causes safe
+    // relocation. Now model the production state: the edge still routes the
+    // replacement's live binding, but
     // reconciliation quarantined it because the stored container id was stale.
     // A second redeploy must prove ownership from Docker, replace quarantine
     // atomically, and keep the API on the exact same host port.
@@ -250,11 +279,22 @@ describeDockerE2E("compose full-deploy host-port preflight", () => {
         containerPort: 3000,
       }),
     ).toBe(true);
+    const relocatedPort = conflictApi.hostPort!;
+    await setActive(project.id, next.id);
+    expect(
+      await repos.hostPortClaim.releaseHostPortClaim({
+        targetKey: LOCAL_HOST_PORT_TARGET.targetKey,
+        port: relocatedPort,
+        projectId: project.id,
+        serviceId: api.id,
+        containerPort: 3000,
+      }),
+    ).toBe(true);
     await repos.hostPortClaim.reserveQuarantinedHostPortClaim({
       targetKey: LOCAL_HOST_PORT_TARGET.targetKey,
-      port: apiPort,
+      port: relocatedPort,
     });
-    await repos.service.updateServiceDeployment(activeApiRow.id, {
+    await repos.service.updateServiceDeployment(conflictApi.id, {
       containerId: "1".repeat(64),
     });
 
@@ -263,37 +303,44 @@ describeDockerE2E("compose full-deploy host-port preflight", () => {
       containerId: "compose",
       meta: { runtimeMode: "docker", deployTarget: "local" },
     });
-    const retryResult = await deployComposeServices(currentProject, retry, runtime, logger, {
-      preparedLocalImages: new Map([
-        [postgres.id, IMAGE],
-        [redis.id, IMAGE],
-        [api.id, IMAGE],
-      ]),
-      routing: new NoopInfraProvider(),
-      ssl: new NoopInfraProvider(),
-      usesManagedRouting: false,
-      executor: createHostExecutor(),
-      localHost: true,
-      hostPortTarget: LOCAL_HOST_PORT_TARGET,
-    });
+    const projectWithRelocatedActive = (await repos.project.findById(project.id))!;
+    const retryResult = await deployComposeServices(
+      projectWithRelocatedActive,
+      retry,
+      runtime,
+      logger,
+      {
+        preparedLocalImages: new Map([
+          [postgres.id, IMAGE],
+          [redis.id, IMAGE],
+          [api.id, IMAGE],
+        ]),
+        routing,
+        ssl: new NoopInfraProvider(),
+        usesManagedRouting: false,
+        executor: createHostExecutor(),
+        localHost: true,
+        hostPortTarget: LOCAL_HOST_PORT_TARGET,
+      },
+    );
 
     expect(retryResult.status).toBe("ready");
     expect(retryResult.summary).toMatchObject({ successful: 3, failed: 0, indeterminate: 0 });
     const retryRows = await repos.service.listByDeployment(retry.id);
     expect(retryRows).toHaveLength(3);
     const retryApi = retryRows.find((row) => row.serviceId === api.id);
-    expect(retryApi).toMatchObject({ status: "success", hostPort: apiPort });
-    expect(retryApi?.hostPorts).toEqual({ 3000: apiPort });
+    expect(retryApi).toMatchObject({ status: "success", hostPort: relocatedPort });
+    expect(retryApi?.hostPorts).toEqual({ 3000: relocatedPort });
     await expect(runtime.getContainerInfo(retryApi!.containerId!)).resolves.toMatchObject({
       containerId: retryApi!.containerId,
       status: "running",
-      hostPortByContainerPort: { 3000: apiPort },
+      hostPortByContainerPort: { 3000: relocatedPort },
     });
     expect(
       await repos.hostPortClaim.listHostPortClaims(LOCAL_HOST_PORT_TARGET.targetKey),
     ).toContainEqual(
       expect.objectContaining({
-        port: apiPort,
+        port: relocatedPort,
         projectId: project.id,
         serviceId: api.id,
         containerPort: 3000,
@@ -309,12 +356,12 @@ describeDockerE2E("compose full-deploy host-port preflight", () => {
     await runtime.stop(retryApi!.containerId!);
     await expect(runtime.getContainerInfo(retryApi!.containerId!)).resolves.toMatchObject({
       status: "stopped",
-      hostPortByContainerPort: { 3000: apiPort },
+      hostPortByContainerPort: { 3000: relocatedPort },
     });
     expect(
       await repos.hostPortClaim.releaseHostPortClaim({
         targetKey: LOCAL_HOST_PORT_TARGET.targetKey,
-        port: apiPort,
+        port: relocatedPort,
         projectId: project.id,
         serviceId: api.id,
         containerPort: 3000,
@@ -322,7 +369,7 @@ describeDockerE2E("compose full-deploy host-port preflight", () => {
     ).toBe(true);
     await repos.hostPortClaim.reserveQuarantinedHostPortClaim({
       targetKey: LOCAL_HOST_PORT_TARGET.targetKey,
-      port: apiPort,
+      port: relocatedPort,
     });
 
     const listAllContainers = runtime.listAllContainers.bind(runtime);
@@ -351,7 +398,7 @@ describeDockerE2E("compose full-deploy host-port preflight", () => {
           [redis.id, IMAGE],
           [api.id, IMAGE],
         ]),
-        routing: new NoopInfraProvider(),
+        routing,
         ssl: new NoopInfraProvider(),
         usesManagedRouting: false,
         executor: createHostExecutor(),
@@ -366,11 +413,11 @@ describeDockerE2E("compose full-deploy host-port preflight", () => {
     const stoppedRetryApi = (await repos.service.listByDeployment(stoppedRetry.id)).find(
       (row) => row.serviceId === api.id,
     );
-    expect(stoppedRetryApi).toMatchObject({ status: "success", hostPort: apiPort });
-    expect(stoppedRetryApi?.hostPorts).toEqual({ 3000: apiPort });
+    expect(stoppedRetryApi).toMatchObject({ status: "success", hostPort: relocatedPort });
+    expect(stoppedRetryApi?.hostPorts).toEqual({ 3000: relocatedPort });
     await expect(runtime.getContainerInfo(stoppedRetryApi!.containerId!)).resolves.toMatchObject({
       status: "running",
-      hostPortByContainerPort: { 3000: apiPort },
+      hostPortByContainerPort: { 3000: relocatedPort },
     });
   }, 180_000);
 });

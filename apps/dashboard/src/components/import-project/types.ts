@@ -17,6 +17,12 @@ export interface EnvironmentVariable {
   key: string;
   value: string;
   visible: boolean;
+  /**
+   * The row is a saved secret whose plaintext was intentionally not loaded.
+   * Deploy serialization sends the mask sentinel for this row so the API keeps
+   * its stored ciphertext. Any key/value edit clears this marker.
+   */
+  preserveValue?: boolean;
 }
 
 export type StartCommand = string;
