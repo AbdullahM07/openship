@@ -3,9 +3,7 @@
 All notable changes to Openship. Versions follow [semver](https://semver.org);
 the in-app updater surfaces critical advisories from `release-advisories.json`.
 
-## Unreleased
-
-## 0.6.10
+## 0.7.0
 
 This release hardens the full deployment lifecycle, makes Compose reconciliation
 lossless, completes remote-server setup and CLI targeting, fixes external mail

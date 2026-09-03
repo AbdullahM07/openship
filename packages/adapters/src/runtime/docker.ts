@@ -53,6 +53,7 @@ import type { PortProbeExecutor } from "../system/port-listen";
 import { PassThrough, Writable, type Readable } from "node:stream";
 import { relative, sep } from "node:path";
 import { resolveDockerBuildArgs } from "./docker-build-args";
+import { dockerPublishedPortInfo } from "./docker-container-info";
 
 /**
  * Detect "not found" errors from the Docker SDK (dockerode). The daemon
@@ -133,6 +134,7 @@ import {
   parseLogLevel,
   sq,
   assembleGitClone,
+  gitShellCommand,
 } from "./build-pipeline";
 import { materializeGitSsh, shellGitSshWriter, type GitSshMaterial } from "./git-ssh-material";
 import { isArtifactPathRef, removeManagedArtifact } from "./managed-artifact";
@@ -801,13 +803,6 @@ function extractNetworkInfo(data: { NetworkSettings?: any; HostConfig?: any }): 
       break;
     }
   }
-  // Keyed by CONTAINER port, because that is what a caller choosing a proxy target
-  // actually knows. The scalar below is the first binding, kept for the callers that
-  // only persist one number (`service_deployment.host_port`) — it is arbitrary for a
-  // multi-port container, and reading it for a SPECIFIC port is how a route ends up
-  // dialing a different app.
-  const hostPortByContainerPort: Record<number, number> = {};
-  let hostPort: number | undefined;
   const liveBindings = (data.NetworkSettings?.Ports ?? {}) as Record<
     string,
     Array<{ HostIp?: string; HostPort?: string }> | null
@@ -821,48 +816,27 @@ function extractNetworkInfo(data: { NetworkSettings?: any; HostConfig?: any }): 
   // it has a concrete binding and otherwise fall back per key to HostConfig. A
   // stopped app must keep every routed reservation; losing these mappings is what
   // allows its old vhost port to be handed to another project.
+  const publishedPorts: DockerPortBinding[] = [];
   for (const key of new Set([...Object.keys(liveBindings), ...Object.keys(configuredBindings)])) {
     const [containerRaw, protocol = "tcp"] = key.split("/");
-    if (protocol.toLowerCase() !== "tcp") continue;
     const containerPort = Number(containerRaw);
-    if (!Number.isSafeInteger(containerPort) || containerPort < 1 || containerPort > 65_535) {
-      continue;
-    }
     const live = liveBindings[key];
     const bindings =
       live && live.some((binding) => binding?.HostPort) ? live : configuredBindings[key];
-    const candidates = (bindings ?? [])
-      .map((binding, index) => {
-        const port = Number(binding?.HostPort);
-        if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) return null;
-        const ip = binding?.HostIp?.trim().replace(/^\[|\]$/g, "") ?? "";
-        // A container can retain the operator's public publish AND Openship's
-        // loopback publish for one container port. Routes dial the loopback one,
-        // so Docker array order must not decide which reservation we recover.
-        const priority =
-          ip === "127.0.0.1" || ip === "::1"
-            ? 3
-            : /^127(?:\.\d{1,3}){3}$/.test(ip)
-              ? 2
-              : ip && ip !== "0.0.0.0" && ip !== "::"
-                ? 1
-                : 0;
-        return { index, port, priority };
-      })
-      .filter((candidate): candidate is { index: number; port: number; priority: number } =>
-        Boolean(candidate),
-      )
-      .sort((left, right) => right.priority - left.priority || left.index - right.index);
-    const selected = candidates[0]?.port;
-    if (selected !== undefined) {
-      hostPortByContainerPort[containerPort] = selected;
-      hostPort ??= selected;
+    for (const binding of bindings ?? []) {
+      publishedPorts.push({
+        privatePort: containerPort,
+        publicPort: Number(binding?.HostPort),
+        type: protocol,
+        ...(binding?.HostIp ? { ip: binding.HostIp } : {}),
+      });
     }
   }
+  const { hostPort, hostPortByContainerPort } = dockerPublishedPortInfo(publishedPorts);
   return {
     ip,
     hostPort,
-    ...(Object.keys(hostPortByContainerPort).length ? { hostPortByContainerPort } : {}),
+    ...(hostPortByContainerPort ? { hostPortByContainerPort } : {}),
   };
 }
 
@@ -1597,17 +1571,14 @@ export class DockerRuntime implements RuntimeAdapter {
     }
 
     // Centralized clone assembly (token / relay / ssh / ambient) — see git-clone.ts.
-    const {
-      cloneUrl,
-      gitEnv: GIT_ENV,
-      credFlag: CRED,
-    } = assembleGitClone({
+    const gitInvocation = assembleGitClone({
       repoUrl: config.repoUrl,
       gitToken: config.gitToken,
       gitCredentialHelperPath: config.gitCredentialHelperPath,
       ssh: sshMaterial,
       ambient: config.gitAmbient,
     });
+    const { cloneUrl, credFlag: CRED } = gitInvocation;
     const dir = sq(remoteContextDir);
 
     const authLabel = config.gitSsh
@@ -1620,33 +1591,56 @@ export class DockerRuntime implements RuntimeAdapter {
     log.log(`Cloning ${config.repoUrl} on the server → ${remoteContextDir} (${authLabel})...\n`);
     await executor.exec(`rm -rf ${dir} && mkdir -p ${dir}`);
 
-    const run = async (cmd: string) => {
+    const run = async (operation: "clone" | "fetch" | "checkout", cmd: string) => {
       const { code } = await executor.streamExec(cmd, (entry) =>
         log.log(entry.message, parseLogLevel(entry.message)),
       );
-      if (code !== 0) throw new Error(`git clone on server exited with code ${code}`);
+      if (code !== 0) throw new Error(`git ${operation} on server exited with code ${code}`);
     };
 
     try {
       if (config.commitSha) {
-        try {
-          await run(
-            `${GIT_ENV} git ${CRED} clone --progress --depth 50 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${dir} && ` +
-              `cd ${dir} && git ${CRED} -c advice.detachedHead=false checkout ${sq(config.commitSha)}`,
+        // Clone and commit selection are deliberately separate. A network/auth
+        // failure means no repository exists and must surface as-is; treating
+        // every clone failure as a shallow-history miss produced the confusing
+        // "not a git repository" follow-up seen in redeploy logs.
+        await run(
+          "clone",
+          gitShellCommand(
+            gitInvocation,
+            `clone --progress --depth 50 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${dir}`,
+          ),
+        );
+        const commitPresent = await executor
+          .exec(`cd ${dir} && git ${CRED} cat-file -e ${sq(`${config.commitSha}^{commit}`)}`)
+          .then(
+            () => true,
+            () => false,
           );
-        } catch {
+        if (!commitPresent) {
           log.log(
             `Commit ${config.commitSha} not in the shallow clone; unshallowing and retrying.\n`,
             "warn",
           );
           await run(
-            `cd ${dir} && ${GIT_ENV} git ${CRED} fetch --progress --unshallow && ` +
-              `git ${CRED} -c advice.detachedHead=false checkout ${sq(config.commitSha)}`,
+            "fetch",
+            `cd ${dir} && ${gitShellCommand(gitInvocation, "fetch --progress --unshallow")}`,
           );
         }
+        await run(
+          "checkout",
+          `cd ${dir} && ${gitShellCommand(
+            gitInvocation,
+            `-c advice.detachedHead=false checkout ${sq(config.commitSha)}`,
+          )}`,
+        );
       } else {
         await run(
-          `${GIT_ENV} git ${CRED} clone --progress --depth 1 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${dir}`,
+          "clone",
+          gitShellCommand(
+            gitInvocation,
+            `clone --progress --depth 1 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${dir}`,
+          ),
         );
       }
       // Never ship .git into the build image.

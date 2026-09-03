@@ -47,6 +47,7 @@ export type {
 export {
   sq,
   assembleGitClone,
+  gitShellCommand,
   injectGitToken,
   gitCredentialPair,
   toGitHubSshUrl,
@@ -84,6 +85,7 @@ export {
   ownsBuiltImage,
   type DockerConnectionOptions,
 } from "./runtime/docker";
+export { containerInfoFromDockerSummary } from "./runtime/docker-container-info";
 // The pull-auth shape, so the API can type the credential resolver it injects (#581).
 export type { DockerRegistryAuth } from "./runtime/docker-auth";
 export {

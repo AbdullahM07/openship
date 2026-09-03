@@ -73,10 +73,11 @@ describe("the deploy routes the carried port through the allocator", () => {
     expect(block).toContain("pinnedHostPortClaims.push(allocation.claim)");
   });
 
-  it("fails closed on the same target and reports legitimate host migrations", () => {
+  it("relocates unavailable preferences and reports the managed route cutover", () => {
     expect(block).toContain("allocation.port !== allocation.preferred");
-    expect(block).toContain("lockPreferred: lockCarriedHostPorts");
-    expect(block).toContain("Project moved hosts");
+    expect(block).toContain("reuseOccupiedPreferred:");
+    expect(block).toContain("will update managed routes during cutover");
+    expect(block).not.toContain("lockPreferred");
   });
 
   it("keeps the unreadable-occupancy warning, which is a different failure", () => {

@@ -7,32 +7,60 @@ import { domain, orphanedResource, project, service } from "../schema";
 
 export type Domain = typeof domain.$inferSelect;
 export type NewDomain = typeof domain.$inferInsert;
+type RepoTransaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
 // ─── Repository ──────────────────────────────────────────────────────────────
 
 export function createDomainRepo(db: Database) {
   /**
-   * A project has exactly ONE primary domain: promoting one demotes the rest.
+   * A project has at most ONE primary domain: promoting one demotes the rest.
    *
-   * The single implementation behind both `setPrimary` (explicit switch) and
-   * `findOrCreate` (a write that asks for `isPrimary`). `findOrCreate` used to
-   * only SET the flag, so adding a second primary — the CLI attaching a real
-   * custom domain after a free `*.opsh.io` had been registered — left two rows
-   * flagged, and readers took whichever came back first: the Domains tab showed a
-   * stale, never-verified subdomain as the project's address while the box was
-   * served on the custom one.
+   * Every path that writes `isPrimary: true` comes through this helper. The
+   * project-row lock serializes competing promotions across API replicas, while
+   * the partial unique index is the final guard against writes outside this
+   * repository. Demotion and promotion share one transaction, so a failed
+   * promotion cannot commit after clearing the previous primary.
    */
-  async function promotePrimary(projectId: string, domainId: string) {
-    await db
+  async function promotePrimaryInTransaction(
+    tx: RepoTransaction,
+    projectId: string,
+    domainId: string,
+    patch: Partial<NewDomain> = {},
+  ): Promise<boolean> {
+    await tx
+      .select({ id: project.id })
+      .from(project)
+      .where(eq(project.id, projectId))
+      .for("update");
+
+    const [target] = await tx
+      .select({ projectId: domain.projectId })
+      .from(domain)
+      .where(eq(domain.id, domainId))
+      .for("update");
+    const targetProjectId = patch.projectId === undefined ? target?.projectId : patch.projectId;
+    if (!target || targetProjectId !== projectId) return false;
+
+    const now = new Date();
+    await tx
       .update(domain)
-      .set({ isPrimary: false, updatedAt: new Date() })
+      .set({ isPrimary: false, updatedAt: now })
       .where(
         and(eq(domain.projectId, projectId), eq(domain.isPrimary, true), ne(domain.id, domainId)),
       );
-    await db
+    await tx
       .update(domain)
-      .set({ isPrimary: true, updatedAt: new Date() })
+      .set({ ...patch, isPrimary: true, updatedAt: now })
       .where(eq(domain.id, domainId));
+    return true;
+  }
+
+  async function promotePrimary(
+    projectId: string,
+    domainId: string,
+    patch: Partial<NewDomain> = {},
+  ): Promise<boolean> {
+    return db.transaction((tx) => promotePrimaryInTransaction(tx, projectId, domainId, patch));
   }
 
   /**
@@ -277,6 +305,11 @@ export function createDomainRepo(db: Database) {
     },
 
     async update(id: string, data: Partial<NewDomain>) {
+      if (data.isPrimary === true) {
+        const row = await db.query.domain.findFirst({ where: eq(domain.id, id) });
+        const targetProjectId = data.projectId === undefined ? row?.projectId : data.projectId;
+        if (targetProjectId && (await promotePrimary(targetProjectId, id, data))) return;
+      }
       await db
         .update(domain)
         .set({ ...data, updatedAt: new Date() })
@@ -314,12 +347,20 @@ export function createDomainRepo(db: Database) {
 
     async create(data: Omit<NewDomain, "id"> & { verificationToken?: string }) {
       const id = generateId("dom");
-      return insertAndRead({
+      const wantsPrimary = data.isPrimary === true && !!data.projectId;
+      const created = await insertAndRead({
         id,
         ...data,
+        // Insert as secondary so the unique invariant remains true until the
+        // serialized promotion transaction can switch ownership.
+        ...(wantsPrimary ? { isPrimary: false } : {}),
         hostname: data.hostname.toLowerCase(),
         verificationToken: data.verificationToken ?? id,
       });
+      if (wantsPrimary && (await promotePrimary(data.projectId!, id))) {
+        return { ...created, isPrimary: true };
+      }
+      return created;
     },
 
     /**
@@ -357,16 +398,17 @@ export function createDomainRepo(db: Database) {
       }
 
       const id = generateId("dom");
+      const wantsPrimary = data.isPrimary === true && !!data.projectId;
       const row = {
         id,
         ...data,
+        ...(wantsPrimary ? { isPrimary: false } : {}),
         hostname,
         verificationToken: data.verificationToken ?? id,
       };
       try {
         const created = await insertAndRead(row);
-        if (row.isPrimary && row.projectId) {
-          await promotePrimary(row.projectId, id);
+        if (wantsPrimary && row.projectId && (await promotePrimary(row.projectId, id))) {
           return { domain: { ...created, isPrimary: true }, created: true };
         }
         return { domain: created, created: true };
@@ -443,32 +485,23 @@ export function createDomainRepo(db: Database) {
       const { promote, ...ssl } = data;
       await db.transaction(async (tx) => {
         const now = new Date();
+        const patch: Partial<NewDomain> = {
+          verified: true,
+          verifiedAt: now,
+          status: "active",
+          verifyAttempts: 0,
+          lastVerifyError: null,
+          lastCheckedAt: now,
+          ...ssl,
+        };
+        if (promote) {
+          const promoted = await promotePrimaryInTransaction(tx, promote.projectId, id, patch);
+          if (promoted) return;
+        }
         await tx
           .update(domain)
-          .set({
-            verified: true,
-            verifiedAt: now,
-            status: "active",
-            verifyAttempts: 0,
-            lastVerifyError: null,
-            lastCheckedAt: now,
-            ...ssl,
-            updatedAt: now,
-          })
+          .set({ ...patch, updatedAt: now })
           .where(eq(domain.id, id));
-        if (promote) {
-          await tx
-            .update(domain)
-            .set({ isPrimary: false, updatedAt: now })
-            .where(
-              and(
-                eq(domain.projectId, promote.projectId),
-                eq(domain.isPrimary, true),
-                ne(domain.id, id),
-              ),
-            );
-          await tx.update(domain).set({ isPrimary: true, updatedAt: now }).where(eq(domain.id, id));
-        }
       });
     },
 

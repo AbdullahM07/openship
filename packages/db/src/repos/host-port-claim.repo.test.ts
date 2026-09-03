@@ -16,6 +16,7 @@ import {
 
 const MIGRATIONS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "../../drizzle");
 const CLAIM_MIGRATION = resolve(MIGRATIONS_DIR, "0111_host_port_claim.sql");
+const CLAIM_OVERLAP_MIGRATION = resolve(MIGRATIONS_DIR, "0121_host_port_claim_overlap.sql");
 
 async function freshDb() {
   const client = new PGlite("memory://");
@@ -29,10 +30,13 @@ type Fixture = Awaited<ReturnType<typeof freshDb>>;
 const QUARANTINE_OWNER = "__host_port_quarantine__";
 
 async function rerunClaimMigration(fixture: Fixture): Promise<void> {
-  for (const statement of readFileSync(CLAIM_MIGRATION, "utf8").split(
-    /-->\s*statement-breakpoint/i,
-  )) {
-    if (statement.trim()) await fixture.client.exec(statement);
+  // Re-run the original backfill, then restore today's overlap index. Production
+  // never replays an old migration after a newer one; this helper deliberately
+  // does so to exercise the idempotent backfill against legacy-shaped rows.
+  for (const migration of [CLAIM_MIGRATION, CLAIM_OVERLAP_MIGRATION]) {
+    for (const statement of readFileSync(migration, "utf8").split(/-->\s*statement-breakpoint/i)) {
+      if (statement.trim()) await fixture.client.exec(statement);
+    }
   }
 }
 
@@ -96,16 +100,17 @@ describe("host-port claims", () => {
     expect(await fixture.repo.listHostPortClaims("local")).toHaveLength(1);
   });
 
-  it("does not refine a legacy scalar over an existing exact owner", async () => {
+  it("refines a legacy route while retaining an exact replacement claim", async () => {
     await fixture.repo.reserveHostPortClaim(claim({ port: 20_001, containerPort: 8_080 }));
     await fixture.repo.reserveHostPortClaim(claim({ port: 20_000, containerPort: null }));
 
     await expect(
       fixture.repo.reserveHostPortClaim(claim({ port: 20_000, containerPort: 8_080 })),
-    ).rejects.toMatchObject({
-      code: "HOST_PORT_CLAIM_CONFLICT",
-      conflict: "owner",
-    } satisfies Partial<HostPortClaimConflictError>);
+    ).resolves.toMatchObject({ port: 20_000, containerPort: 8_080 });
+    expect(await fixture.repo.listHostPortClaims("local")).toMatchObject([
+      { port: 20_000, containerPort: 8_080 },
+      { port: 20_001, containerPort: 8_080 },
+    ]);
   });
 
   it("keeps the quarantine identity unreachable through workload reservations", async () => {
@@ -159,6 +164,42 @@ describe("host-port claims", () => {
     expect(await fixture.repo.listHostPortClaims("server:srv-a")).toHaveLength(1);
   });
 
+  it("atomically replaces quarantine when live ownership is verified", async () => {
+    const quarantined = await fixture.repo.reserveQuarantinedHostPortClaim({
+      targetKey: "local",
+      port: 20_000,
+    });
+
+    const replaced = await fixture.repo.replaceQuarantinedHostPortClaim(claim());
+
+    expect(replaced).toMatchObject({
+      id: quarantined.id,
+      targetKey: "local",
+      port: 20_000,
+      projectId: "project-a",
+      serviceId: null,
+      containerPort: 3_000,
+    });
+    expect(await fixture.repo.listHostPortClaims("local")).toEqual([replaced]);
+  });
+
+  it("replaces quarantine while retaining that workload's cutover claim", async () => {
+    await fixture.repo.reserveQuarantinedHostPortClaim({ targetKey: "local", port: 20_000 });
+    await fixture.repo.reserveHostPortClaim(claim({ port: 20_001 }));
+
+    await expect(fixture.repo.replaceQuarantinedHostPortClaim(claim())).resolves.toMatchObject({
+      port: 20_000,
+      projectId: "project-a",
+      containerPort: 3_000,
+    });
+    expect(await fixture.repo.listHostPortClaims("local")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ port: 20_000, projectId: "project-a" }),
+        expect.objectContaining({ port: 20_001, projectId: "project-a" }),
+      ]),
+    );
+  });
+
   it("rejects another owner for the same target and port but permits another target", async () => {
     await fixture.repo.reserveHostPortClaim(claim());
 
@@ -176,13 +217,18 @@ describe("host-port claims", () => {
     ).resolves.toMatchObject({ targetKey: "server:srv-a", port: 20_000 });
   });
 
-  it("rejects a second port for the same stable target owner", async () => {
+  it("allows one owner to protect old and replacement ports during cutover", async () => {
     await fixture.repo.reserveHostPortClaim(claim());
 
-    await expect(fixture.repo.reserveHostPortClaim(claim({ port: 20_001 }))).rejects.toMatchObject({
-      code: "HOST_PORT_CLAIM_CONFLICT",
-      conflict: "owner",
-    } satisfies Partial<HostPortClaimConflictError>);
+    await expect(fixture.repo.reserveHostPortClaim(claim({ port: 20_001 }))).resolves.toMatchObject(
+      {
+        port: 20_001,
+      },
+    );
+    expect(await fixture.repo.listHostPortClaims("local")).toMatchObject([
+      { port: 20_000, projectId: "project-a", containerPort: 3_000 },
+      { port: 20_001, projectId: "project-a", containerPort: 3_000 },
+    ]);
   });
 
   it("distinguishes every routed container port, including bare single apps", async () => {

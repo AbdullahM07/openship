@@ -37,6 +37,7 @@ import { checkNoActiveBuild } from "./build.service";
 import { livePrimaryContainerId } from "../services/service-container";
 import { decryptEnvMap } from "../../lib/encryption";
 import { inlineEmptyDefers } from "./compose/service-env-layers";
+import * as sessionManager from "./session-manager";
 
 /**
  * #336: present a deployment to a CLIENT — masks `meta.composeServices[].environment`.
@@ -410,6 +411,7 @@ export async function rejectDeployment(deploymentId: string, organizationId: str
       ? { meta: { ...rejectMeta, composeDeployment: { ...rejectedCompose, decision: "rejected" } } }
       : undefined,
   );
+  sessionManager.clearDecisionPending(deploymentId);
 
   return {
     success: true,
@@ -437,6 +439,7 @@ export async function keepDeployment(deploymentId: string, organizationId: strin
       meta: { ...meta, composeDeployment: { ...existingCompose, decision: "kept" } },
     });
   }
+  sessionManager.clearDecisionPending(deploymentId);
 
   // Normally onSuccess already advanced the pointer to this release; ensure it
   // (the kept partial is the live one now).

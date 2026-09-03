@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { runBuildPipeline, BuildLogger, type BuildEnvironment } from "./build-pipeline";
 import type { BuildConfig } from "../types";
 
@@ -141,5 +141,75 @@ describe("runBuildPipeline node_modules/.bin PATH prelude (#623)", () => {
     expect(buildCmd).toContain(EXPECTED_EXPORT);
     expect(buildCmd).toContain("next build");
     expect(buildCmd.indexOf(EXPECTED_EXPORT)).toBeLessThan(buildCmd.indexOf("next build"));
+  });
+});
+
+describe("runBuildPipeline pinned clone failure boundaries", () => {
+  const pinnedConfig = (): BuildConfig =>
+    makeConfig({
+      sourceStaged: false,
+      repoUrl: "https://github.com/oblien/openship.git",
+      branch: "main",
+      commitSha: "30a396bda22eda34bcd2bc73d5b601683b146e7a",
+      gitCredentialHelperPath: "/tmp/relay-helper.sh",
+      installCommand: "",
+      buildCommand: "",
+    });
+
+  it("does not misclassify a failed clone as a shallow-history miss", async () => {
+    const commands: string[] = [];
+    const exec = vi.fn(async (command: string) => {
+      commands.push(command);
+      throw new Error("GitHub temporarily limiting unauthenticated downloads");
+    });
+
+    const result = await runBuildPipeline(
+      { projectDir: PROJECT_DIR, exec },
+      pinnedConfig(),
+      new BuildLogger(),
+    );
+
+    expect(result).toMatchObject({ status: "failed", failedStep: "clone" });
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toContain(" clone ");
+    expect(commands[0]).not.toContain("--unshallow");
+  });
+
+  it("unshallows only after clone succeeds and the pinned commit is absent", async () => {
+    const commands: string[] = [];
+    const exec = vi.fn(async (command: string) => {
+      commands.push(command);
+      if (command.includes(" cat-file ")) throw new Error("unknown commit");
+    });
+
+    const result = await runBuildPipeline(
+      { projectDir: PROJECT_DIR, exec },
+      pinnedConfig(),
+      new BuildLogger(),
+    );
+
+    expect(result.status).toBe("deploying");
+    expect(commands.filter((command) => command.includes(" clone "))).toHaveLength(1);
+    expect(commands.filter((command) => command.includes("--unshallow"))).toHaveLength(1);
+    expect(commands.at(-1)).toContain(" checkout ");
+    // Both network operations must obtain the relay header before invoking Git.
+    for (const command of commands.filter(
+      (entry) => entry.includes(" clone ") || entry.includes("--unshallow"),
+    )) {
+      expect(command.indexOf("auth-header")).toBeLessThan(command.indexOf("git "));
+    }
+  });
+
+  it("checks out directly when the pinned commit is already in the shallow clone", async () => {
+    const commands: string[] = [];
+    const result = await runBuildPipeline(
+      recordingEnv(commands),
+      pinnedConfig(),
+      new BuildLogger(),
+    );
+
+    expect(result.status).toBe("deploying");
+    expect(commands.some((command) => command.includes("--unshallow"))).toBe(false);
+    expect(commands.at(-1)).toContain(" checkout ");
   });
 });

@@ -82,7 +82,7 @@ const DOCKER_SOCKET_DISCOVERY_SCRIPT = [
   "set -eu",
   'uid="$(id -u 2>/dev/null || printf 0)"',
   'printf "%s\\n" "/var/run/docker.sock" "/run/docker.sock" "/run/podman/podman.sock" "/run/user/$uid/docker.sock" "$HOME/.docker/run/docker.sock" | while IFS= read -r candidate; do if [ -S "$candidate" ]; then printf "%s\\n" "$candidate"; fi; done',
-  'find /run/user -maxdepth 2 -type s \\( -name docker.sock -o -name podman.sock \\) -print 2>/dev/null || true',
+  "find /run/user -maxdepth 2 -type s \\( -name docker.sock -o -name podman.sock \\) -print 2>/dev/null || true",
   'for dir in /run /var/run "$HOME/.docker/run"; do',
   '  if [ -d "$dir" ]; then',
   '    find "$dir" -maxdepth 3 -type s \\( -name docker.sock -o -name podman.sock \\) -print 2>/dev/null || true',
@@ -112,9 +112,7 @@ async function discoverRemoteDockerSocketPathsWithExecutor(
   return normalizeSocketPathLines(output.split(/\r?\n/));
 }
 
-async function discoverRemoteDockerSocketPaths(
-  opts: DockerConnectionOptions,
-): Promise<string[]> {
+async function discoverRemoteDockerSocketPaths(opts: DockerConnectionOptions): Promise<string[]> {
   // Use pooled executor when available - no extra SSH connection needed
   if (opts.executor) {
     return discoverRemoteDockerSocketPathsWithExecutor(opts.executor);
@@ -130,9 +128,7 @@ async function discoverRemoteDockerSocketPaths(
   }
 }
 
-async function resolveRemoteDockerSocketPath(
-  opts: DockerConnectionOptions,
-): Promise<string> {
+async function resolveRemoteDockerSocketPath(opts: DockerConnectionOptions): Promise<string> {
   const configuredSocketPath = getConfiguredDockerSocketPath(opts);
   if (configuredSocketPath) {
     return configuredSocketPath;
@@ -313,10 +309,7 @@ function pipeThrough(
  * and `unshift`-then-`pipe` proved unreliable under the Bun runtime (the byte was silently
  * dropped).
  */
-type FirstByte =
-  | { kind: "data"; chunk: Buffer }
-  | { kind: "closed" }
-  | { kind: "silent" };
+type FirstByte = { kind: "data"; chunk: Buffer } | { kind: "closed" } | { kind: "silent" };
 
 function awaitFirstByte(upstream: Duplex, ms: number): Promise<FirstByte> {
   return new Promise((resolve) => {
@@ -327,7 +320,17 @@ function awaitFirstByte(upstream: Duplex, ms: number): Promise<FirstByte> {
       upstream.removeListener("close", onFail);
       resolve(outcome);
     };
-    const onData = (chunk: Buffer) => finish({ kind: "data", chunk });
+    const onData = (chunk: Buffer) => {
+      // Removing the last `data` listener does NOT put a Node/Bun readable back
+      // into paused mode. Without this pause the SSH channel remains flowing
+      // until the promise continuation installs `pipeThrough`, so a fast Docker
+      // response can discard every chunk after the first one in that tiny gap.
+      // Docker's SSH channel commonly emits 32 KiB chunks; losing the second
+      // chunk leaves dockerode waiting forever for the advertised Content-Length.
+      // `pipe()` resumes the source when the caller commits the channel.
+      upstream.pause();
+      finish({ kind: "data", chunk });
+    };
     const onFail = () => finish({ kind: "closed" });
     const timer = setTimeout(() => finish({ kind: "silent" }), ms);
     upstream.on("data", onData);
@@ -378,7 +381,8 @@ function upstreamClosedReason(
 ): string {
   return bridgeFailureReason(
     opts,
-    dialStdioDiagnostics(upstream) || `the ${transport} channel closed before answering the request`,
+    dialStdioDiagnostics(upstream) ||
+      `the ${transport} channel closed before answering the request`,
   );
 }
 
@@ -771,7 +775,9 @@ export function createDockerSshBridge(opts: DockerConnectionOptions): DockerSshB
           : "channel opened but no data flowed",
       );
     } catch (err) {
-      console.warn(`[docker-ssh] bridge client failed (${opts.host ?? "?"}): ${safeErrorMessage(err)}`);
+      console.warn(
+        `[docker-ssh] bridge client failed (${opts.host ?? "?"}): ${safeErrorMessage(err)}`,
+      );
       capture.fail(bridgeFailureReason(opts, safeErrorMessage(err)));
     }
   };
@@ -794,7 +800,9 @@ export function createDockerSshBridge(opts: DockerConnectionOptions): DockerSshB
   // permanent floor an accept-time error (EMFILE/ENFILE under fd pressure) would be
   // an unhandled 'error' event and crash the process. Log and keep serving.
   server.on("error", (err) => {
-    console.warn(`[docker-ssh] bridge listener error (${opts.host ?? "?"}): ${safeErrorMessage(err)}`);
+    console.warn(
+      `[docker-ssh] bridge listener error (${opts.host ?? "?"}): ${safeErrorMessage(err)}`,
+    );
   });
 
   return {

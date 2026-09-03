@@ -5,6 +5,7 @@ import {
   gitCredentialPair,
   toGitHubSshUrl,
   assembleGitClone,
+  gitShellCommand,
 } from "./git-clone";
 
 describe("sq (POSIX single-quote)", () => {
@@ -162,9 +163,31 @@ describe("assembleGitClone — relay (desktop credential helper) mode", () => {
     expect(inv.cloneUrl).toBe("https://github.com/owner/repo.git");
   });
   it("wires the remote credential helper via GIT_CONFIG_*", () => {
-    expect(inv.gitEnv).toContain("GIT_CONFIG_KEY_0=credential.helper");
-    expect(inv.gitEnv).toContain("GIT_CONFIG_VALUE_0='/tmp/helper.sh'");
+    expect(inv.gitEnv).toContain("GIT_CONFIG_VALUE_0=''");
+    expect(inv.gitEnv).toContain("GIT_CONFIG_KEY_1=credential.helper");
+    expect(inv.gitEnv).toContain("GIT_CONFIG_VALUE_1='/tmp/helper.sh'");
     expect(inv.gitEnv).toContain("credential.useHttpPath");
+  });
+  it("authenticates the first request instead of waiting for a GitHub challenge", () => {
+    const command = gitShellCommand(inv, "clone 'https://github.com/owner/repo.git' '/tmp/repo'");
+    expect(command).toContain("'/tmp/helper.sh' auth-header 'https' 'github.com' 'owner/repo.git'");
+    expect(command).toContain("GIT_CONFIG_KEY_3=http.extraHeader");
+    expect(command).toContain('GIT_CONFIG_VALUE_3="$OPENSHIP_GIT_AUTH_HEADER"');
+    expect(command.indexOf("auth-header")).toBeLessThan(command.indexOf("git clone"));
+  });
+  it("does not put a credential or Authorization value in the assembled command", () => {
+    const command = gitShellCommand(inv, "clone 'repo' 'target'");
+    expect(command).not.toContain("password=");
+    expect(command).not.toContain("Basic ");
+    expect(command).not.toContain("ghp_");
+  });
+  it("rejects a non-HTTPS relay URL", () => {
+    expect(() =>
+      assembleGitClone({
+        repoUrl: "git@github.com:owner/repo.git",
+        gitCredentialHelperPath: "/tmp/helper.sh",
+      }),
+    ).toThrow(/HTTPS repository URL/);
   });
   it("does NOT disable the credential helper (it IS the auth)", () => {
     expect(inv.credFlag).toBe("");

@@ -6,6 +6,7 @@ import { hostPortClaim } from "../schema/host-port-claim";
 export type HostPortClaim = typeof hostPortClaim.$inferSelect;
 export type NewHostPortClaim = typeof hostPortClaim.$inferInsert;
 export type HostPortTargetKey = "local" | `host:${string}` | `server:${string}`;
+type RepoTransaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 /** Impossible workload owner used to fail closed around ambiguous/orphan routes. */
 export const HOST_PORT_QUARANTINE_OWNER = "__host_port_quarantine__";
 
@@ -28,10 +29,9 @@ export interface PruneHostPortClaimsInput extends HostPortClaimOwner {
 }
 
 /**
- * A reservation can conflict in either direction:
- *
- * - `port`: another stable owner already reserves this target/port;
- * - `owner`: this owner already reserves a different port on this target.
+ * A reservation conflicts when another stable owner already reserves the
+ * target/port. One owner may deliberately reserve an old and a replacement
+ * port at the same time while managed routes cut over.
  *
  * Existing owner details are deliberately not included in the message. The
  * repository is host-global, and a caller must not turn a collision into a
@@ -41,15 +41,11 @@ export class HostPortClaimConflictError extends Error {
   readonly code = "HOST_PORT_CLAIM_CONFLICT" as const;
 
   constructor(
-    public readonly conflict: "port" | "owner",
+    public readonly conflict: "port",
     public readonly targetKey: HostPortTargetKey,
     public readonly port: number,
   ) {
-    super(
-      conflict === "port"
-        ? `Host port ${port} is already reserved on ${targetKey}`
-        : `This workload already reserves another host port on ${targetKey}`,
-    );
+    super(`Host port ${port} is already reserved on ${targetKey}`);
     this.name = "HostPortClaimConflictError";
   }
 }
@@ -159,50 +155,12 @@ export function createHostPortClaimRepo(db: Database) {
           byPort.containerPort === null &&
           input.containerPort !== null
         ) {
-          const [existingExactOwner] = await db
-            .select()
-            .from(hostPortClaim)
-            .where(
-              and(
-                eq(hostPortClaim.targetKey, input.targetKey),
-                eq(hostPortClaim.projectId, input.projectId),
-                nullableServiceCondition(input.serviceId),
-                eq(hostPortClaim.containerPort, input.containerPort),
-              ),
-            )
-            .limit(1);
-          if (existingExactOwner) {
-            throw new HostPortClaimConflictError("owner", input.targetKey, input.port);
-          }
-
-          try {
-            const [upgraded] = await db
-              .update(hostPortClaim)
-              .set({ containerPort: input.containerPort, updatedAt: new Date() })
-              .where(and(eq(hostPortClaim.id, byPort.id), isNull(hostPortClaim.containerPort)))
-              .returning();
-            if (upgraded) return upgraded;
-          } catch (error) {
-            // A concurrent exact-owner insert can win after the read above. Map
-            // that unique collision to the repository's stable, non-leaky error;
-            // preserve unrelated database failures verbatim.
-            const [concurrentExactOwner] = await db
-              .select()
-              .from(hostPortClaim)
-              .where(
-                and(
-                  eq(hostPortClaim.targetKey, input.targetKey),
-                  eq(hostPortClaim.projectId, input.projectId),
-                  nullableServiceCondition(input.serviceId),
-                  eq(hostPortClaim.containerPort, input.containerPort),
-                ),
-              )
-              .limit(1);
-            if (concurrentExactOwner) {
-              throw new HostPortClaimConflictError("owner", input.targetKey, input.port);
-            }
-            throw error;
-          }
+          const [upgraded] = await db
+            .update(hostPortClaim)
+            .set({ containerPort: input.containerPort, updatedAt: new Date() })
+            .where(and(eq(hostPortClaim.id, byPort.id), isNull(hostPortClaim.containerPort)))
+            .returning();
+          if (upgraded) return upgraded;
 
           // Another observer changed or released the legacy row. Retry from a
           // fresh insert/read rather than deciding from stale state.
@@ -211,21 +169,9 @@ export function createHostPortClaimRepo(db: Database) {
         throw new HostPortClaimConflictError("port", input.targetKey, input.port);
       }
 
-      const [byOwner] = await db
-        .select()
-        .from(hostPortClaim)
-        .where(
-          and(
-            eq(hostPortClaim.targetKey, input.targetKey),
-            eq(hostPortClaim.projectId, input.projectId),
-            nullableServiceCondition(input.serviceId),
-            nullableContainerPortCondition(input.containerPort),
-          ),
-        )
-        .limit(1);
-      if (byOwner) {
-        throw new HostPortClaimConflictError("owner", input.targetKey, input.port);
-      }
+      // The target/port row disappeared between the failed insert and lookup.
+      // Retry the narrow release race; a second port for this owner is valid
+      // during route cutover and therefore is intentionally not a conflict.
     }
 
     throw new Error(`Host-port reservation changed concurrently on ${input.targetKey}; retry`);
@@ -247,9 +193,9 @@ export function createHostPortClaimRepo(db: Database) {
      *
      * The unique indexes arbitrate concurrent callers. Repeating the exact same
      * reservation is idempotent. A matching legacy scalar is atomically refined
-     * with its first observed container port; either a different owner on the
-     * port or a different port for this exact owner raises
-     * HostPortClaimConflictError.
+     * with its first observed container port. A different owner on the same
+     * port raises HostPortClaimConflictError; the same owner may hold an old and
+     * replacement port until route-aware convergence retires the old one.
      */
     async reserveHostPortClaim(input: HostPortClaimIdentity): Promise<HostPortClaim> {
       validateIdentity(input);
@@ -270,6 +216,69 @@ export function createHostPortClaimRepo(db: Database) {
       };
       validateIdentity(identity);
       return reserveIdentity(identity);
+    },
+
+    /**
+     * Atomically transfer a quarantined port to a live-verified workload.
+     *
+     * The caller has already proved the exact container-port → host-port bind
+     * and holds the physical-target advisory lock. Updating the sentinel row in
+     * place keeps continuous ownership of the port; a delete followed by an
+     * insert would briefly make it look free and could strand the quarantine if
+     * the second statement failed.
+     *
+     * Returns null when there is no quarantine row to replace. An exact
+     * workload row is idempotent; every other occupant fails closed.
+     */
+    async replaceQuarantinedHostPortClaim(
+      input: HostPortClaimIdentity,
+    ): Promise<HostPortClaim | null> {
+      validateIdentity(input);
+      assertWorkloadOwner(input);
+
+      return db.transaction(async (rawTx) => {
+        const tx = rawTx as RepoTransaction;
+        const [byPort] = await tx
+          .select()
+          .from(hostPortClaim)
+          .where(
+            and(eq(hostPortClaim.targetKey, input.targetKey), eq(hostPortClaim.port, input.port)),
+          )
+          .for("update")
+          .limit(1);
+
+        if (!byPort) return null;
+        if (sameOwner(byPort, input)) return byPort;
+        const isExactQuarantine =
+          byPort.projectId === HOST_PORT_QUARANTINE_OWNER &&
+          byPort.serviceId === HOST_PORT_QUARANTINE_OWNER &&
+          byPort.containerPort === input.port;
+        if (!isExactQuarantine) {
+          throw new HostPortClaimConflictError("port", input.targetKey, input.port);
+        }
+
+        const [replaced] = await tx
+          .update(hostPortClaim)
+          .set({
+            projectId: input.projectId,
+            serviceId: input.serviceId,
+            containerPort: input.containerPort,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(hostPortClaim.id, byPort.id),
+              eq(hostPortClaim.projectId, HOST_PORT_QUARANTINE_OWNER),
+              eq(hostPortClaim.serviceId, HOST_PORT_QUARANTINE_OWNER),
+              eq(hostPortClaim.containerPort, input.port),
+            ),
+          )
+          .returning();
+        if (!replaced) {
+          throw new Error(`Host-port quarantine changed concurrently on ${input.targetKey}`);
+        }
+        return replaced;
+      });
     },
 
     /**

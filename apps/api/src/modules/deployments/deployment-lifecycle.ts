@@ -713,6 +713,7 @@ export async function onSuccess(
     url?: string;
     durationMs: number;
     warningMessage?: string;
+    decisionPending?: boolean;
     metaPatch?: Record<string, unknown>;
   },
 ): Promise<void> {
@@ -871,6 +872,7 @@ export async function onSuccess(
           .filter(Boolean)
           .join(" ")
       : result.warningMessage,
+    decisionPending: result.decisionPending,
     // Advisory port-check results ride the live `complete` event so the dashboard
     // can raise the "wrong port?" modal immediately; the same data is persisted in
     // meta (above) for re-hydration on refresh.

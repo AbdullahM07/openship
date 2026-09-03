@@ -27,6 +27,7 @@ import {
   UNLIMITED_RESOURCES,
   DeployError,
   safeErrorMessage,
+  withTimeout,
   type ComposeAdvanced,
   type ProxySettings,
 } from "@repo/core";
@@ -42,6 +43,7 @@ import {
   BareRuntime,
   BuildLogger,
   DockerRuntime,
+  containerInfoFromDockerSummary,
   ensureEdge,
   ownsBuiltImage,
   STATIC_RELEASE_BASE,
@@ -151,6 +153,9 @@ import {
   deploymentCancellationKeepsProvisioned,
   throwIfDeploymentCancelled,
 } from "../deployment-cancellation";
+import { liveMatchTiersForDeployment, resolveLiveServiceState } from "../../services/live-state";
+
+const CARRIED_STATE_PREFLIGHT_TIMEOUT_MS = 15_000;
 
 export interface ComposeDeployResult {
   /** `reconciling` when at least one service's outcome is UNKNOWN because the
@@ -932,12 +937,19 @@ export async function deployComposeServices(
   logger: BuildLogger,
   opts?: ComposeDeployOptions,
 ): Promise<ComposeDeployResult> {
+  const runUnlocked = (): Promise<ComposeDeployResult> => {
+    throwIfDeploymentCancelled(opts?.signal);
+    const run = () => deployComposeServicesUnlocked(project, dep, runtime, logger, opts);
+    return opts?.signal && opts.executor?.runWithAbortSignal
+      ? opts.executor.runWithAbortSignal(opts.signal, run)
+      : run();
+  };
   const needsHostPortLock = usesHostLoopbackUpstream(
     resolveRouteStrategy(project.routeStrategy),
     runtime,
   );
   if (!needsHostPortLock) {
-    return deployComposeServicesUnlocked(project, dep, runtime, logger, opts);
+    return runUnlocked();
   }
   if (!opts?.executor) {
     throw new Error("Cannot deploy loopback-routed services without a physical target executor");
@@ -946,11 +958,7 @@ export async function deployComposeServices(
   if (!target) {
     throw new Error("Cannot deploy loopback-routed services without a physical host identity");
   }
-  return withHostPortTargetLock(
-    target,
-    () => deployComposeServicesUnlocked(project, dep, runtime, logger, opts),
-    opts?.signal,
-  );
+  return withHostPortTargetLock(target, runUnlocked, opts?.signal);
 }
 
 async function deployComposeServicesUnlocked(
@@ -1043,6 +1051,8 @@ async function deployComposeServicesUnlocked(
     resources: opts?.resources,
   });
   logger.log(`Service group ready for ${project.slug}.\n`);
+  throwIfDeploymentCancelled(opts?.signal);
+  logger.log("Loading deployment preflight state...\n");
 
   // The project's existing domain rows, keyed by hostname. This drives per-host
   // SSL gating in BOTH the toolchain preflight (below) and the per-service route
@@ -1058,6 +1068,7 @@ async function deployComposeServicesUnlocked(
         (await repos.domain.listByProject(project.id)).map((d) => [d.hostname.toLowerCase(), d]),
       )
     : new Map();
+  throwIfDeploymentCancelled(opts?.signal);
 
   // Ensure the server has the components this deploy needs — ONCE, before the
   // fan-out — mirroring the single-app deploy preflight (build-pipeline.ts
@@ -1068,6 +1079,7 @@ async function deployComposeServicesUnlocked(
   // host-port check: compose services are reached through openresty by hostname,
   // not by binding host ports the way a bare process does.)
   if (opts?.system) {
+    logger.log("Checking target prerequisites and edge routing...\n");
     const systemLog = (entry: { message: string; level: "info" | "warn" | "error" }) => {
       logger.log(`${entry.message}\n`, entry.level);
     };
@@ -1144,6 +1156,9 @@ async function deployComposeServicesUnlocked(
     }
   }
 
+  throwIfDeploymentCancelled(opts?.signal);
+  logger.log("Target preflight ready. Inspecting the active release...\n");
+
   // Service-scoped rows are loaded separately below and must not leak into the
   // project layer or another service.
   const projectEnvMap = await repos.project.getEnvMap(project.id, dep.environment, null);
@@ -1172,7 +1187,7 @@ async function deployComposeServicesUnlocked(
 
   // 4. Load previous service containers so each service is replaced in-place
   //    instead of tearing down the whole app before the first deploy attempt.
-  const previousServiceDeps = project.activeDeploymentId
+  let previousServiceDeps = project.activeDeploymentId
     ? await repos.service.listByDeployment(project.activeDeploymentId)
     : [];
   const activeDeployment = project.activeDeploymentId
@@ -1180,10 +1195,146 @@ async function deployComposeServicesUnlocked(
     : null;
   const activeServerId = ((activeDeployment?.meta ?? {}) as { serverId?: string }).serverId ?? null;
   const targetServerId = opts?.serverId ?? null;
-  // A host port belongs to a physical host. On the same target it is immutable
-  // across an ordinary redeploy; on a migration the new host may legitimately
-  // allocate a different number.
-  const lockCarriedHostPorts = activeDeployment !== null && activeServerId === targetServerId;
+  // Docker ownership proofs are meaningful only on the same physical target.
+  // The old host port remains a preference, never an immutable identity: when
+  // it is unavailable the replacement gets a free port and managed routes move
+  // during cutover.
+  const sameTargetRedeploy = activeDeployment !== null && activeServerId === targetServerId;
+
+  /**
+   * One authoritative Docker snapshot replaces N per-service inspect calls and
+   * recovers rows whose stored container id is stale. A failed snapshot is not
+   * converted into "container missing": on a same-host redeploy that would make
+   * an occupied locked route look orphaned and trigger a bogus port move.
+   */
+  const carriedContainerInfoById = new Map<string, ContainerInfo>();
+  const fullyInspectedCarriedContainerIds = new Set<string>();
+  if (
+    usesHostLoopback &&
+    sameTargetRedeploy &&
+    previousServiceDeps.some((row) => row.containerId) &&
+    runtime.supports("hostContainerQuery") &&
+    runtime.listAllContainers
+  ) {
+    let liveContainers: Awaited<ReturnType<NonNullable<typeof runtime.listAllContainers>>>;
+    try {
+      liveContainers = await withTimeout(
+        runtime.listAllContainers(),
+        CARRIED_STATE_PREFLIGHT_TIMEOUT_MS,
+        `live container inventory timed out after ${CARRIED_STATE_PREFLIGHT_TIMEOUT_MS / 1000}s`,
+      );
+    } catch (error) {
+      throw new Error(
+        `Deployment preflight could not verify the active services on the target, so no service activation was started: ${safeErrorMessage(error)}`,
+      );
+    }
+
+    const liveById = new Map(liveContainers.map((container) => [container.id, container]));
+    const matches = resolveLiveServiceState({
+      services: services.map((service) => ({ id: service.id, name: service.name })),
+      live: liveContainers,
+      projectId: project.id,
+      slug: project.slug,
+      trackedIds: Object.fromEntries(
+        previousServiceDeps.map((row) => [row.serviceId, row.containerId]),
+      ),
+      tiers: liveMatchTiersForDeployment(
+        (activeDeployment?.meta ?? null) as Record<string, unknown> | null,
+      ),
+    });
+
+    const healedRows = new Map<string, (typeof previousServiceDeps)[number]>();
+    for (const row of previousServiceDeps) {
+      if (!row.containerId) continue;
+      const match = matches.get(row.serviceId);
+      const liveSummary = match?.containerId ? liveById.get(match.containerId) : undefined;
+      if (!liveSummary) {
+        carriedContainerInfoById.set(row.containerId, {
+          containerId: row.containerId,
+          status: "missing",
+        });
+        continue;
+      }
+      if ((match?.duplicates.length ?? 0) > 0) {
+        throw new Error(
+          `Deployment preflight found more than one container matching active service "${row.serviceName ?? row.serviceId}" (${[liveSummary.names[0] ?? liveSummary.id.slice(0, 12), ...match!.duplicates].join(", ")}), so no service activation was started. Remove or reconcile the duplicate container before redeploying.`,
+        );
+      }
+
+      const live = containerInfoFromDockerSummary(liveSummary);
+      carriedContainerInfoById.set(row.containerId, live);
+      carriedContainerInfoById.set(live.containerId, live);
+      if (live.containerId === row.containerId) continue;
+
+      const repairedFields = {
+        containerId: live.containerId,
+        ...(live.ip !== undefined ? { ip: live.ip } : {}),
+        ...(row.hostPort == null && live.hostPort !== undefined ? { hostPort: live.hostPort } : {}),
+        ...(live.hostPortByContainerPort !== undefined
+          ? { hostPorts: live.hostPortByContainerPort }
+          : {}),
+      };
+      await repos.service.updateServiceDeployment(row.id, repairedFields);
+      healedRows.set(row.serviceId, {
+        ...row,
+        ...repairedFields,
+      });
+      const serviceName =
+        row.serviceName ?? services.find((service) => service.id === row.serviceId)?.name;
+      logger.log(
+        `Recovered active service "${serviceName ?? row.serviceId}" by live Docker identity and repaired its stale container reference before cutover.\n`,
+        "warn",
+        serviceName ? { serviceName } : undefined,
+      );
+    }
+    if (healedRows.size > 0) {
+      previousServiceDeps = previousServiceDeps.map((row) => healedRows.get(row.serviceId) ?? row);
+    }
+  }
+
+  type RequiredCarriedHostPortBinding = { containerPort: number; hostPort: number };
+  const containsRequiredHostPortBindings = (
+    info: ContainerInfo,
+    required: readonly RequiredCarriedHostPortBinding[],
+  ): boolean =>
+    required.every(
+      ({ containerPort, hostPort }) => info.hostPortByContainerPort?.[containerPort] === hostPort,
+    );
+  const readCarriedContainerInfo = async (
+    containerId: string,
+    requiredHostPortBindings: readonly RequiredCarriedHostPortBinding[] = [],
+  ): Promise<ContainerInfo | undefined> => {
+    if (!runtime.supports("containerInfo")) return undefined;
+    const cached = carriedContainerInfoById.get(containerId);
+    if (
+      cached &&
+      (requiredHostPortBindings.length === 0 ||
+        containsRequiredHostPortBindings(cached, requiredHostPortBindings))
+    ) {
+      return cached;
+    }
+    // `docker ps -a` is the efficient cohort inventory, but Docker may omit a
+    // stopped container's published bindings there. Inspect at most once for
+    // that container when a routed binding is required; Docker inspect retains
+    // it under HostConfig.PortBindings after the listener has stopped.
+    if (cached && fullyInspectedCarriedContainerIds.has(containerId)) return cached;
+    fullyInspectedCarriedContainerIds.add(containerId);
+    try {
+      const live = await withTimeout(
+        runtime.getContainerInfo(containerId),
+        CARRIED_STATE_PREFLIGHT_TIMEOUT_MS,
+        `container inspection timed out after ${CARRIED_STATE_PREFLIGHT_TIMEOUT_MS / 1000}s`,
+      );
+      carriedContainerInfoById.set(containerId, live);
+      carriedContainerInfoById.set(live.containerId, live);
+      fullyInspectedCarriedContainerIds.add(live.containerId);
+      return live;
+    } catch (error) {
+      throw new Error(
+        `Deployment preflight could not inspect the active container ${containerId.slice(0, 12)}, so no service activation was started: ${safeErrorMessage(error)}`,
+      );
+    }
+  };
   const previousByServiceId = new Map(previousServiceDeps.map((row) => [row.serviceId, row]));
   const enabledServiceIds = new Set(enabled.map((svc) => svc.id));
 
@@ -1565,64 +1716,70 @@ async function deployComposeServicesUnlocked(
   // same loopback port. Allocations from THIS pass are tracked separately so a
   // carried claim can be released only for its owner without erasing a sibling.
   const hostPortTarget = opts?.hostPortTarget ?? null;
-  /**
-   * Inspect each carried container at most once. Besides avoiding duplicate
-   * SSH/Docker calls in the preflight and carry-forward branches, this cache is
-   * the evidence used to repair a missing canonical host-port claim: a stale
-   * database cache is never enough to move a route.
-   */
-  const carriedContainerInfoById = new Map<string, ContainerInfo | null>();
-  const readCarriedContainerInfo = async (
-    containerId: string,
-  ): Promise<ContainerInfo | null | undefined> => {
-    if (!runtime.supports("containerInfo")) return undefined;
-    if (carriedContainerInfoById.has(containerId)) {
-      return carriedContainerInfoById.get(containerId) ?? null;
-    }
-    const live = await runtime.getContainerInfo(containerId).catch(() => null);
-    carriedContainerInfoById.set(containerId, live);
-    return live;
-  };
 
+  const carriedHostPortProofKey = (
+    serviceId: string,
+    containerPort: number,
+    hostPort: number,
+  ): string => JSON.stringify([serviceId, containerPort, hostPort]);
+  const carriedHostPortBindings = (
+    row: (typeof previousServiceDeps)[number],
+  ): RequiredCarriedHostPortBinding[] => {
+    const persisted = row.hostPorts ?? {};
+    const persistedPorts = Object.keys(persisted)
+      .map((key) => Number(key))
+      .filter((port) => Number.isSafeInteger(port) && port > 0 && port <= 65_535);
+    const demandedPorts = [...(hostLoopbackRoutePortDemands.get(row.serviceId) ?? [])];
+    const candidatePorts = [...new Set([...persistedPorts, ...demandedPorts])];
+    const primaryPort = demandedPorts[0] ?? persistedPorts[0];
+
+    return candidatePorts.flatMap((containerPort) => {
+      const mapped = persisted[String(containerPort)];
+      const hostPort =
+        typeof mapped === "number" && mapped > 0
+          ? mapped
+          : containerPort === primaryPort
+            ? (row.hostPort ?? undefined)
+            : undefined;
+      return hostPort === undefined ? [] : [{ containerPort, hostPort }];
+    });
+  };
+  const runningCarriedHostPortBindings = new Set<string>();
   const verifiedCarriedHostPorts: VerifiedCarriedPinnedHostPort[] = [];
-  if (hostPortTarget && lockCarriedHostPorts && runtime.supports("containerInfo")) {
-    const rowsWithContainers = previousServiceDeps.filter(
-      (row) => !!row.containerId && (row.hostPort != null || row.hostPorts != null),
-    );
+  if (hostPortTarget && sameTargetRedeploy && runtime.supports("containerInfo")) {
+    const rowsWithContainers = previousServiceDeps.flatMap((row) => {
+      if (!row.containerId || (row.hostPort == null && row.hostPorts == null)) return [];
+      const bindings = carriedHostPortBindings(row);
+      return bindings.length > 0 ? [{ row, bindings }] : [];
+    });
     const liveRows = await Promise.all(
-      rowsWithContainers.map(async (row) => ({
+      rowsWithContainers.map(async ({ row, bindings }) => ({
         row,
-        live: await readCarriedContainerInfo(row.containerId!),
+        bindings,
+        live: await readCarriedContainerInfo(row.containerId!, bindings),
       })),
     );
 
-    for (const { row, live } of liveRows) {
-      if (!live || live.status !== "running" || !live.hostPortByContainerPort) continue;
-      const persisted = row.hostPorts ?? {};
-      const persistedPorts = Object.keys(persisted)
-        .map((key) => Number(key))
-        .filter((port) => Number.isSafeInteger(port) && port > 0 && port <= 65_535);
-      const demandedPorts = [...(hostLoopbackRoutePortDemands.get(row.serviceId) ?? [])];
-      const candidatePorts = [...new Set([...persistedPorts, ...demandedPorts])];
-      const primaryPort = demandedPorts[0] ?? persistedPorts[0];
-
-      for (const containerPort of candidatePorts) {
-        const mapped = persisted[String(containerPort)];
-        const expectedHostPort =
-          typeof mapped === "number" && mapped > 0
-            ? mapped
-            : containerPort === primaryPort
-              ? (row.hostPort ?? undefined)
-              : undefined;
-        if (expectedHostPort === undefined) continue;
+    for (const { row, bindings, live } of liveRows) {
+      for (const { containerPort, hostPort } of bindings) {
+        const exactBinding =
+          live !== undefined &&
+          live.status !== "missing" &&
+          live.hostPortByContainerPort?.[containerPort] === hostPort;
+        if (!exactBinding) continue;
+        if (live.status === "running") {
+          runningCarriedHostPortBindings.add(
+            carriedHostPortProofKey(row.serviceId, containerPort, hostPort),
+          );
+        }
         verifiedCarriedHostPorts.push({
           owner: {
             projectId: project.id,
             serviceId: row.serviceId,
             containerPort,
           },
-          hostPort: expectedHostPort,
-          liveHostPortByContainerPort: live.hostPortByContainerPort,
+          hostPort,
+          liveHostPortByContainerPort: live.hostPortByContainerPort!,
         });
       }
     }
@@ -1641,8 +1798,8 @@ async function deployComposeServicesUnlocked(
                 claim.serviceId ??
                 "service";
               logger.log(
-                `Reattached locked host port ${claim.port} to ${serviceName}:${claim.containerPort} ` +
-                  `after the live container confirmed the existing binding.\n`,
+                `Reattached host port ${claim.port} to ${serviceName}:${claim.containerPort} ` +
+                  `after Docker inspection confirmed the existing binding.\n`,
                 "info",
                 { serviceName },
               );
@@ -1869,7 +2026,7 @@ async function deployComposeServicesUnlocked(
 
   type PreparedServiceHostPorts = {
     pinnedByContainerPort: Map<number, number>;
-    allocations: Array<Pick<AllocatedPinnedHostPort, "claim" | "previousClaim">>;
+    allocations: Array<Pick<AllocatedPinnedHostPort, "claim" | "claimWasCreated">>;
   };
   const preparedHostPortsByServiceId = new Map<string, PreparedServiceHostPorts>();
   const prepareServiceHostPorts = async (
@@ -1891,7 +2048,7 @@ async function deployComposeServicesUnlocked(
     }
 
     const pinnedByContainerPort = new Map<number, number>();
-    const allocations: Array<Pick<AllocatedPinnedHostPort, "claim" | "previousClaim">> = [];
+    const allocations: Array<Pick<AllocatedPinnedHostPort, "claim" | "claimWasCreated">> = [];
     const primaryRoutedPort = routedContainerPorts[0];
     try {
       if (
@@ -1921,13 +2078,23 @@ async function deployComposeServicesUnlocked(
             cachedPreferred,
             allowLegacyContainerPort: containerPort === primaryRoutedPort,
             additionalAvoid: allocatedHostPorts,
-            lockPreferred: lockCarriedHostPorts ? { ownerLabel: service.name } : undefined,
+            // A durable claim protects allocation ownership; it does not prove
+            // that the current listener belongs to this workload. Only Docker's
+            // exact running binding may override an occupied live-port scan.
+            reuseOccupiedPreferred: (preferred) =>
+              sameTargetRedeploy &&
+              runningCarriedHostPortBindings.has(
+                carriedHostPortProofKey(service.id, containerPort, preferred),
+              ),
             allocate: (allocationOptions) => allocateHostPort(opts.executor!, allocationOptions),
           });
           allocations.push(allocation);
-          if (allocation.preferred && allocation.port !== allocation.preferred) {
+          if (allocation.preferred !== undefined && allocation.port !== allocation.preferred) {
             logger.log(
-              `Project moved hosts: ${service.name} uses ${allocation.port} instead of ${allocation.preferred}.\n`,
+              `Host port ${allocation.preferred} for ${service.name}:${containerPort} was unavailable; ` +
+                `reserved ${allocation.port} and will update managed routes during cutover.\n`,
+              "warn",
+              { serviceName: service.name },
             );
           }
           if (!allocation.scanned) {
@@ -1966,15 +2133,18 @@ async function deployComposeServicesUnlocked(
     return prepared;
   };
 
-  // Reserve the complete exact cohort before the first container replacement.
-  // The target lock surrounding this function keeps the plan stable through
-  // activation. If any allocation fails, release every new reservation already
-  // made for earlier cohort members and leave all running containers untouched.
-  if (opts?.strictScope && opts.targetServiceIds) {
+  // Reserve the complete activation cohort before the first container
+  // replacement. This applies to ordinary full redeploys too: discovering the
+  // API's locked-port conflict only after Postgres/Redis were replaced is a
+  // partial rollout, even though the later safety guard correctly refused to
+  // move the API route. The target lock keeps this plan stable through
+  // activation. If any allocation fails, release every new reservation and
+  // leave all running containers untouched.
+  if (usesHostLoopback && opts?.executor) {
     try {
       for (const service of generatedConfigPreflightServices) {
         if (runtime instanceof DockerRuntime && opts.staticServiceIds?.has(service.id)) continue;
-        const networkModeUnsupported = runtime.unsupportedComposeKeys.has("networkMode");
+        const networkModeUnsupported = runtime.unsupportedComposeKeys?.has("networkMode") ?? false;
         const networkRef = networkModeUnsupported
           ? undefined
           : composeNamespaceRef(
@@ -2001,7 +2171,7 @@ async function deployComposeServicesUnlocked(
         );
       }
       throw new Error(
-        `Coordinated service deployment aborted before cutover while reserving host ports: ${safeErrorMessage(err)}`,
+        `Service deployment aborted before cutover while reserving the complete host-port set: ${safeErrorMessage(err)}`,
       );
     }
   }

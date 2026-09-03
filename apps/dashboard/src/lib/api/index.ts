@@ -100,6 +100,8 @@ export type {
   IssueInfraFix,
   RescanResult,
   WorkloadHealthRow,
+  HealthCheckSummary,
+  CurrentHealthScanResult,
   MonitoringScanSession,
   MonitoringScanStage,
 } from "./issues";

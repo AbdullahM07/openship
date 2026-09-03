@@ -459,6 +459,9 @@ describe("single-app prebuilt release-image pipeline", () => {
         imageRef: RESOLVED_IMAGE,
         prebuiltImage: true,
         startCommand: "",
+        // The decrypted deployment snapshot is also the runtime payload; a
+        // secret must not disappear after being used for image preparation.
+        envVars: { API_TOKEN: "secret" },
       }),
       expect.any(Function),
     );

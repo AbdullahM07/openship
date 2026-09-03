@@ -33,6 +33,7 @@ const h = vi.hoisted(() => ({
   releaseNewPinnedHostPortClaims: vi.fn(),
   reserveResolvedLoopbackRoutes: vi.fn(),
   upsertServiceDeployment: vi.fn(),
+  updateServiceDeployment: vi.fn(),
   services: [] as Array<Record<string, unknown>>,
   previousServiceRows: [] as Array<Record<string, unknown>>,
   previousDeployment: { id: "d-old", containerId: "compose", createdAt: null } as Record<
@@ -52,6 +53,7 @@ vi.mock("@repo/db", () => ({
       listByProject: async () => h.services,
       listByDeployment: async () => h.previousServiceRows,
       upsertServiceDeployment: (...args: unknown[]) => h.upsertServiceDeployment(...args),
+      updateServiceDeployment: (...args: unknown[]) => h.updateServiceDeployment(...args),
       markServiceDeploymentFailed: async () => undefined,
     },
     deployment: {
@@ -135,6 +137,7 @@ function haltingRuntime(name: "docker" | "cloud" = "docker", containerIp = true)
 function carriedRuntime(containerIp = true) {
   return {
     name: "docker",
+    unsupportedComposeKeys: new Set(),
     supports: (capability: string) =>
       capability === "containerInfo" || (capability === "containerIp" && containerIp),
     ensureServiceGroup: vi.fn(async () => ({ id: "group-1" })),
@@ -222,6 +225,7 @@ beforeEach(() => {
   h.allocateAndReservePinnedHostPort.mockImplementation(async (input) => ({
     port: 30_000,
     scanned: true,
+    claimWasCreated: true,
     claim: {
       id: "hpc-web",
       targetKey: "local",
@@ -236,6 +240,7 @@ beforeEach(() => {
   h.convergeTargetHostPortClaims.mockResolvedValue({ released: 0, retained: [] });
   h.convergeTargetHostPortClaimsUnlocked.mockResolvedValue({ released: 0, retained: [] });
   h.upsertServiceDeployment.mockResolvedValue(undefined);
+  h.updateServiceDeployment.mockResolvedValue(undefined);
 });
 
 function addDisabledPreviousService() {
@@ -398,6 +403,474 @@ describe("compose deploy — host channel unavailable", () => {
       firstAllocation,
     ]);
     expect(deployServiceWorkload).not.toHaveBeenCalled();
+  });
+
+  it("accepts a relocated port during full-redeploy preflight before replacing any service", async () => {
+    const runtime = startingRuntime();
+    const deployServiceWorkload = vi.mocked(runtime.deployServiceWorkload);
+    const destroy = vi.mocked(runtime.destroy);
+    h.services = [
+      {
+        id: "svc-postgres",
+        projectId: "p1",
+        name: "postgres",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: ["5432"],
+        image: "postgres:16",
+        exposed: false,
+        publicEndpoints: [],
+      },
+      {
+        id: "svc-redis",
+        projectId: "p1",
+        name: "redis",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: ["6379"],
+        image: "redis:7",
+        exposed: false,
+        publicEndpoints: [],
+      },
+      {
+        id: "svc-api",
+        projectId: "p1",
+        name: "api",
+        enabled: true,
+        dependsOn: ["postgres", "redis"],
+        advanced: null,
+        ports: ["3000"],
+        image: "ghcr.io/acme/api:next",
+        exposed: true,
+        exposedPort: "3000",
+        domainType: "custom",
+        customDomain: "api.example.com",
+        publicEndpoints: [],
+      },
+    ];
+    h.previousServiceRows = [
+      {
+        id: "sd-postgres",
+        deploymentId: "d-old",
+        serviceId: "svc-postgres",
+        serviceName: "postgres",
+        containerId: "container-postgres",
+        status: "success",
+        imageRef: "postgres:16",
+      },
+      {
+        id: "sd-redis",
+        deploymentId: "d-old",
+        serviceId: "svc-redis",
+        serviceName: "redis",
+        containerId: "container-redis",
+        status: "success",
+        imageRef: "redis:7",
+      },
+      {
+        id: "sd-api",
+        deploymentId: "d-old",
+        serviceId: "svc-api",
+        serviceName: "api",
+        containerId: "container-api",
+        status: "success",
+        imageRef: "ghcr.io/acme/api:old",
+        hostPort: 20_008,
+        hostPorts: { 3000: 20_008 },
+      },
+    ];
+    h.allocateAndReservePinnedHostPort.mockResolvedValueOnce({
+      port: 20_001,
+      preferred: 20_008,
+      scanned: true,
+      claimWasCreated: true,
+      previousClaim: {
+        projectId: "p1",
+        serviceId: "svc-api",
+        containerPort: 3000,
+        port: 20_008,
+      },
+      claim: {
+        id: "hpc-api-replacement",
+        targetKey: "local",
+        projectId: "p1",
+        serviceId: "svc-api",
+        containerPort: 3000,
+        port: 20_001,
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      },
+    });
+
+    const { logger } = recordingLogger();
+    const result = await deployComposeServices(
+      { ...project, activeDeploymentId: "d-old", routeStrategy: "loopback-port" } as never,
+      dep,
+      runtime,
+      logger,
+      {
+        executor: {} as CommandExecutor,
+        hostPortTarget: localHostPortTarget,
+        routing: {
+          registerRoute: vi.fn(async () => undefined),
+          removeRoute: vi.fn(async () => undefined),
+        } as never,
+        ssl: {
+          provisionCert: vi.fn(async () => ({ verified: false })),
+          renewCert: vi.fn(),
+          verifyCert: vi.fn(),
+          installCert: vi.fn(),
+        } as never,
+        usesManagedRouting: true,
+      },
+    );
+
+    expect(result.status).toBe("ready");
+    expect(h.allocateAndReservePinnedHostPort.mock.invocationCallOrder[0]).toBeLessThan(
+      deployServiceWorkload.mock.invocationCallOrder[0]!,
+    );
+    const occupancyPolicy = h.allocateAndReservePinnedHostPort.mock.calls[0]![0]
+      .reuseOccupiedPreferred as (port: number) => boolean;
+    expect(occupancyPolicy(20_008)).toBe(false);
+    expect(deployServiceWorkload).toHaveBeenCalledTimes(3);
+    expect(destroy).toHaveBeenCalled();
+    expect(h.upsertServiceDeployment).toHaveBeenCalled();
+  });
+
+  it("recovers a stale active container id from one live Docker inventory before port reconciliation", async () => {
+    const base = startingRuntime();
+    const getContainerInfo = vi.fn();
+    const runtime = {
+      ...base,
+      supports: (capability: string) =>
+        capability === "containerIp" ||
+        capability === "containerInfo" ||
+        capability === "hostContainerQuery",
+      listAllContainers: vi.fn(async () => [
+        {
+          id: "live-api-container",
+          names: ["openship-app-api"],
+          image: "ghcr.io/acme/api:old",
+          imageId: "sha256:api",
+          state: "running",
+          status: "Up 2 hours",
+          labels: { "openship.project": "p1", "openship.service": "api" },
+          ports: [{ privatePort: 3000, publicPort: 20_008, type: "tcp", ip: "127.0.0.1" }],
+          mounts: [],
+          ip: "172.18.0.8",
+        },
+      ]),
+      getContainerInfo,
+    } as unknown as MultiServiceRuntimeAdapter;
+    h.services = [
+      {
+        id: "svc-api",
+        projectId: "p1",
+        name: "api",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: ["3000"],
+        image: "ghcr.io/acme/api:next",
+        exposed: true,
+        exposedPort: "3000",
+        domainType: "custom",
+        customDomain: "api.example.com",
+        publicEndpoints: [],
+      },
+    ];
+    h.previousServiceRows = [
+      {
+        id: "sd-api",
+        deploymentId: "d-old",
+        serviceId: "svc-api",
+        serviceName: "api",
+        containerId: "stale-api-container",
+        status: "success",
+        imageRef: "ghcr.io/acme/api:old",
+        hostPort: 20_008,
+        hostPorts: { 3000: 20_008 },
+      },
+    ];
+    h.allocateAndReservePinnedHostPort.mockRejectedValueOnce(new Error("halt after preflight"));
+
+    const { logger } = recordingLogger();
+    await expect(
+      deployComposeServices(
+        { ...project, activeDeploymentId: "d-old", routeStrategy: "loopback-port" } as never,
+        dep,
+        runtime,
+        logger,
+        {
+          executor: {} as CommandExecutor,
+          hostPortTarget: localHostPortTarget,
+          routing: {
+            registerRoute: vi.fn(async () => undefined),
+            removeRoute: vi.fn(async () => undefined),
+          } as never,
+          ssl: {
+            provisionCert: vi.fn(async () => ({ verified: false })),
+            renewCert: vi.fn(),
+            verifyCert: vi.fn(),
+            installCert: vi.fn(),
+          } as never,
+          usesManagedRouting: true,
+        },
+      ),
+    ).rejects.toThrow("halt after preflight");
+
+    expect(h.updateServiceDeployment).toHaveBeenCalledWith(
+      "sd-api",
+      expect.objectContaining({
+        containerId: "live-api-container",
+        hostPorts: { 3000: 20_008 },
+        ip: "172.18.0.8",
+      }),
+    );
+    expect(h.prepareTargetPinnedHostPorts).toHaveBeenCalledWith(
+      expect.objectContaining({
+        verifiedCarriedHostPorts: [
+          expect.objectContaining({
+            owner: { projectId: "p1", serviceId: "svc-api", containerPort: 3000 },
+            hostPort: 20_008,
+            liveHostPortByContainerPort: { 3000: 20_008 },
+          }),
+        ],
+      }),
+    );
+    expect(h.allocateAndReservePinnedHostPort).toHaveBeenCalledWith(
+      expect.objectContaining({ reuseOccupiedPreferred: expect.any(Function) }),
+    );
+    const occupancyPolicy = h.allocateAndReservePinnedHostPort.mock.calls[0]![0]
+      .reuseOccupiedPreferred as (port: number) => boolean;
+    expect(occupancyPolicy(20_008)).toBe(true);
+    expect(getContainerInfo).not.toHaveBeenCalled();
+    expect(base.deployServiceWorkload).not.toHaveBeenCalled();
+  });
+
+  it("inspects a stopped carried container when the Docker inventory omits its bindings", async () => {
+    const base = startingRuntime();
+    const getContainerInfo = vi.fn(async (containerId: string) => ({
+      containerId,
+      status: "stopped" as const,
+      hostPort: 20_007,
+      hostPortByContainerPort: { 3000: 20_007 },
+    }));
+    const runtime = {
+      ...base,
+      supports: (capability: string) =>
+        capability === "containerIp" ||
+        capability === "containerInfo" ||
+        capability === "hostContainerQuery",
+      listAllContainers: vi.fn(async () => [
+        {
+          id: "stopped-web-container",
+          names: ["openship-app-web"],
+          image: "ghcr.io/acme/web:old",
+          imageId: "sha256:web",
+          state: "exited",
+          status: "Exited (1) 2 minutes ago",
+          labels: { "openship.project": "p1", "openship.service": "web" },
+          // Docker's list endpoint may omit published bindings after stop. The
+          // inspect endpoint above retains HostConfig.PortBindings.
+          ports: [],
+          mounts: [],
+        },
+      ]),
+      getContainerInfo,
+    } as unknown as MultiServiceRuntimeAdapter;
+    h.services = [
+      {
+        id: "svc-web",
+        projectId: "p1",
+        name: "web",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: ["3000"],
+        image: "ghcr.io/acme/web:next",
+        exposed: true,
+        exposedPort: "3000",
+        domainType: "custom",
+        customDomain: "web.example.com",
+        publicEndpoints: [],
+      },
+    ];
+    h.previousServiceRows = [
+      {
+        id: "sd-web",
+        deploymentId: "d-old",
+        serviceId: "svc-web",
+        serviceName: "web",
+        containerId: "stopped-web-container",
+        status: "success",
+        imageRef: "ghcr.io/acme/web:old",
+        hostPort: 20_007,
+        hostPorts: { 3000: 20_007 },
+      },
+    ];
+    h.allocateAndReservePinnedHostPort.mockRejectedValueOnce(new Error("halt after preflight"));
+    const promptUser = vi.fn(async () => "abort");
+
+    const { logger } = recordingLogger();
+    await expect(
+      deployComposeServices(
+        { ...project, activeDeploymentId: "d-old", routeStrategy: "loopback-port" } as never,
+        dep,
+        runtime,
+        logger,
+        {
+          executor: {} as CommandExecutor,
+          hostPortTarget: localHostPortTarget,
+          routing: {
+            registerRoute: vi.fn(async () => undefined),
+            removeRoute: vi.fn(async () => undefined),
+          } as never,
+          ssl: {
+            provisionCert: vi.fn(async () => ({ verified: false })),
+            renewCert: vi.fn(),
+            verifyCert: vi.fn(),
+            installCert: vi.fn(),
+          } as never,
+          usesManagedRouting: true,
+          promptUser,
+        },
+      ),
+    ).rejects.toThrow("halt after preflight");
+
+    expect(getContainerInfo).toHaveBeenCalledTimes(1);
+    expect(getContainerInfo).toHaveBeenCalledWith("stopped-web-container");
+    expect(h.prepareTargetPinnedHostPorts).toHaveBeenCalledWith(
+      expect.objectContaining({
+        verifiedCarriedHostPorts: [
+          expect.objectContaining({
+            owner: { projectId: "p1", serviceId: "svc-web", containerPort: 3000 },
+            hostPort: 20_007,
+            liveHostPortByContainerPort: { 3000: 20_007 },
+          }),
+        ],
+      }),
+    );
+    expect(h.allocateAndReservePinnedHostPort).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cachedPreferred: 20_007,
+        reuseOccupiedPreferred: expect.any(Function),
+      }),
+    );
+    const occupancyPolicy = h.allocateAndReservePinnedHostPort.mock.calls[0]![0]
+      .reuseOccupiedPreferred as (port: number) => boolean;
+    expect(occupancyPolicy(20_007)).toBe(false);
+    expect(base.deployServiceWorkload).not.toHaveBeenCalled();
+  });
+
+  it("refuses ambiguous duplicate containers before repairing or activating anything", async () => {
+    const base = startingRuntime();
+    const liveContainer = (id: string, name: string) => ({
+      id,
+      names: [name],
+      image: "ghcr.io/acme/api:old",
+      imageId: "sha256:api",
+      state: "running",
+      status: "Up 2 hours",
+      labels: { "openship.project": "p1", "openship.service": "api" },
+      ports: [{ privatePort: 3000, publicPort: 20_008, type: "tcp", ip: "127.0.0.1" }],
+      mounts: [],
+      ip: "172.18.0.8",
+    });
+    const runtime = {
+      ...base,
+      supports: (capability: string) =>
+        capability === "containerIp" ||
+        capability === "containerInfo" ||
+        capability === "hostContainerQuery",
+      listAllContainers: vi.fn(async () => [
+        liveContainer("live-api-container-a", "openship-app-api-a"),
+        liveContainer("live-api-container-b", "openship-app-api-b"),
+      ]),
+    } as unknown as MultiServiceRuntimeAdapter;
+    h.services = [
+      {
+        id: "svc-api",
+        projectId: "p1",
+        name: "api",
+        enabled: true,
+        dependsOn: [],
+        advanced: null,
+        ports: ["3000"],
+        image: "ghcr.io/acme/api:next",
+        exposed: true,
+        exposedPort: "3000",
+        domainType: "custom",
+        customDomain: "api.example.com",
+        publicEndpoints: [],
+      },
+    ];
+    h.previousServiceRows = [
+      {
+        id: "sd-api",
+        deploymentId: "d-old",
+        serviceId: "svc-api",
+        serviceName: "api",
+        containerId: "stale-api-container",
+        status: "success",
+        imageRef: "ghcr.io/acme/api:old",
+        hostPort: 20_008,
+        hostPorts: { 3000: 20_008 },
+      },
+    ];
+
+    const { logger } = recordingLogger();
+    await expect(
+      deployComposeServices(
+        { ...project, activeDeploymentId: "d-old", routeStrategy: "loopback-port" } as never,
+        dep,
+        runtime,
+        logger,
+        {
+          executor: {} as CommandExecutor,
+          hostPortTarget: localHostPortTarget,
+        },
+      ),
+    ).rejects.toThrow(
+      /more than one container matching active service "api".*no service activation/i,
+    );
+
+    expect(h.updateServiceDeployment).not.toHaveBeenCalled();
+    expect(h.allocateAndReservePinnedHostPort).not.toHaveBeenCalled();
+    expect(base.deployServiceWorkload).not.toHaveBeenCalled();
+    expect(base.destroy).not.toHaveBeenCalled();
+  });
+
+  it("fails an inconclusive live inventory before any service activation", async () => {
+    const base = startingRuntime();
+    const runtime = {
+      ...base,
+      supports: (capability: string) =>
+        capability === "containerIp" || capability === "hostContainerQuery",
+      listAllContainers: vi.fn(async () => {
+        throw new Error("Docker inventory channel timed out");
+      }),
+    } as unknown as MultiServiceRuntimeAdapter;
+
+    const { logger } = recordingLogger();
+    await expect(
+      deployComposeServices(
+        { ...project, activeDeploymentId: "d-old", routeStrategy: "loopback-port" } as never,
+        dep,
+        runtime,
+        logger,
+        {
+          executor: {} as CommandExecutor,
+          hostPortTarget: localHostPortTarget,
+        },
+      ),
+    ).rejects.toThrow(/preflight could not verify.*no service activation was started.*timed out/i);
+
+    expect(base.deployServiceWorkload).not.toHaveBeenCalled();
+    expect(base.destroy).not.toHaveBeenCalled();
+    expect(h.allocateAndReservePinnedHostPort).not.toHaveBeenCalled();
   });
 
   it("releases a target's preallocated host port when earlier carried bookkeeping throws", async () => {
@@ -963,6 +1436,88 @@ describe("compose deploy — host channel unavailable", () => {
       deployComposeServices(project, dep, haltingRuntime("cloud"), logger, { executor: null }),
     ).rejects.toThrow(/halt/);
     expect(lines.some((l) => l.message.includes("Host operations are unavailable"))).toBe(false);
+  });
+
+  it("cancels a pre-activation host wait inside the executor scope and leaves a following deploy unblocked", async () => {
+    const runtime = startingRuntime();
+    const deployServiceWorkload = vi.mocked(runtime.deployServiceWorkload);
+    const destroy = vi.mocked(runtime.destroy);
+    let activeSignal: AbortSignal | undefined;
+    let channelClosed = false;
+    const readFile = vi.fn(() => {
+      const signal = activeSignal;
+      if (!signal) throw new Error("host operation escaped its deployment cancellation scope");
+      return new Promise<string>((_resolve, reject) => {
+        const cancel = () => {
+          // Model the real executor invariant: settle only after channel close.
+          channelClosed = true;
+          const error = new Error("SSH preflight cancelled after channel close");
+          error.name = "AbortError";
+          reject(error);
+        };
+        signal.addEventListener("abort", cancel, { once: true });
+        if (signal.aborted) cancel();
+      });
+    });
+    const executor = {
+      runWithAbortSignal: async <T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> => {
+        activeSignal = signal;
+        try {
+          return await fn();
+        } finally {
+          if (activeSignal === signal) activeSignal = undefined;
+        }
+      },
+      readFile,
+    } as unknown as CommandExecutor;
+    const secondReached = new Error("following deployment reached target preflight");
+    const system = {
+      ensureFeature: vi
+        .fn()
+        .mockImplementationOnce(() => readFile())
+        .mockRejectedValueOnce(secondReached),
+    };
+    const firstController = new AbortController();
+    const { logger } = recordingLogger();
+    const first = deployComposeServices(
+      { ...project, activeDeploymentId: "d-old" } as never,
+      dep,
+      runtime,
+      logger,
+      {
+        executor,
+        hostPortTarget: localHostPortTarget,
+        system: system as never,
+        signal: firstController.signal,
+      },
+    );
+    await vi.waitFor(() => expect(readFile).toHaveBeenCalledTimes(1));
+
+    firstController.abort();
+
+    await expect(first).rejects.toMatchObject({ name: "AbortError" });
+    expect(channelClosed).toBe(true);
+    expect(deployServiceWorkload).not.toHaveBeenCalled();
+    expect(destroy).not.toHaveBeenCalled();
+    expect(h.upsertServiceDeployment).not.toHaveBeenCalled();
+
+    await expect(
+      deployComposeServices(
+        { ...project, activeDeploymentId: "d-old" } as never,
+        { ...dep, id: "d2" } as never,
+        runtime,
+        logger,
+        {
+          executor,
+          hostPortTarget: localHostPortTarget,
+          system: system as never,
+          signal: new AbortController().signal,
+        },
+      ),
+    ).rejects.toBe(secondReached);
+    expect(system.ensureFeature).toHaveBeenCalledTimes(2);
+    expect(deployServiceWorkload).not.toHaveBeenCalled();
+    expect(destroy).not.toHaveBeenCalled();
   });
 
   it("fails before container activation when a loopback target has no executor", async () => {

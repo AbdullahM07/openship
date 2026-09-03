@@ -25,7 +25,7 @@ const RELEASE_0_2_0: GithubReleasePayload = {
 describe("changelog release details", () => {
   const changelog = `# Changelog
 
-## 0.6.10
+## 0.7.0
 
 - newer
 
@@ -49,7 +49,7 @@ describe("changelog release details", () => {
   it("links to the website changelog and its version route, never GitHub", () => {
     expect(changelogUrl()).toBe("https://openship.io/changelog");
     expect(changelogUrl("v0.6.9")).toBe("https://openship.io/changelog/v0-6-9");
-    expect(changelogUrl("0.6.10-dev.1")).toBe("https://openship.io/changelog");
+    expect(changelogUrl("0.7.0-dev.1")).toBe("https://openship.io/changelog");
     expect(changelogUrl("not-a-version")).toBe("https://openship.io/changelog");
   });
 });

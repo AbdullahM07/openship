@@ -54,6 +54,19 @@ export interface Project {
   activeDeploymentStatus?: string | null;
   /** True when the live release is a partial-failure deploy awaiting keep/reject. */
   awaitingDecision?: boolean | null;
+  /** True when the live release's edge/domain routes did not finish syncing. */
+  routingUnsynced?: boolean | null;
+  /** True when the latest failed deploy has a named, clearable blocker. */
+  latestDeploymentBlocked?: boolean | null;
+  /** Operator switch, derived from the project's disabled timestamp. */
+  enabled?: boolean | null;
+  /** Current project migration, when one is still running or awaiting a decision. */
+  activeMigration?: {
+    id: string;
+    status: string;
+    mode: string;
+    needsAction?: boolean;
+  } | null;
   serviceCount?: number;
   hasMultipleServices?: boolean;
   /** Set once soft-deleted; in practice teardown hard-deletes, so the list

@@ -27,6 +27,8 @@ const {
     project: {
       findById: vi.fn(),
       getEnvMap: vi.fn(),
+      listEnvVars: vi.fn(),
+      bulkSetEnvVars: vi.fn(),
       listEnvVarChangeMeta: vi.fn(),
       update: vi.fn(),
     },
@@ -120,12 +122,13 @@ import {
   type DeploymentConfigSnapshot,
 } from "../../../src/modules/deployments/build.service";
 import { createServiceRepo, toComposeSpec, type Database } from "@repo/db";
-import type { ReleaseSource } from "@repo/core";
+import { ENV_MASK, type ReleaseSource } from "@repo/core";
 import {
   newFolderSessionId,
   putFolderSession,
 } from "../../../src/modules/projects/folder/session-store";
 import { ComposeConfigurationError } from "../../../src/modules/deployments/compose-configuration-error";
+import { decrypt, encrypt } from "../../../src/lib/encryption";
 
 const ctx = { userId: "user-1", organizationId: "org-1" } as any;
 
@@ -1406,6 +1409,8 @@ describe("requestBuildAccess — folder-upload compose services", () => {
       baseProject({ gitProvider: "upload", localPath: null, runtimeMode: null }),
     );
     repos.project.getEnvMap.mockResolvedValue({});
+    repos.project.listEnvVars.mockResolvedValue([]);
+    repos.project.bulkSetEnvVars.mockResolvedValue(undefined);
     repos.deployment.findById.mockResolvedValue(null);
     repos.deployment.listByProject.mockResolvedValue({ rows: [] });
     repos.deployment.getLatestSuccessfulForBranch.mockResolvedValue(null);
@@ -1475,6 +1480,67 @@ describe("requestBuildAccess — folder-upload compose services", () => {
         composeServices: scannedServices,
       }),
     );
+  });
+
+  it("#801: preserves a stored secret submitted as the mask sentinel", async () => {
+    const uploadSessionId = seedSession();
+    const storedSecret = encrypt("runtime-secret");
+    repos.project.listEnvVars.mockResolvedValue([
+      {
+        key: "AUTH_SECRET",
+        value: storedSecret,
+        isSecret: true,
+        environment: "production",
+        serviceId: null,
+      },
+      {
+        key: "PUBLIC_SETTING",
+        value: encrypt("old-value"),
+        isSecret: false,
+        environment: "production",
+        serviceId: null,
+      },
+    ]);
+
+    await requestBuildAccess(ctx, {
+      projectId: "project-1",
+      uploadSessionId,
+      environment: "production",
+      envVars: { AUTH_SECRET: ENV_MASK, PUBLIC_SETTING: "new-value" },
+    });
+
+    const captured = repos.deployment.create.mock.calls.at(-1)?.[0]?.envVars;
+    expect(decrypt(captured.AUTH_SECRET)).toBe("runtime-secret");
+    expect(decrypt(captured.PUBLIC_SETTING)).toBe("new-value");
+    expect(repos.project.bulkSetEnvVars).toHaveBeenCalledWith(
+      "project-1",
+      "production",
+      expect.arrayContaining([
+        expect.objectContaining({ key: "AUTH_SECRET", value: storedSecret, isSecret: true }),
+      ]),
+    );
+  });
+
+  it("keeps an explicitly submitted empty secret distinct from the mask sentinel", async () => {
+    const uploadSessionId = seedSession();
+    repos.project.listEnvVars.mockResolvedValue([
+      {
+        key: "AUTH_SECRET",
+        value: encrypt("old-secret"),
+        isSecret: true,
+        environment: "production",
+        serviceId: null,
+      },
+    ]);
+
+    await requestBuildAccess(ctx, {
+      projectId: "project-1",
+      uploadSessionId,
+      envVars: { AUTH_SECRET: "" },
+    });
+
+    const captured = repos.deployment.create.mock.calls.at(-1)?.[0]?.envVars;
+    expect(decrypt(captured.AUTH_SECRET)).toBe("");
   });
 
   it("prefers the caller's services over the session's", async () => {

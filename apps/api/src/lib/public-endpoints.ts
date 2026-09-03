@@ -175,6 +175,27 @@ export function inferPublicRouteDomainType(
   return managedHostnameToSlug(hostname) ? "free" : "custom";
 }
 
+/**
+ * Canonical ordering for persisted public-route rows. A healthy project has one
+ * primary row, but legacy/imported data can contain ties. Prefer a custom route
+ * in that case, then use the hostname for deterministic ordering.
+ *
+ * Compare the effective type rather than the nullable database column so this
+ * agrees with routeDomainRowToPublicEndpoint for legacy rows.
+ */
+export function comparePublicRouteRows(
+  left: Pick<ProjectDomainRow, "hostname" | "isPrimary" | "domainType">,
+  right: Pick<ProjectDomainRow, "hostname" | "isPrimary" | "domainType">,
+): number {
+  if (left.isPrimary !== right.isPrimary) return left.isPrimary ? -1 : 1;
+
+  const leftType = inferPublicRouteDomainType(left.hostname, left.domainType);
+  const rightType = inferPublicRouteDomainType(right.hostname, right.domainType);
+  if (leftType !== rightType) return leftType === "custom" ? -1 : 1;
+
+  return left.hostname.localeCompare(right.hostname);
+}
+
 export function publicEndpointHostname(
   endpoint: Pick<StoredPublicEndpoint, "domainType" | "domain" | "customDomain">,
 ): string | undefined {
@@ -239,13 +260,7 @@ function routeRowsToPublicEndpoints(
 ): StoredPublicEndpoint[] {
   return (projectDomains ?? [])
     .filter((domain) => !domain.serviceId)
-    .sort((left, right) => {
-      if (left.isPrimary !== right.isPrimary) {
-        return left.isPrimary ? -1 : 1;
-      }
-
-      return left.hostname.localeCompare(right.hostname);
-    })
+    .sort(comparePublicRouteRows)
     .map(routeDomainRowToPublicEndpoint)
     .filter((endpoint): endpoint is StoredPublicEndpoint => endpoint !== null);
 }
@@ -930,10 +945,7 @@ export function serviceDomainRowsToPublicEndpoints(
 ): StoredPublicEndpoint[] {
   return (domains ?? [])
     .filter((domain) => domain.serviceId === serviceId)
-    .sort((left, right) => {
-      if (left.isPrimary !== right.isPrimary) return left.isPrimary ? -1 : 1;
-      return left.hostname.localeCompare(right.hostname);
-    })
+    .sort(comparePublicRouteRows)
     .map(routeDomainRowToPublicEndpoint)
     .filter((endpoint): endpoint is StoredPublicEndpoint => endpoint !== null);
 }
