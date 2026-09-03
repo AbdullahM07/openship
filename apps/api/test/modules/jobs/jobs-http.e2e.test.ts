@@ -249,21 +249,72 @@ describe("jobs HTTP — fix #2: cross-org write isolation", () => {
     expect(await repos.job.findByKey(key)).toBeNull();
   });
 
-  it("system jobs stay tunable by any member, and still refuse deletion", async () => {
-    // Builtins store no actionConfig → no target servers → nothing to gate on.
-    // They are instance operations, so this must not become owner-of-org-A-only.
-    const a = await seedOwner();
-    const b = await seedOwner();
-    await seedSystemJob("test:builtin-write");
+  it("only an instance admin can mutate or run an instance-wide system job", async () => {
+    // Every ordinary user owns a personal org, so an org-owner check is not an
+    // instance boundary. Reproduce the advisory's encoded dispatcher route.
+    const orgOwner = await seedOwner();
+    const victim = await seedOwner();
+    const instanceAdmin = await seedOwner({ instanceAdmin: true });
+    const victimServer = await seedServer(victim.orgId);
+    const victimJob = "custom:victim-once";
+    const now = new Date();
+    await db.insert(schema.job).values({
+      id: "job_victim_once",
+      key: victimJob,
+      kind: "custom",
+      label: "Victim once",
+      scheduleType: "once",
+      runAt: new Date(Date.now() - 60_000),
+      enabled: true,
+      actionType: "command",
+      actionConfig: { serverIds: [victimServer], command: "true" },
+      createdBy: victim.userId,
+      createdAt: now,
+      updatedAt: now,
+    });
+    await seedSystemJob("jobs:oneshot");
+
+    const deniedRun = await req(app, "POST", "/jobs%3Aoneshot/run", {
+      auth: orgOwner.auth,
+    });
+    expect(deniedRun.status).toBe(403);
+    expect(deniedRun.body.code).toBe("FORBIDDEN");
+    expect(deniedRun.body.error).toBe("Requires an instance administrator");
+    expect(await repos.jobRun.listRecent({ jobId: "jobs:oneshot" })).toEqual([]);
+    expect(await repos.jobRun.listRecent({ jobId: victimJob })).toEqual([]);
+    expect(await repos.job.findByKey(victimJob)).toMatchObject({
+      enabled: true,
+      runAt: expect.any(Date),
+    });
+
+    const deniedPatch = await req(app, "PATCH", "/jobs%3Aoneshot", {
+      auth: orgOwner.auth,
+      body: { enabled: false },
+    });
+    expect(deniedPatch.status).toBe(403);
+    expect((await repos.job.findByKey("jobs:oneshot"))?.enabled).toBe(true);
+
+    // Keep the positive instance-admin case independent of the denied victim.
+    await repos.job.remove(victimJob);
+
+    const allowedRun = await req(app, "POST", "/jobs%3Aoneshot/run", {
+      auth: instanceAdmin.auth,
+    });
+    expect(allowedRun.status).toBe(200);
+    expect(allowedRun.body.data).toMatchObject({
+      key: "jobs:oneshot",
+      summary: { fired: 0 },
+    });
 
     expect(
-      (await req(app, "PATCH", "/test:builtin-write", { auth: b.auth, body: { enabled: false } })).status,
+      (
+        await req(app, "PATCH", "/jobs%3Aoneshot", {
+          auth: instanceAdmin.auth,
+          body: { enabled: false },
+        })
+      ).status,
     ).toBe(200);
-    expect((await repos.job.findByKey("test:builtin-write"))?.enabled).toBe(false);
-
-    const del = await req(app, "DELETE", "/test:builtin-write", { auth: a.auth });
-    expect(del.status).toBeGreaterThanOrEqual(400);
-    expect(await repos.job.findByKey("test:builtin-write")).not.toBeNull();
+    expect((await repos.job.findByKey("jobs:oneshot"))?.enabled).toBe(false);
   });
 
   it("an unknown key is 404 on both write verbs", async () => {

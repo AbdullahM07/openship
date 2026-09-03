@@ -74,7 +74,7 @@ const sidebarOrgClient = (
 
 export function Sidebar() {
   const { user } = useAuth();
-  const { selfHosted, deployMode, authMode, version, machineName, productView } = usePlatform();
+  const { selfHosted, deployMode, authMode, machineName, productView } = usePlatform();
   const { connected: cloudConnected, cloudUser } = useCloud();
   const isDesktop = deployMode === "desktop";
 
@@ -666,15 +666,6 @@ export function Sidebar() {
               <LogOut className="size-4" />
             )}
           </button>
-        )}
-
-        {!collapsed && version && (
-          <p
-            className="mt-3 text-center text-[11px] tabular-nums text-muted-foreground/60"
-            aria-label={`OpenShip version ${version}`}
-          >
-            v{version.replace(/^v/i, "")}
-          </p>
         )}
       </div>
     </aside>
