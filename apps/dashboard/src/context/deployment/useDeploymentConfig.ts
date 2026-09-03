@@ -23,6 +23,7 @@ import {
   buildSingleModeSnapshot,
   syncActiveModeSnapshot,
 } from "./mode-config";
+import { savedDeploymentEnvRows } from "./env-payload";
 import { normalizeSubdomain } from "@/utils/subdomain";
 import { useDefaultDomainType } from "@/context/CloudContext";
 
@@ -152,9 +153,11 @@ function scanComposePath(
  */
 function scanEnv(envVars: EnvironmentVariable[]): { env?: Record<string, string> } {
   const env: Record<string, string> = {};
-  for (const { key, value } of envVars) {
+  for (const { key, value, preserveValue } of envVars) {
     const name = key.trim();
-    if (name) env[name] = value;
+    // A preserved row contains no plaintext to interpolate. Sending its empty
+    // display value would repeat the masked-view mistake from #801.
+    if (name && !preserveValue) env[name] = value;
   }
   return Object.keys(env).length > 0 ? { env } : {};
 }
@@ -1155,12 +1158,11 @@ export function useDeploymentConfig() {
         const svcRes = await servicesApi.list(projectId).catch(() => null);
         const serviceRows: Service[] = svcRes?.services ?? [];
 
-        // Production env → config.envVars (secret VALUES come back masked; blank
-        // them — the env editor owns secret edits — rather than seeding the mask).
+        // Production env → config.envVars. Secret plaintext never enters this
+        // context; preserveValue keeps its display blank distinct from a real
+        // empty value when the deployment request is serialized (#801).
         const envRes = await projectsApi.getEnv(projectId).catch(() => null);
-        const envVars: DeploymentConfig["envVars"] = (envRes?.data ?? [])
-          .filter((v) => v.environment === "production")
-          .map((v) => ({ key: v.key, value: v.isSecret ? "" : v.value, visible: true }));
+        const envVars: DeploymentConfig["envVars"] = savedDeploymentEnvRows(envRes?.data ?? []);
 
         const response = buildSavedProjectResponse(project, serviceRows);
         const repoName = project.gitRepo || project.name || "project";

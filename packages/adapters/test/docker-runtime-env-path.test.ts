@@ -137,6 +137,17 @@ const serviceEnv = async (environment: Record<string, string>): Promise<string[]
   (await serviceRun(environment)).env;
 
 describe("DockerRuntime.deploy — project PATH never reaches container Env (#623)", () => {
+  it("#801: passes secret-looking runtime values to Docker unchanged", async () => {
+    const env = await deployEnv({
+      AUTH_SECRET: "runtime-secret",
+      PG_HURRICANE_PASSWORD: "p@ss=word with spaces",
+      PUBLIC_SETTING: "enabled",
+    });
+    expect(env).toContain("AUTH_SECRET=runtime-secret");
+    expect(env).toContain("PG_HURRICANE_PASSWORD=p@ss=word with spaces");
+    expect(env).toContain("PUBLIC_SETTING=enabled");
+  });
+
   it("drops PATH and keeps every other key in declaration order", async () => {
     const env = await deployEnv(PROJECT_ENV);
     // The runtime's own two come first, then the project's, unchanged in order.

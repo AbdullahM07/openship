@@ -53,7 +53,7 @@ import { deploymentWorkload, projectToClass, snapshotToClass } from "./deploymen
 import { resolveProjectInfo } from "./prepare.service";
 import { ComposeConfigurationError } from "./compose-configuration-error";
 import { getFolderSession } from "../projects/folder/session-store";
-import { hasMaskedValue, unmaskEnv } from "../../lib/secret-env";
+import { hasMaskedValue, isMaskedValue, unmaskEnv } from "../../lib/secret-env";
 import { assertValidCustomDomains, customHostnamesOf } from "../../lib/custom-domain-guard";
 import {
   assertBuildMinutesAvailable,
@@ -878,6 +878,51 @@ export function encryptEnvVars(envVars?: Record<string, string>): Record<string,
   return encrypted;
 }
 
+type StoredProjectEnv = {
+  key: string;
+  value: string;
+  isSecret: boolean;
+};
+
+/**
+ * Resolve the env map submitted by the deploy wizard without destroying values
+ * the browser was never allowed to read.
+ *
+ * The shared mask sentinel means "keep the stored value"; it is never itself an
+ * environment value. Every real value, including an explicitly empty one, is
+ * encrypted normally. A sentinel with no stored secret behind it is dropped.
+ */
+function resolveSubmittedProjectEnv(
+  submitted: Record<string, string>,
+  storedRows: StoredProjectEnv[],
+): {
+  encrypted: Record<string, string> | null;
+  rows: Array<{ key: string; value: string; isSecret: boolean }>;
+} {
+  const storedByKey = new Map(storedRows.map((row) => [row.key, row]));
+  const rows: Array<{ key: string; value: string; isSecret: boolean }> = [];
+
+  for (const [key, submittedValue] of Object.entries(submitted)) {
+    const stored = storedByKey.get(key);
+    const preservesUnreadableSecret = stored?.isSecret === true && isMaskedValue(submittedValue);
+
+    if (isMaskedValue(submittedValue) && !preservesUnreadableSecret) {
+      // The mask is a transport sentinel, never an environment value. With no
+      // matching saved secret there is nothing safe to recover.
+      continue;
+    }
+
+    rows.push({
+      key,
+      value: preservesUnreadableSecret ? stored.value : encrypt(submittedValue),
+      isSecret: stored?.isSecret ?? looksLikeSecretKey(key),
+    });
+  }
+
+  const encrypted = Object.fromEntries(rows.map(({ key, value }) => [key, value]));
+  return { encrypted: rows.length > 0 ? encrypted : null, rows };
+}
+
 /**
  * Load a deployment + its project, refusing if their organizations don't
  * agree. The calling route's permission middleware already verified the
@@ -1501,8 +1546,22 @@ export async function requestBuildAccess(
   // already-saved env vars, the same way triggerDeployment's fresh-deploy
   // path does. Without this, a bare/server-build deploy silently ships with
   // no env at all even though `PATCH /api/projects/:id/env` succeeded.
-  let deploymentEnvVars = encryptEnvVars(envVars);
-  if (!deploymentEnvVars) {
+  // A saved secret is deliberately unreadable in the browser. The v0.6.9
+  // wizard represented that value as "" and then echoed the whole form here,
+  // replacing the real ciphertext with an encrypted empty string in BOTH this
+  // deployment snapshot and the project. Current callers send the explicit
+  // mask sentinel instead; resolve it against project-level rows before either
+  // write while keeping a genuinely submitted empty string unambiguous.
+  let deploymentEnvVars: Record<string, string> | null;
+  let submittedProjectEnv:
+    | Array<{ key: string; value: string; isSecret: boolean }>
+    | undefined;
+  if (envVars && Object.keys(envVars).length > 0) {
+    const storedRows = await repos.project.listEnvVars(project.id, env, null);
+    const resolved = resolveSubmittedProjectEnv(envVars, storedRows);
+    deploymentEnvVars = resolved.encrypted;
+    submittedProjectEnv = resolved.rows;
+  } else {
     // A deployment snapshot is project-scoped. Service-scoped rows are loaded
     // live, per service, by the compose deployer; flattening them into this map
     // leaks one service's values into every other service and destroys scope.
@@ -1532,26 +1591,11 @@ export async function requestBuildAccess(
   });
 
   // Store env vars on project as "latest defaults"
-  if (envVars && Object.keys(envVars).length > 0) {
-    // These arrive as a flat name→value map — a pasted `.env`, an upload, a CLI deploy —
-    // carrying no per-variable intent, and every one of them used to be stored
-    // `isSecret: false`. So an `OPENAI_API_KEY`, or a `DATABASE_URL` with a password in
-    // it, was flagged an ordinary value: returned in cleartext by GET /env and rendered
-    // as readable text in the editor to anyone with project access (#587). The name is
-    // the only signal available here, so default from it and let the operator correct it
-    // with the editor's per-row secret toggle.
-    //
-    // An EXISTING variable keeps its stored flag. `bulkSetEnvVars` replaces the whole
-    // set, so re-deriving the default every time would overturn that toggle on the
-    // operator's very next deploy.
-    const prior = await repos.project.listEnvVars(project.id, env).catch(() => []);
-    const priorSecret = new Map(prior.map((v) => [v.key, v.isSecret]));
-    const vars = Object.entries(envVars).map(([key, value]) => ({
-      key,
-      value: encrypt(value),
-      isSecret: priorSecret.get(key) ?? looksLikeSecretKey(key),
-    }));
-    await repos.project.bulkSetEnvVars(project.id, env, vars);
+  if (submittedProjectEnv) {
+    // These arrive as a flat map with no per-variable flag. New keys therefore
+    // use the name heuristic, while resolveSubmittedProjectEnv keeps an existing
+    // row's explicit flag and (for an unreadable secret) its exact ciphertext.
+    await repos.project.bulkSetEnvVars(project.id, env, submittedProjectEnv);
   }
 
   // Kick off the build BEFORE returning so the dashboard can attach via the

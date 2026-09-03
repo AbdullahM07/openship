@@ -49,7 +49,6 @@ import {
   STATIC_RELEASE_BASE,
   allocateHostPort,
   edgeProxyFor,
-  ensurePortAvailable,
   rootOrDegrade,
   resolveEnvironment,
   runDeployPipeline,
@@ -108,7 +107,6 @@ import {
   allocateAndReservePinnedHostPort,
   convergeTargetHostPortClaims,
   convergeTargetHostPortClaimsUnlocked,
-  findOwnedPinnedHostPort,
   prepareTargetPinnedHostPorts,
   type VerifiedCarriedPinnedHostPort,
   releaseNewPinnedHostPortClaims,
@@ -1197,10 +1195,11 @@ async function deployComposeServicesUnlocked(
     : null;
   const activeServerId = ((activeDeployment?.meta ?? {}) as { serverId?: string }).serverId ?? null;
   const targetServerId = opts?.serverId ?? null;
-  // A host port belongs to a physical host. On the same target it is immutable
-  // across an ordinary redeploy; on a migration the new host may legitimately
-  // allocate a different number.
-  const lockCarriedHostPorts = activeDeployment !== null && activeServerId === targetServerId;
+  // Docker ownership proofs are meaningful only on the same physical target.
+  // The old host port remains a preference, never an immutable identity: when
+  // it is unavailable the replacement gets a free port and managed routes move
+  // during cutover.
+  const sameTargetRedeploy = activeDeployment !== null && activeServerId === targetServerId;
 
   /**
    * One authoritative Docker snapshot replaces N per-service inspect calls and
@@ -1212,7 +1211,7 @@ async function deployComposeServicesUnlocked(
   const fullyInspectedCarriedContainerIds = new Set<string>();
   if (
     usesHostLoopback &&
-    lockCarriedHostPorts &&
+    sameTargetRedeploy &&
     previousServiceDeps.some((row) => row.containerId) &&
     runtime.supports("hostContainerQuery") &&
     runtime.listAllContainers
@@ -1745,10 +1744,9 @@ async function deployComposeServicesUnlocked(
       return hostPort === undefined ? [] : [{ containerPort, hostPort }];
     });
   };
-  type CarriedHostPortBindingState = "running" | "inactive" | "unverified";
-  const carriedHostPortBindingState = new Map<string, CarriedHostPortBindingState>();
+  const runningCarriedHostPortBindings = new Set<string>();
   const verifiedCarriedHostPorts: VerifiedCarriedPinnedHostPort[] = [];
-  if (hostPortTarget && lockCarriedHostPorts && runtime.supports("containerInfo")) {
+  if (hostPortTarget && sameTargetRedeploy && runtime.supports("containerInfo")) {
     const rowsWithContainers = previousServiceDeps.flatMap((row) => {
       if (!row.containerId || (row.hostPort == null && row.hostPorts == null)) return [];
       const bindings = carriedHostPortBindings(row);
@@ -1768,11 +1766,12 @@ async function deployComposeServicesUnlocked(
           live !== undefined &&
           live.status !== "missing" &&
           live.hostPortByContainerPort?.[containerPort] === hostPort;
-        carriedHostPortBindingState.set(
-          carriedHostPortProofKey(row.serviceId, containerPort, hostPort),
-          exactBinding ? (live.status === "running" ? "running" : "inactive") : "unverified",
-        );
         if (!exactBinding) continue;
+        if (live.status === "running") {
+          runningCarriedHostPortBindings.add(
+            carriedHostPortProofKey(row.serviceId, containerPort, hostPort),
+          );
+        }
         verifiedCarriedHostPorts.push({
           owner: {
             projectId: project.id,
@@ -1799,7 +1798,7 @@ async function deployComposeServicesUnlocked(
                 claim.serviceId ??
                 "service";
               logger.log(
-                `Reattached locked host port ${claim.port} to ${serviceName}:${claim.containerPort} ` +
+                `Reattached host port ${claim.port} to ${serviceName}:${claim.containerPort} ` +
                   `after Docker inspection confirmed the existing binding.\n`,
                 "info",
                 { serviceName },
@@ -2027,7 +2026,7 @@ async function deployComposeServicesUnlocked(
 
   type PreparedServiceHostPorts = {
     pinnedByContainerPort: Map<number, number>;
-    allocations: Array<Pick<AllocatedPinnedHostPort, "claim" | "previousClaim">>;
+    allocations: Array<Pick<AllocatedPinnedHostPort, "claim" | "claimWasCreated">>;
   };
   const preparedHostPortsByServiceId = new Map<string, PreparedServiceHostPorts>();
   const prepareServiceHostPorts = async (
@@ -2049,7 +2048,7 @@ async function deployComposeServicesUnlocked(
     }
 
     const pinnedByContainerPort = new Map<number, number>();
-    const allocations: Array<Pick<AllocatedPinnedHostPort, "claim" | "previousClaim">> = [];
+    const allocations: Array<Pick<AllocatedPinnedHostPort, "claim" | "claimWasCreated">> = [];
     const primaryRoutedPort = routedContainerPorts[0];
     try {
       if (
@@ -2072,16 +2071,6 @@ async function deployComposeServicesUnlocked(
               : containerPort === primaryRoutedPort
                 ? previousRow?.hostPort
                 : undefined;
-          const previousClaim = findOwnedPinnedHostPort(pinnedHostPortClaims, owner, {
-            allowLegacyContainerPort: containerPort === primaryRoutedPort,
-          });
-          const resolvedPreferred = previousClaim?.port ?? cachedPreferred ?? undefined;
-          const bindingState =
-            resolvedPreferred === undefined
-              ? undefined
-              : carriedHostPortBindingState.get(
-                  carriedHostPortProofKey(service.id, containerPort, resolvedPreferred),
-                );
           const allocation = await allocateAndReservePinnedHostPort({
             target: hostPortTarget!,
             claims: pinnedHostPortClaims,
@@ -2089,23 +2078,23 @@ async function deployComposeServicesUnlocked(
             cachedPreferred,
             allowLegacyContainerPort: containerPort === primaryRoutedPort,
             additionalAvoid: allocatedHostPorts,
-            lockPreferred: lockCarriedHostPorts ? { ownerLabel: service.name } : undefined,
-            reuseOccupiedPreferred:
-              bindingState === undefined ? undefined : bindingState === "running",
-            recoverUnavailablePreferred:
-              bindingState === "inactive" && opts.promptUser
-                ? async (port) => {
-                    throwIfDeploymentCancelled(opts.signal);
-                    await ensurePortAvailable(opts.executor!, port, logger, opts.promptUser!);
-                    throwIfDeploymentCancelled(opts.signal);
-                  }
-                : undefined,
+            // A durable claim protects allocation ownership; it does not prove
+            // that the current listener belongs to this workload. Only Docker's
+            // exact running binding may override an occupied live-port scan.
+            reuseOccupiedPreferred: (preferred) =>
+              sameTargetRedeploy &&
+              runningCarriedHostPortBindings.has(
+                carriedHostPortProofKey(service.id, containerPort, preferred),
+              ),
             allocate: (allocationOptions) => allocateHostPort(opts.executor!, allocationOptions),
           });
           allocations.push(allocation);
-          if (allocation.preferred && allocation.port !== allocation.preferred) {
+          if (allocation.preferred !== undefined && allocation.port !== allocation.preferred) {
             logger.log(
-              `Project moved hosts: ${service.name} uses ${allocation.port} instead of ${allocation.preferred}.\n`,
+              `Host port ${allocation.preferred} for ${service.name}:${containerPort} was unavailable; ` +
+                `reserved ${allocation.port} and will update managed routes during cutover.\n`,
+              "warn",
+              { serviceName: service.name },
             );
           }
           if (!allocation.scanned) {
