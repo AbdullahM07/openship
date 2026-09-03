@@ -138,3 +138,34 @@ describe("exec timeout", () => {
     expect(channel.close).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("channel retry", () => {
+  it("recovers and retries when client.exec fails with 'Unable to exec'", async () => {
+    const channel = new FakeChannel();
+    let attempts = 0;
+    const client1 = fakeClient((_cmd, cb) => {
+      attempts += 1;
+      cb(new Error("Unable to exec"), null as unknown as FakeChannel);
+    });
+    const client2 = fakeClient((_cmd, cb) => {
+      attempts += 1;
+      cb(null, channel);
+    });
+
+    connectSshClient
+      .mockResolvedValueOnce(client1)
+      .mockResolvedValueOnce(client2);
+
+    const executor = new SshExecutor(CONFIG);
+    const p = executor.exec("git --version");
+
+    await untilExec(client2);
+    channel.emit("data", Buffer.from("git version 2.55.0\n"));
+    channel.emit("exit", 0);
+    channel.emit("close", 0);
+
+    await expect(p).resolves.toBe("git version 2.55.0");
+    expect(attempts).toBe(2);
+    expect(client1.end).toHaveBeenCalled();
+  });
+});

@@ -70,6 +70,12 @@ describe("probeExec", () => {
     );
   });
 
+  it("re-throws 'Unable to exec' channel failure instead of reporting component as missing", async () => {
+    await expect(probeExec(throwing(new Error("Unable to exec")), "git --version", "test")).rejects.toThrow(
+      "Unable to exec",
+    );
+  });
+
   it("trims the output it reports", async () => {
     expect((await probeExec({ exec: async () => "git version 2.43.0\n" }, "g", "test")).output).toBe(
       "git version 2.43.0",

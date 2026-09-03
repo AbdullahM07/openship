@@ -448,11 +448,15 @@ export class SshExecutor implements CommandExecutor {
     else this.resetConnection();
   }
 
-  /** Returns true if the error is an SSH channel-open failure. */
+  /** Returns true if the error is an SSH channel-open or channel-exec failure. */
   private static isChannelError(err: unknown): boolean {
     if (!(err instanceof Error)) return false;
     const msg = err.message.toLowerCase();
-    return msg.includes("channel open failure") || msg.includes("open failed");
+    return (
+      msg.includes("channel open failure") ||
+      msg.includes("open failed") ||
+      msg.includes("unable to exec")
+    );
   }
 
   /**

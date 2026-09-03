@@ -25,6 +25,9 @@ const RETRYABLE_CONNECTION_ERROR_PATTERNS = [
   // "first redeploy fails, second click works" pattern.
   "Channel open failure",
   "open failed",
+  // ssh2 emits "Unable to exec" when the SSH server rejects an exec channel
+  // request (SSH_MSG_CHANNEL_FAILURE) on an open session channel.
+  "Unable to exec",
   // NOT "socket hang up": it is what an HTTP client reports for ANY far end that vanished
   // mid-request, including a permission-denied Docker socket and a wedged channel, neither
   // of which a fresh connection fixes. A match here makes `withExecutor` replay its whole
