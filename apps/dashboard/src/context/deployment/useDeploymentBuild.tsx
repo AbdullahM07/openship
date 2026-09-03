@@ -18,6 +18,7 @@ import { DeployCredentialModal } from "@/components/deployments/DeployCredential
 import { useServerGitHubConnectModal } from "@/components/github/ServerGitHubConnect";
 import type { DeploymentConfig, DeploymentState, DeploymentStatus, ServiceDeployStatus } from "./types";
 import { syncActiveModeSnapshot } from "./mode-config";
+import { deploymentEnvPayload } from "./env-payload";
 import {
   BUILD_PHASES,
   DEFAULT_CONFIG,
@@ -841,21 +842,14 @@ export function useDeploymentBuild(
       ensuredProjectId = projectData.project_id;
 
       // Step 2: Create deployment with config snapshot + env vars
-      const envVarsMap: Record<string, string> = {};
-      if (config.envVars && config.envVars.length > 0) {
-        for (const ev of config.envVars) {
-          if (ev.key.trim()) {
-            envVarsMap[ev.key] = ev.value;
-          }
-        }
-      }
+      const envVarsMap = deploymentEnvPayload(config.envVars);
 
       const data = await deployApi.buildAccess({
         projectId: projectData.project_id,
         branch: config.branch || undefined,
         // Folder-upload: adopt the uploaded source (workspace or staging dir).
         uploadSessionId: config.uploadSessionId || undefined,
-        envVars: Object.keys(envVarsMap).length > 0 ? envVarsMap : undefined,
+        envVars: envVarsMap,
         // "None" routing → explicit [] (no public URL). Must be [], not
         // undefined: undefined makes the backend auto-derive a free subdomain.
         publicEndpoints: !isServiceDeployment

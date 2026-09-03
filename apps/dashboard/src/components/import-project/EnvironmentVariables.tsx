@@ -26,7 +26,14 @@ import type { Dictionary } from "@/i18n";
 // a save round-trips it and the backend restores the stored secret; "show
 // values" reveals real values into a display-only overlay; editing a revealed
 // row replaces the sentinel with the typed value.
-type EnvironmentVariableRow = { sourceId?: string; key: string; value: string; visible: boolean };
+type EnvironmentVariableRow = {
+  sourceId?: string;
+  key: string;
+  value: string;
+  visible: boolean;
+  /** Saved secret whose plaintext is intentionally absent from local state. */
+  preserveValue?: boolean;
+};
 
 type EnvironmentVariableMeta = {
   source: "env-file" | "default" | "missing" | "interpolated";
@@ -180,7 +187,9 @@ const EnvironmentVariables: React.FC<EnvironmentVariablesPropsOptional> = ({
   // Keeping it here makes the eye work identically in every host.
   const [shownKeys, setShownKeys] = useState<Set<string>>(() => new Set());
   const [revealingKeys, setRevealingKeys] = useState<Set<string>>(() => new Set());
-  const maskedKeys = currentEnvVars.filter((env) => isMaskedValue(env.value)).map((env) => env.key);
+  const maskedKeys = currentEnvVars
+    .filter((env) => env.preserveValue || isMaskedValue(env.value))
+    .map((env) => env.key);
   const hasMaskedRow = maskedKeys.length > 0;
   // Every masked row shown → the header flips to "Hide values". Until then it
   // reads "Show values" and fetches whatever is still hidden, so the pair is
@@ -290,7 +299,7 @@ const EnvironmentVariables: React.FC<EnvironmentVariablesPropsOptional> = ({
     async (index: number) => {
       const target = currentEnvVars[index];
       if (!target) return;
-      if (isMaskedValue(target.value)) {
+      if (target.preserveValue || isMaskedValue(target.value)) {
         if (shownKeys.has(target.key)) hideKeys([target.key]);
         else await revealAndShow([target.key]);
         return;
@@ -314,11 +323,32 @@ const EnvironmentVariables: React.FC<EnvironmentVariablesPropsOptional> = ({
   }, [allShown, maskedKeys, hideKeys, revealAndShow]);
 
   const handleKeyChange = (index: number, value: string) => {
-    updateEnvVar(index, "key", value);
+    const row = currentEnvVars[index];
+    updateEnvVars(
+      currentEnvVars.map((env, i) =>
+        i === index
+          ? {
+              ...env,
+              key: value,
+              // A stored value belongs to its original key. Renaming the row
+              // cannot carry that secret to a different variable implicitly.
+              preserveValue: row?.key === value ? row.preserveValue : false,
+            }
+          : env,
+      ),
+    );
   };
 
   const handleValueChange = (index: number, value: string) => {
     const row = currentEnvVars[index];
+    if (row?.preserveValue) {
+      updateEnvVars(
+        currentEnvVars.map((env, i) =>
+          i === index ? { ...env, value, preserveValue: false, visible: true } : env,
+        ),
+      );
+      return;
+    }
     // Editing a REVEALED row turns it into a plaintext row, which reads visibility
     // from its own `visible` flag instead of `shownKeys` — so carry the shown state
     // over, or the value the operator is typing flips back to dots mid-keystroke in
@@ -350,7 +380,11 @@ const EnvironmentVariables: React.FC<EnvironmentVariablesPropsOptional> = ({
       for (const nextVar of parsed) {
         const existingIdx = existingMap.get(nextVar.key);
         if (existingIdx !== undefined) {
-          merged[existingIdx] = { ...merged[existingIdx], value: nextVar.value };
+          merged[existingIdx] = {
+            ...merged[existingIdx],
+            value: nextVar.value,
+            preserveValue: false,
+          };
           updated++;
         } else {
           merged.push(nextVar);
@@ -806,19 +840,25 @@ const EnvironmentVariables: React.FC<EnvironmentVariablesPropsOptional> = ({
         onClick={handlePasteZoneClick}
       >
         {currentEnvVars.map((env, index) => {
-          const resolution = getEnvResolutionState(envMeta?.[env.key], env.value, t);
+          const resolution = getEnvResolutionState(
+            envMeta?.[env.key],
+            env.preserveValue ? ENV_MASK : env.value,
+            t,
+          );
           const inputStateClass = resolution?.inputClass ?? "";
           // #336: a masked row holds only the sentinel — the real value arrives in
           // the overlay when THAT key is revealed, and its visibility lives in
           // `shownKeys`. A plaintext row (new / typed) shows its own value and keeps
           // its own `visible` flag. Masked with no reveal source wired: no eye at
           // all, since the toggle could only ever display the sentinel as text.
-          const masked = isMaskedValue(env.value);
+          const masked = Boolean(env.preserveValue) || isMaskedValue(env.value);
           const showAsText = masked ? shownKeys.has(env.key) : env.visible;
           const displayValue =
             masked && Object.hasOwn(revealedValues, env.key)
               ? revealedValues[env.key]
-              : env.value;
+              : env.preserveValue
+                ? ""
+                : env.value;
           const canToggleValue = !masked || Boolean(onReveal);
           return (
             <div key={index} data-env-index={index} className="space-y-1.5">
@@ -844,7 +884,7 @@ const EnvironmentVariables: React.FC<EnvironmentVariablesPropsOptional> = ({
                     type={showAsText ? "text" : "password"}
                     value={displayValue}
                     onChange={(e) => handleValueChange(index, e.target.value)}
-                    placeholder={ev.valuePlaceholder}
+                    placeholder={env.preserveValue ? ENV_MASK : ev.valuePlaceholder}
                     readOnly={!isEditingMode}
                     className={`w-full px-3.5 py-2.5 pe-9 border border-border/50 rounded-lg text-sm font-mono text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-2 focus:ring-primary/20 transition-all ${
                       !isEditingMode ? 'cursor-default bg-muted/20' : 'bg-muted/30'

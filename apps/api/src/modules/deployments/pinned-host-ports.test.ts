@@ -312,6 +312,21 @@ describe("pinnedHostPortsToAvoid", () => {
     );
   });
 
+  it("uses the active release hint while old and replacement claims overlap", () => {
+    const overlapping: PinnedHostPort[] = [
+      { projectId: "compose", serviceId: "api", containerPort: 3000, port: 20002 },
+      { projectId: "compose", serviceId: "api", containerPort: 3000, port: 20009 },
+    ];
+
+    expect(
+      findOwnedPinnedHostPort(
+        overlapping,
+        { projectId: "compose", serviceId: "api", containerPort: 3000 },
+        { preferredPort: 20009 },
+      )?.port,
+    ).toBe(20009);
+  });
+
   it("never treats a quarantine sentinel as reusable, even for an imported matching id", () => {
     const quarantine: PinnedHostPort[] = [
       {
@@ -505,104 +520,89 @@ describe("pinnedHostPortsToAvoid", () => {
     expect(allocation.port).toBe(20002);
   });
 
-  it("refuses a stopped container's configured port when a foreign listener occupies it", async () => {
+  it("reserves a replacement while retaining an occupied carried claim through cutover", async () => {
     const owner = { projectId: "compose", serviceId: "api", containerPort: 3000 };
-    await expect(
-      allocateAndReservePinnedHostPort({
-        target: remoteTarget,
-        claims,
-        owner,
-        reuseOccupiedPreferred: false,
-        lockPreferred: { ownerLabel: "api" },
-        allocate: async (options) => ({
-          port: pickHostPort(new Set([20002]), options),
-          scanned: true,
-        }),
-      }),
-    ).rejects.toThrow(/locked host port.*20002.*20000/);
-    expect(claimRepo.reserve).not.toHaveBeenCalled();
-  });
-
-  it("retries a locked preferred port only after explicit conflict recovery", async () => {
-    const owner = { projectId: "compose", serviceId: "api", containerPort: 3000 };
-    let occupied = true;
-    const allocate = vi.fn(async (options) => ({
-      port: pickHostPort(occupied ? new Set([20002]) : new Set(), options),
-      scanned: true,
-    }));
-    const recoverUnavailablePreferred = vi.fn(async () => {
-      occupied = false;
-    });
-
     const allocation = await allocateAndReservePinnedHostPort({
       target: remoteTarget,
       claims,
       owner,
       reuseOccupiedPreferred: false,
-      lockPreferred: { ownerLabel: "api" },
-      recoverUnavailablePreferred,
-      allocate,
+      allocate: async (options) => ({
+        port: pickHostPort(new Set([20002]), options),
+        scanned: true,
+      }),
     });
 
-    expect(allocation.port).toBe(20002);
-    expect(recoverUnavailablePreferred).toHaveBeenCalledWith(20002);
-    expect(allocate).toHaveBeenCalledTimes(2);
+    expect(allocation).toMatchObject({
+      port: 20000,
+      preferred: 20002,
+      previousClaim: expect.objectContaining({ port: 20002 }),
+      claimWasCreated: true,
+    });
     expect(claimRepo.reserve).toHaveBeenCalledTimes(1);
+    expect(claimRepo.reserve).toHaveBeenCalledWith(
+      expect.objectContaining({ ...owner, port: 20000 }),
+    );
   });
 
-  it("never offers takeover when another durable owner also claims the preferred port", async () => {
+  it("never steals a preferred port claimed by another durable owner", async () => {
     const owner = { projectId: "compose", serviceId: "api", containerPort: 3000 };
-    const recoverUnavailablePreferred = vi.fn(async () => undefined);
-    await expect(
-      allocateAndReservePinnedHostPort({
-        target: remoteTarget,
-        claims: [
-          ...claims,
-          { projectId: "foreign", serviceId: "web", containerPort: 8080, port: 20002 },
-        ],
-        owner,
-        reuseOccupiedPreferred: false,
-        lockPreferred: { ownerLabel: "api" },
-        recoverUnavailablePreferred,
-        allocate: async (options) => ({
-          port: pickHostPort(new Set([20002]), options),
-          scanned: true,
-        }),
+    const allocation = await allocateAndReservePinnedHostPort({
+      target: remoteTarget,
+      claims: [
+        ...claims.filter((claim) => claim.port !== 20002),
+        { projectId: "foreign", serviceId: "web", containerPort: 8080, port: 20002 },
+      ],
+      owner,
+      cachedPreferred: 20002,
+      reuseOccupiedPreferred: false,
+      allocate: async (options) => ({
+        port: pickHostPort(new Set([20002]), options),
+        scanned: true,
       }),
-    ).rejects.toThrow(/locked host port.*20002.*20000/);
-    expect(recoverUnavailablePreferred).not.toHaveBeenCalled();
-    expect(claimRepo.reserve).not.toHaveBeenCalled();
+    });
+
+    expect(allocation.port).toBe(20000);
+    expect(claimRepo.reserve).toHaveBeenCalledWith(
+      expect.objectContaining({ ...owner, port: 20000 }),
+    );
+    expect(claimRepo.reserve).not.toHaveBeenCalledWith(
+      expect.objectContaining({ ...owner, port: 20002 }),
+    );
   });
 
-  it("does not treat a failed port scan as proof that an inactive binding is free", async () => {
-    await expect(
-      allocateAndReservePinnedHostPort({
-        target: remoteTarget,
-        claims,
-        owner: { projectId: "compose", serviceId: "api", containerPort: 3000 },
-        reuseOccupiedPreferred: false,
-        lockPreferred: { ownerLabel: "api" },
-        allocate: async (options) => ({
-          port: pickHostPort(new Set(), options),
-          scanned: false,
-        }),
+  it("keeps the durable preference when a live scan is unavailable", async () => {
+    const allocation = await allocateAndReservePinnedHostPort({
+      target: remoteTarget,
+      claims,
+      owner: { projectId: "compose", serviceId: "api", containerPort: 3000 },
+      reuseOccupiedPreferred: false,
+      allocate: async (options) => ({
+        port: pickHostPort(new Set(), options),
+        scanned: false,
       }),
-    ).rejects.toThrow(/live port occupancy could not be verified/);
-    expect(claimRepo.reserve).not.toHaveBeenCalled();
+    });
+
+    expect(allocation).toMatchObject({ port: 20002, scanned: false, claimWasCreated: false });
   });
 
-  it("rejects a same-target legacy-cache renumber before reserving a new claim", async () => {
-    await expect(
-      allocateAndReservePinnedHostPort({
-        target: localTarget,
-        claims: [],
-        owner: { projectId: "legacy", serviceId: "api", containerPort: 3000 },
-        cachedPreferred: 20011,
-        lockPreferred: { ownerLabel: "api" },
-        allocate: async () => ({ port: 20012, scanned: true }),
-      }),
-    ).rejects.toThrow(/locked host port.*20011.*20012/);
-    expect(claimRepo.reserve).not.toHaveBeenCalled();
+  it("relocates an unavailable legacy cache on the same target", async () => {
+    const allocation = await allocateAndReservePinnedHostPort({
+      target: localTarget,
+      claims: [],
+      owner: { projectId: "legacy", serviceId: "api", containerPort: 3000 },
+      cachedPreferred: 20011,
+      allocate: async () => ({ port: 20012, scanned: true }),
+    });
+
+    expect(allocation).toMatchObject({
+      port: 20012,
+      preferred: 20011,
+      claimWasCreated: true,
+    });
+    expect(claimRepo.reserve).toHaveBeenCalledWith(
+      expect.objectContaining({ targetKey: "local", port: 20012 }),
+    );
   });
 
   it("permits renumbering when the caller is migrating to another target", async () => {
@@ -656,9 +656,18 @@ describe("pinnedHostPortsToAvoid", () => {
       owner: { projectId: "old", serviceId: "api", containerPort: 3000 },
       allocate: async () => ({ port: 20011, scanned: true }),
     });
+    const replacement = await allocateAndReservePinnedHostPort({
+      target: localTarget,
+      claims: [{ projectId: "moving", serviceId: "api", containerPort: 3000, port: 20012 }],
+      owner: { projectId: "moving", serviceId: "api", containerPort: 3000 },
+      reuseOccupiedPreferred: false,
+      allocate: async () => ({ port: 20013, scanned: true }),
+    });
 
-    await expect(releaseNewPinnedHostPortClaims(localTarget, [fresh, carried])).resolves.toBe(1);
-    expect(claimRepo.release).toHaveBeenCalledTimes(1);
+    await expect(
+      releaseNewPinnedHostPortClaims(localTarget, [fresh, carried, replacement]),
+    ).resolves.toBe(2);
+    expect(claimRepo.release).toHaveBeenCalledTimes(2);
     expect(claimRepo.release).toHaveBeenCalledWith(
       expect.objectContaining({
         targetKey: "local",
@@ -666,6 +675,15 @@ describe("pinnedHostPortsToAvoid", () => {
         serviceId: "api",
         containerPort: 3000,
         port: 20010,
+      }),
+    );
+    expect(claimRepo.release).toHaveBeenCalledWith(
+      expect.objectContaining({
+        targetKey: "local",
+        projectId: "moving",
+        serviceId: "api",
+        containerPort: 3000,
+        port: 20013,
       }),
     );
   });
@@ -805,6 +823,39 @@ describe("pinnedHostPortsToAvoid", () => {
     );
     expect(claimRepo.releaseQuarantine).not.toHaveBeenCalledWith(
       expect.objectContaining({ port: 20020 }),
+    );
+  });
+
+  it("retains an owner's old claim until the edge stops routing it", async () => {
+    const projectId = "project-a";
+    const owner = { projectId, serviceId: "api", containerPort: 3000 };
+    const oldClaim = storedClaim("old", "local", { ...owner, port: 20010 });
+    const replacement = storedClaim("replacement", "local", { ...owner, port: 20011 });
+    claimRepo.list.mockResolvedValue([oldClaim, replacement]);
+
+    const first = await convergeTargetHostPortClaimsUnlocked({
+      target: localTarget,
+      projectId,
+      desiredPublishes: [{ serviceId: "api", containerPort: 3000, hostPort: 20011 }],
+      edgeProxy: {
+        listLoopbackUpstreamPortsStrict: async () => new Set([20010, 20011]),
+      },
+    });
+
+    expect(first.retained.map((claim) => claim.id)).toEqual(["old", "replacement"]);
+    expect(claimRepo.release).not.toHaveBeenCalled();
+
+    claimRepo.release.mockClear();
+    const second = await convergeTargetHostPortClaimsUnlocked({
+      target: localTarget,
+      projectId,
+      desiredPublishes: [{ serviceId: "api", containerPort: 3000, hostPort: 20011 }],
+      edgeProxy: { listLoopbackUpstreamPortsStrict: async () => new Set([20011]) },
+    });
+
+    expect(second.retained.map((claim) => claim.id)).toEqual(["replacement"]);
+    expect(claimRepo.release).toHaveBeenCalledWith(
+      expect.objectContaining({ ...owner, port: 20010 }),
     );
   });
 

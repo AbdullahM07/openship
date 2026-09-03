@@ -1952,7 +1952,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
 
   let pinnedHostPort: number | undefined;
   const attemptedHostPortAllocations: Array<
-    Pick<AllocatedPinnedHostPort, "claim" | "previousClaim">
+    Pick<AllocatedPinnedHostPort, "claim" | "previousClaim" | "claimWasCreated">
   > = [];
   const needsHostLoopbackClaim =
     usesHostLoopback && !isStaticFileServe && !isWorker && phase.effectiveTarget !== "cloud";
@@ -2037,7 +2037,11 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
               containerPort: exact ? exact.containerPort : legacy ? legacy.containerPort : port,
               port,
             });
-            attemptedHostPortAllocations.push({ claim, previousClaim: exact ?? legacy });
+            attemptedHostPortAllocations.push({
+              claim,
+              previousClaim: exact ?? legacy,
+              claimWasCreated: !exact && !legacy,
+            });
           }
         })();
 

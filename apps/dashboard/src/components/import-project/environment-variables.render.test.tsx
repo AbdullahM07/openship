@@ -87,6 +87,16 @@ describe("EnvironmentVariables reveal affordance", () => {
     expect(eyeCount(render({ envVars: MASKED }))).toBe(0);
   });
 
+  it("renders a preserved project secret as set without putting plaintext in state", () => {
+    const html = render({
+      envVars: [
+        { key: "AUTH_SECRET", value: "", visible: true, preserveValue: true },
+      ],
+    });
+    expect(html).toContain('placeholder="••••••••"');
+    expect(eyeCount(html)).toBe(0);
+  });
+
   it("gives a plaintext row an eye with or without a source", () => {
     // This asymmetry is what the operator saw as "some rows have no show button": an
     // empty or typed value isn't masked, so it kept its eye while masked neighbours in
