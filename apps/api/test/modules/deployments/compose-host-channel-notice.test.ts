@@ -965,6 +965,88 @@ describe("compose deploy — host channel unavailable", () => {
     expect(lines.some((l) => l.message.includes("Host operations are unavailable"))).toBe(false);
   });
 
+  it("cancels a pre-activation host wait inside the executor scope and leaves a following deploy unblocked", async () => {
+    const runtime = startingRuntime();
+    const deployServiceWorkload = vi.mocked(runtime.deployServiceWorkload);
+    const destroy = vi.mocked(runtime.destroy);
+    let activeSignal: AbortSignal | undefined;
+    let channelClosed = false;
+    const readFile = vi.fn(() => {
+      const signal = activeSignal;
+      if (!signal) throw new Error("host operation escaped its deployment cancellation scope");
+      return new Promise<string>((_resolve, reject) => {
+        const cancel = () => {
+          // Model the real executor invariant: settle only after channel close.
+          channelClosed = true;
+          const error = new Error("SSH preflight cancelled after channel close");
+          error.name = "AbortError";
+          reject(error);
+        };
+        signal.addEventListener("abort", cancel, { once: true });
+        if (signal.aborted) cancel();
+      });
+    });
+    const executor = {
+      runWithAbortSignal: async <T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> => {
+        activeSignal = signal;
+        try {
+          return await fn();
+        } finally {
+          if (activeSignal === signal) activeSignal = undefined;
+        }
+      },
+      readFile,
+    } as unknown as CommandExecutor;
+    const secondReached = new Error("following deployment reached target preflight");
+    const system = {
+      ensureFeature: vi
+        .fn()
+        .mockImplementationOnce(() => readFile())
+        .mockRejectedValueOnce(secondReached),
+    };
+    const firstController = new AbortController();
+    const { logger } = recordingLogger();
+    const first = deployComposeServices(
+      { ...project, activeDeploymentId: "d-old" } as never,
+      dep,
+      runtime,
+      logger,
+      {
+        executor,
+        hostPortTarget: localHostPortTarget,
+        system: system as never,
+        signal: firstController.signal,
+      },
+    );
+    await vi.waitFor(() => expect(readFile).toHaveBeenCalledTimes(1));
+
+    firstController.abort();
+
+    await expect(first).rejects.toMatchObject({ name: "AbortError" });
+    expect(channelClosed).toBe(true);
+    expect(deployServiceWorkload).not.toHaveBeenCalled();
+    expect(destroy).not.toHaveBeenCalled();
+    expect(h.upsertServiceDeployment).not.toHaveBeenCalled();
+
+    await expect(
+      deployComposeServices(
+        { ...project, activeDeploymentId: "d-old" } as never,
+        { ...dep, id: "d2" } as never,
+        runtime,
+        logger,
+        {
+          executor,
+          hostPortTarget: localHostPortTarget,
+          system: system as never,
+          signal: new AbortController().signal,
+        },
+      ),
+    ).rejects.toBe(secondReached);
+    expect(system.ensureFeature).toHaveBeenCalledTimes(2);
+    expect(deployServiceWorkload).not.toHaveBeenCalled();
+    expect(destroy).not.toHaveBeenCalled();
+  });
+
   it("fails before container activation when a loopback target has no executor", async () => {
     const runtime = haltingRuntime();
     const ensureServiceGroup = vi.mocked(runtime.ensureServiceGroup);

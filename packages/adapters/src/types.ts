@@ -834,6 +834,20 @@ export interface ExecOnly {
  */
 export interface CommandExecutor extends ExecOnly {
   /**
+   * Bind an AbortSignal to command/file operations started by `fn`.
+   *
+   * Remote executors use an async-local scope rather than mutable instance
+   * state: one deployment may be cancelled while another caller legitimately
+   * shares the pooled connection.  Implementations must not resolve the scope
+   * until an operation which already started has quiesced its transport.  That
+   * invariant lets provisioning locks release safely after cancellation.
+   *
+   * Optional for compatibility with lightweight/custom executors. Callers must
+   * still pass explicit signals to APIs that expose one.
+   */
+  runWithAbortSignal?<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T>;
+
+  /**
    * Run a command with real-time log streaming.
    * Resolves when the command exits - the log callback fires for each line.
    *

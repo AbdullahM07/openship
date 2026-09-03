@@ -932,12 +932,19 @@ export async function deployComposeServices(
   logger: BuildLogger,
   opts?: ComposeDeployOptions,
 ): Promise<ComposeDeployResult> {
+  const runUnlocked = (): Promise<ComposeDeployResult> => {
+    throwIfDeploymentCancelled(opts?.signal);
+    const run = () => deployComposeServicesUnlocked(project, dep, runtime, logger, opts);
+    return opts?.signal && opts.executor?.runWithAbortSignal
+      ? opts.executor.runWithAbortSignal(opts.signal, run)
+      : run();
+  };
   const needsHostPortLock = usesHostLoopbackUpstream(
     resolveRouteStrategy(project.routeStrategy),
     runtime,
   );
   if (!needsHostPortLock) {
-    return deployComposeServicesUnlocked(project, dep, runtime, logger, opts);
+    return runUnlocked();
   }
   if (!opts?.executor) {
     throw new Error("Cannot deploy loopback-routed services without a physical target executor");
@@ -948,7 +955,7 @@ export async function deployComposeServices(
   }
   return withHostPortTargetLock(
     target,
-    () => deployComposeServicesUnlocked(project, dep, runtime, logger, opts),
+    runUnlocked,
     opts?.signal,
   );
 }
@@ -1043,6 +1050,8 @@ async function deployComposeServicesUnlocked(
     resources: opts?.resources,
   });
   logger.log(`Service group ready for ${project.slug}.\n`);
+  throwIfDeploymentCancelled(opts?.signal);
+  logger.log("Loading deployment preflight state...\n");
 
   // The project's existing domain rows, keyed by hostname. This drives per-host
   // SSL gating in BOTH the toolchain preflight (below) and the per-service route
@@ -1058,6 +1067,7 @@ async function deployComposeServicesUnlocked(
         (await repos.domain.listByProject(project.id)).map((d) => [d.hostname.toLowerCase(), d]),
       )
     : new Map();
+  throwIfDeploymentCancelled(opts?.signal);
 
   // Ensure the server has the components this deploy needs — ONCE, before the
   // fan-out — mirroring the single-app deploy preflight (build-pipeline.ts
@@ -1068,6 +1078,7 @@ async function deployComposeServicesUnlocked(
   // host-port check: compose services are reached through openresty by hostname,
   // not by binding host ports the way a bare process does.)
   if (opts?.system) {
+    logger.log("Checking target prerequisites and edge routing...\n");
     const systemLog = (entry: { message: string; level: "info" | "warn" | "error" }) => {
       logger.log(`${entry.message}\n`, entry.level);
     };
@@ -1143,6 +1154,9 @@ async function deployComposeServicesUnlocked(
       );
     }
   }
+
+  throwIfDeploymentCancelled(opts?.signal);
+  logger.log("Target preflight ready. Inspecting the active release...\n");
 
   // Service-scoped rows are loaded separately below and must not leak into the
   // project layer or another service.
