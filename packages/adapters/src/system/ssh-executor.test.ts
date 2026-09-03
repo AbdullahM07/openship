@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 
 /**
  * `streamExec`'s abort path is the transport half of the server-logs fix: a disconnected
@@ -32,10 +32,15 @@ class FakeChannel extends EventEmitter {
 }
 
 function fakeClient(onExec: (cmd: string, cb: (err: Error | null, ch: FakeChannel) => void) => void) {
-  return {
-    on: vi.fn(),
-    exec: vi.fn(onExec),
+  const client = new EventEmitter() as EventEmitter & {
+    exec: ReturnType<typeof vi.fn>;
+    end: ReturnType<typeof vi.fn>;
+    destroy: ReturnType<typeof vi.fn>;
   };
+  client.exec = vi.fn(onExec);
+  client.end = vi.fn(() => client.emit("close"));
+  client.destroy = vi.fn(() => client.emit("close"));
+  return client;
 }
 
 const CONFIG = { host: "h", username: "u", privateKey: "k" };
@@ -50,6 +55,10 @@ const untilExec = (client: ReturnType<typeof fakeClient>) =>
 
 beforeEach(() => {
   connectSshClient.mockReset();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe("streamExec abort", () => {
@@ -106,5 +115,26 @@ describe("streamExec abort", () => {
     channel.emit("close", 0);
 
     await expect(p).resolves.toEqual({ code: 0, output: "hi\n" });
+  });
+});
+
+describe("exec timeout", () => {
+  it("closes the remote channel before rejecting", async () => {
+    vi.useFakeTimers();
+    const channel = new FakeChannel();
+    const client = fakeClient((_cmd, cb) => cb(null, channel));
+    connectSshClient.mockResolvedValue(client);
+    const executor = new SshExecutor(CONFIG);
+    const pending = executor.exec("sleep 999", { timeout: 100 });
+
+    for (let i = 0; i < 8 && client.exec.mock.calls.length === 0; i += 1) {
+      await Promise.resolve();
+    }
+    expect(client.exec).toHaveBeenCalledTimes(1);
+    const rejection = expect(pending).rejects.toThrow("Command timed out after 100ms");
+    await vi.advanceTimersByTimeAsync(100);
+
+    await rejection;
+    expect(channel.close).toHaveBeenCalledTimes(1);
   });
 });
