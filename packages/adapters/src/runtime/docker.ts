@@ -133,6 +133,7 @@ import {
   parseLogLevel,
   sq,
   assembleGitClone,
+  gitShellCommand,
 } from "./build-pipeline";
 import { materializeGitSsh, shellGitSshWriter, type GitSshMaterial } from "./git-ssh-material";
 import { isArtifactPathRef, removeManagedArtifact } from "./managed-artifact";
@@ -1597,17 +1598,14 @@ export class DockerRuntime implements RuntimeAdapter {
     }
 
     // Centralized clone assembly (token / relay / ssh / ambient) — see git-clone.ts.
-    const {
-      cloneUrl,
-      gitEnv: GIT_ENV,
-      credFlag: CRED,
-    } = assembleGitClone({
+    const gitInvocation = assembleGitClone({
       repoUrl: config.repoUrl,
       gitToken: config.gitToken,
       gitCredentialHelperPath: config.gitCredentialHelperPath,
       ssh: sshMaterial,
       ambient: config.gitAmbient,
     });
+    const { cloneUrl, credFlag: CRED } = gitInvocation;
     const dir = sq(remoteContextDir);
 
     const authLabel = config.gitSsh
@@ -1620,33 +1618,56 @@ export class DockerRuntime implements RuntimeAdapter {
     log.log(`Cloning ${config.repoUrl} on the server → ${remoteContextDir} (${authLabel})...\n`);
     await executor.exec(`rm -rf ${dir} && mkdir -p ${dir}`);
 
-    const run = async (cmd: string) => {
+    const run = async (operation: "clone" | "fetch" | "checkout", cmd: string) => {
       const { code } = await executor.streamExec(cmd, (entry) =>
         log.log(entry.message, parseLogLevel(entry.message)),
       );
-      if (code !== 0) throw new Error(`git clone on server exited with code ${code}`);
+      if (code !== 0) throw new Error(`git ${operation} on server exited with code ${code}`);
     };
 
     try {
       if (config.commitSha) {
-        try {
-          await run(
-            `${GIT_ENV} git ${CRED} clone --progress --depth 50 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${dir} && ` +
-              `cd ${dir} && git ${CRED} -c advice.detachedHead=false checkout ${sq(config.commitSha)}`,
+        // Clone and commit selection are deliberately separate. A network/auth
+        // failure means no repository exists and must surface as-is; treating
+        // every clone failure as a shallow-history miss produced the confusing
+        // "not a git repository" follow-up seen in redeploy logs.
+        await run(
+          "clone",
+          gitShellCommand(
+            gitInvocation,
+            `clone --progress --depth 50 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${dir}`,
+          ),
+        );
+        const commitPresent = await executor
+          .exec(`cd ${dir} && git ${CRED} cat-file -e ${sq(`${config.commitSha}^{commit}`)}`)
+          .then(
+            () => true,
+            () => false,
           );
-        } catch {
+        if (!commitPresent) {
           log.log(
             `Commit ${config.commitSha} not in the shallow clone; unshallowing and retrying.\n`,
             "warn",
           );
           await run(
-            `cd ${dir} && ${GIT_ENV} git ${CRED} fetch --progress --unshallow && ` +
-              `git ${CRED} -c advice.detachedHead=false checkout ${sq(config.commitSha)}`,
+            "fetch",
+            `cd ${dir} && ${gitShellCommand(gitInvocation, "fetch --progress --unshallow")}`,
           );
         }
+        await run(
+          "checkout",
+          `cd ${dir} && ${gitShellCommand(
+            gitInvocation,
+            `-c advice.detachedHead=false checkout ${sq(config.commitSha)}`,
+          )}`,
+        );
       } else {
         await run(
-          `${GIT_ENV} git ${CRED} clone --progress --depth 1 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${dir}`,
+          "clone",
+          gitShellCommand(
+            gitInvocation,
+            `clone --progress --depth 1 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${dir}`,
+          ),
         );
       }
       // Never ship .git into the build image.
