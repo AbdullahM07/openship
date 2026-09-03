@@ -159,6 +159,41 @@ describe("host-port claims", () => {
     expect(await fixture.repo.listHostPortClaims("server:srv-a")).toHaveLength(1);
   });
 
+  it("atomically replaces quarantine when live ownership is verified", async () => {
+    const quarantined = await fixture.repo.reserveQuarantinedHostPortClaim({
+      targetKey: "local",
+      port: 20_000,
+    });
+
+    const replaced = await fixture.repo.replaceQuarantinedHostPortClaim(claim());
+
+    expect(replaced).toMatchObject({
+      id: quarantined.id,
+      targetKey: "local",
+      port: 20_000,
+      projectId: "project-a",
+      serviceId: null,
+      containerPort: 3_000,
+    });
+    expect(await fixture.repo.listHostPortClaims("local")).toEqual([replaced]);
+  });
+
+  it("does not replace quarantine when that workload already owns another port", async () => {
+    await fixture.repo.reserveQuarantinedHostPortClaim({ targetKey: "local", port: 20_000 });
+    await fixture.repo.reserveHostPortClaim(claim({ port: 20_001 }));
+
+    await expect(fixture.repo.replaceQuarantinedHostPortClaim(claim())).rejects.toMatchObject({
+      code: "HOST_PORT_CLAIM_CONFLICT",
+      conflict: "owner",
+    } satisfies Partial<HostPortClaimConflictError>);
+    expect(await fixture.repo.listHostPortClaims("local")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ port: 20_000, projectId: QUARANTINE_OWNER }),
+        expect.objectContaining({ port: 20_001, projectId: "project-a" }),
+      ]),
+    );
+  });
+
   it("rejects another owner for the same target and port but permits another target", async () => {
     await fixture.repo.reserveHostPortClaim(claim());
 

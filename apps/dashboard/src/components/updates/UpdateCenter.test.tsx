@@ -8,13 +8,13 @@ vi.mock("./useUpdates", () => ({
   useUpdates: () => ({
     state: {
       currentVersion: "0.6.9",
-      latestVersion: "0.6.10",
+      latestVersion: "0.7.0",
       updateAvailable: true,
       advisories: [],
       changelogUrl: "https://openship.io/changelog",
       latestChangelogUrl: "https://openship.io/changelog/v0-6-10",
     },
-    latest: { version: "0.6.10", tag: "v0.6.10", notes: "newer notes" },
+    latest: { version: "0.7.0", tag: "v0.7.0", notes: "newer notes" },
     muted: false,
     desktop: false,
     mode: "selfhosted",

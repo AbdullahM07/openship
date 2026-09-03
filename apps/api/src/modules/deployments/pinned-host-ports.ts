@@ -178,6 +178,7 @@ export async function prepareTargetPinnedHostPorts(input: {
     const conflictingPortOwner = claims.some(
       (claim) =>
         claim.port === candidate.hostPort &&
+        !isQuarantineClaim(claim) &&
         !(
           claim.projectId === candidate.owner.projectId &&
           claim.serviceId === candidate.owner.serviceId &&
@@ -188,12 +189,31 @@ export async function prepareTargetPinnedHostPorts(input: {
       continue;
     }
 
-    const claim = await reserveTargetPinnedHostPort(input.target, {
+    const identity = {
       ...candidate.owner,
       port: candidate.hostPort,
-    });
-    claims = [...claims, claim];
-    canonicalClaims.push(claim);
+    };
+    const canonicalQuarantine = canonicalClaims.find(
+      (claim) => claim.port === candidate.hostPort && isQuarantineClaim(claim),
+    );
+    const claim = canonicalQuarantine
+      ? ((await repos.hostPortClaim.replaceQuarantinedHostPortClaim({
+          targetKey: input.target.targetKey,
+          ...identity,
+        })) ?? (await reserveTargetPinnedHostPort(input.target, identity)))
+      : await reserveTargetPinnedHostPort(input.target, identity);
+    claims = [
+      ...claims.filter(
+        (current) =>
+          !(current.targetKey === input.target.targetKey && current.port === candidate.hostPort),
+      ),
+      claim,
+    ];
+    const canonicalIndex = canonicalClaims.findIndex(
+      (current) => current.port === candidate.hostPort,
+    );
+    if (canonicalIndex >= 0) canonicalClaims.splice(canonicalIndex, 1, claim);
+    else canonicalClaims.push(claim);
     input.onCarriedHostPortReconciled?.(claim);
   }
 
@@ -524,15 +544,11 @@ export async function allocateAndReservePinnedHostPort(
       ? ownsReusablePinnedHostPort(input.claims, reusable) && !avoid.has(reusable.port)
       : false,
   });
-  if (
-    input.lockPreferred &&
-    preferred !== undefined &&
-    allocation.port !== preferred
-  ) {
+  if (input.lockPreferred && preferred !== undefined && allocation.port !== preferred) {
     throw new Error(
       `Refusing to change the locked host port for ${input.lockPreferred.ownerLabel} from ` +
         `${preferred} to ${allocation.port} during a same-server redeploy. ` +
-        `The existing workload and routes were left unchanged.`,
+        `Preflight could not prove that the existing binding was safely reusable.`,
     );
   }
   const claim = await reserveTargetPinnedHostPort(input.target, {

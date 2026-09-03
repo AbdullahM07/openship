@@ -1,7 +1,7 @@
 /**
  * Issues HTTP handlers — the org-wide "what is broken" surface.
  *
- * Three handlers, all thin: the aggregator owns every decision (which sources the
+ * These handlers stay thin: the aggregator owns every decision (which sources the
  * caller may see, how severity ranks, what the fix is), so these only parse a query
  * param and shape the envelope. Rescan is the one that acts, and it acts by firing
  * jobs that already exist rather than probing anything itself.
@@ -9,12 +9,16 @@
 
 import type { Context } from "hono";
 import { getRequestContext } from "../../lib/request-context";
-import { SYSTEM_JOB_BY_KEY } from "../jobs/job.registry";
-import { runJobNow } from "../jobs/job.service";
+import { runJobNow, systemJobAvailability } from "../jobs/job.service";
 import { listOrganizationIssues } from "./issues.service";
-import { listWorkloadHealthSnapshots } from "../monitoring/health-watch";
+import {
+  getCurrentHealthScan,
+  listWorkloadHealthSnapshots,
+  runCurrentHealthScan,
+} from "../monitoring/health-watch";
 import { repos } from "@repo/db";
 import { env } from "../../config/env";
+import { getPlatform } from "@repo/adapters";
 
 /** GET /api/issues?status=open|resolved — every issue in the caller's org. */
 export async function listIssues(c: Context) {
@@ -46,6 +50,8 @@ export async function issuesSummary(c: Context) {
  * monitoring load. */
 export async function healthSnapshot(c: Context) {
   const ctx = getRequestContext(c);
+  const currentHealthAvailable = getPlatform().target !== "cloud";
+  const healthWatchAvailable = systemJobAvailability("services:health-watch") === "available";
   const [rows, job, servers] = await Promise.all([
     Promise.resolve(listWorkloadHealthSnapshots(ctx.organizationId)),
     repos.job.findByKey("services:health-watch"),
@@ -57,13 +63,28 @@ export async function healthSnapshot(c: Context) {
       ...row,
       serverName: row.serverId ? (serverNames.get(row.serverId) ?? row.serverId) : "This server",
     })),
-    watching: job?.enabled ?? false,
+    watching: healthWatchAvailable && (job?.enabled ?? false),
+    capabilities: {
+      current: currentHealthAvailable,
+      continuous: healthWatchAvailable,
+    },
+    currentScan: getCurrentHealthScan(ctx.organizationId),
     watcher: {
       key: "services:health-watch",
       schedule: job?.cronExpression ?? null,
-      eventsEnabled: !env.OPENSHIP_DISABLE_CONTAINER_EVENTS,
+      available: healthWatchAvailable,
+      eventsEnabled: healthWatchAvailable && !env.OPENSHIP_DISABLE_CONTAINER_EVENTS,
     },
   });
+}
+
+/** POST /api/issues/health/scan — one org-scoped observation pass. This calls
+ * the health watch's own scanner in snapshot-only mode; it never creates a job,
+ * incident, notification, or event subscription. */
+export async function scanCurrentHealth(c: Context) {
+  const ctx = getRequestContext(c);
+  const result = await runCurrentHealthScan(ctx.organizationId);
+  return c.json({ data: result });
 }
 
 /**
@@ -120,10 +141,7 @@ export async function rescanIssues(c: Context) {
   // puts on its own run-now, rather than a second cloud check here.
   if (activeRescan?.status === "running") return c.json({ data: activeRescan }, 202);
 
-  const available = RESCAN_JOBS.filter((key) => {
-    const def = SYSTEM_JOB_BY_KEY.get(key);
-    return !def?.available || def.available();
-  });
+  const available = RESCAN_JOBS.filter((key) => systemJobAvailability(key) === "available");
   const skipped = RESCAN_JOBS.filter((key) => !available.includes(key));
 
   activeRescan = {

@@ -53,6 +53,7 @@ import type { PortProbeExecutor } from "../system/port-listen";
 import { PassThrough, Writable, type Readable } from "node:stream";
 import { relative, sep } from "node:path";
 import { resolveDockerBuildArgs } from "./docker-build-args";
+import { dockerPublishedPortInfo } from "./docker-container-info";
 
 /**
  * Detect "not found" errors from the Docker SDK (dockerode). The daemon
@@ -802,13 +803,6 @@ function extractNetworkInfo(data: { NetworkSettings?: any; HostConfig?: any }): 
       break;
     }
   }
-  // Keyed by CONTAINER port, because that is what a caller choosing a proxy target
-  // actually knows. The scalar below is the first binding, kept for the callers that
-  // only persist one number (`service_deployment.host_port`) — it is arbitrary for a
-  // multi-port container, and reading it for a SPECIFIC port is how a route ends up
-  // dialing a different app.
-  const hostPortByContainerPort: Record<number, number> = {};
-  let hostPort: number | undefined;
   const liveBindings = (data.NetworkSettings?.Ports ?? {}) as Record<
     string,
     Array<{ HostIp?: string; HostPort?: string }> | null
@@ -822,48 +816,27 @@ function extractNetworkInfo(data: { NetworkSettings?: any; HostConfig?: any }): 
   // it has a concrete binding and otherwise fall back per key to HostConfig. A
   // stopped app must keep every routed reservation; losing these mappings is what
   // allows its old vhost port to be handed to another project.
+  const publishedPorts: DockerPortBinding[] = [];
   for (const key of new Set([...Object.keys(liveBindings), ...Object.keys(configuredBindings)])) {
     const [containerRaw, protocol = "tcp"] = key.split("/");
-    if (protocol.toLowerCase() !== "tcp") continue;
     const containerPort = Number(containerRaw);
-    if (!Number.isSafeInteger(containerPort) || containerPort < 1 || containerPort > 65_535) {
-      continue;
-    }
     const live = liveBindings[key];
     const bindings =
       live && live.some((binding) => binding?.HostPort) ? live : configuredBindings[key];
-    const candidates = (bindings ?? [])
-      .map((binding, index) => {
-        const port = Number(binding?.HostPort);
-        if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) return null;
-        const ip = binding?.HostIp?.trim().replace(/^\[|\]$/g, "") ?? "";
-        // A container can retain the operator's public publish AND Openship's
-        // loopback publish for one container port. Routes dial the loopback one,
-        // so Docker array order must not decide which reservation we recover.
-        const priority =
-          ip === "127.0.0.1" || ip === "::1"
-            ? 3
-            : /^127(?:\.\d{1,3}){3}$/.test(ip)
-              ? 2
-              : ip && ip !== "0.0.0.0" && ip !== "::"
-                ? 1
-                : 0;
-        return { index, port, priority };
-      })
-      .filter((candidate): candidate is { index: number; port: number; priority: number } =>
-        Boolean(candidate),
-      )
-      .sort((left, right) => right.priority - left.priority || left.index - right.index);
-    const selected = candidates[0]?.port;
-    if (selected !== undefined) {
-      hostPortByContainerPort[containerPort] = selected;
-      hostPort ??= selected;
+    for (const binding of bindings ?? []) {
+      publishedPorts.push({
+        privatePort: containerPort,
+        publicPort: Number(binding?.HostPort),
+        type: protocol,
+        ...(binding?.HostIp ? { ip: binding.HostIp } : {}),
+      });
     }
   }
+  const { hostPort, hostPortByContainerPort } = dockerPublishedPortInfo(publishedPorts);
   return {
     ip,
     hostPort,
-    ...(Object.keys(hostPortByContainerPort).length ? { hostPortByContainerPort } : {}),
+    ...(hostPortByContainerPort ? { hostPortByContainerPort } : {}),
   };
 }
 

@@ -6,16 +6,20 @@
  * config + run output are not readable across orgs (only server-admins of the
  * job's target servers; builtins stay member-visible).
  */
-import { describe, it, expect, beforeAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterAll } from "vitest";
+import { initPlatform, resetPlatform } from "@repo/adapters";
 import { makeApp, seedOwner, seedServer, resetJobs, installFakeRunner, req, db, schema, repos } from "./_harness";
 
 const app = makeApp();
+const runner = installFakeRunner();
 
-beforeAll(() => {
-  installFakeRunner();
+beforeAll(async () => {
+  await initPlatform({ target: "selfhosted", runtime: "docker" });
 });
+afterAll(() => resetPlatform());
 beforeEach(async () => {
   await resetJobs();
+  runner.recurring.clear();
 });
 
 describe("jobs HTTP — auth + CRUD", () => {
@@ -315,6 +319,85 @@ describe("jobs HTTP — fix #2: cross-org write isolation", () => {
       ).status,
     ).toBe(200);
     expect((await repos.job.findByKey("jobs:oneshot"))?.enabled).toBe(false);
+  });
+
+  it("self-heals a missing registered system job and keeps one row + schedule", async () => {
+    const instanceAdmin = await seedOwner({ instanceAdmin: true });
+    const path = "/services%3Ahealth-watch";
+
+    // Exercise the same boot/request race that produced `Job not found`: both
+    // requests see no row and converge through the registry-backed upsert.
+    const results = await Promise.all([
+      req(app, "PATCH", path, { auth: instanceAdmin.auth, body: { enabled: true } }),
+      req(app, "PATCH", path, { auth: instanceAdmin.auth, body: { enabled: true } }),
+    ]);
+    expect(results.map((result) => result.status)).toEqual([200, 200]);
+
+    const matchingRows = (await repos.job.listAll()).filter(
+      (row) => row.key === "services:health-watch",
+    );
+    expect(matchingRows).toHaveLength(1);
+    expect(matchingRows[0]).toMatchObject({
+      kind: "system",
+      actionType: "builtin",
+      label: "Container health watch",
+      cronExpression: "* * * * *",
+      enabled: true,
+    });
+    expect([...runner.recurring.keys()].filter((key) => key === "services:health-watch")).toHaveLength(1);
+
+    // A later click is idempotent too: no second definition and no second timer.
+    expect((await req(app, "PATCH", path, {
+      auth: instanceAdmin.auth,
+      body: { enabled: true },
+    })).status).toBe(200);
+    expect((await repos.job.listAll()).filter((row) => row.key === "services:health-watch")).toHaveLength(1);
+    expect([...runner.recurring.keys()].filter((key) => key === "services:health-watch")).toHaveLength(1);
+
+    // The registration is the registry's real health-watch callback, wrapped by
+    // the normal job-run recorder—not a second Health-tab implementation.
+    await runner.tick("services:health-watch");
+    expect(await repos.jobRun.listRecent({ jobId: "services:health-watch", limit: 5 })).toMatchObject([
+      { status: "success", trigger: "schedule", kind: "system" },
+    ]);
+  });
+
+  it("authorizes a missing registered system job before creating it", async () => {
+    const orgOwner = await seedOwner();
+    const denied = await req(app, "PATCH", "/services%3Ahealth-watch", {
+      auth: orgOwner.auth,
+      body: { enabled: true },
+    });
+
+    expect(denied.status).toBe(403);
+    expect(denied.body.error).toBe("Requires an instance administrator");
+    expect(await repos.job.findByKey("services:health-watch")).toBeNull();
+    expect(runner.recurring.has("services:health-watch")).toBe(false);
+  });
+
+  it("keeps operator settings when concurrent system-job ensures converge", async () => {
+    const definition = {
+      key: "services:health-watch",
+      label: "Container health watch",
+      defaultCron: "* * * * *",
+    };
+    await repos.job.upsertSystem(definition);
+    await repos.job.update(definition.key, {
+      enabled: false,
+      cronExpression: "*/7 * * * *",
+    });
+
+    await Promise.all([
+      repos.job.upsertSystem(definition),
+      repos.job.upsertSystem(definition),
+      repos.job.upsertSystem(definition),
+    ]);
+
+    expect((await repos.job.listAll()).filter((row) => row.key === definition.key)).toHaveLength(1);
+    expect(await repos.job.findByKey(definition.key)).toMatchObject({
+      enabled: false,
+      cronExpression: "*/7 * * * *",
+    });
   });
 
   it("an unknown key is 404 on both write verbs", async () => {

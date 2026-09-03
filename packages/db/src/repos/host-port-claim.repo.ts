@@ -6,6 +6,7 @@ import { hostPortClaim } from "../schema/host-port-claim";
 export type HostPortClaim = typeof hostPortClaim.$inferSelect;
 export type NewHostPortClaim = typeof hostPortClaim.$inferInsert;
 export type HostPortTargetKey = "local" | `host:${string}` | `server:${string}`;
+type RepoTransaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 /** Impossible workload owner used to fail closed around ambiguous/orphan routes. */
 export const HOST_PORT_QUARANTINE_OWNER = "__host_port_quarantine__";
 
@@ -270,6 +271,86 @@ export function createHostPortClaimRepo(db: Database) {
       };
       validateIdentity(identity);
       return reserveIdentity(identity);
+    },
+
+    /**
+     * Atomically transfer a quarantined port to a live-verified workload.
+     *
+     * The caller has already proved the exact container-port → host-port bind
+     * and holds the physical-target advisory lock. Updating the sentinel row in
+     * place keeps continuous ownership of the port; a delete followed by an
+     * insert would briefly make it look free and could strand the quarantine if
+     * the second statement failed.
+     *
+     * Returns null when there is no quarantine row to replace. An exact
+     * workload row is idempotent; every other occupant fails closed.
+     */
+    async replaceQuarantinedHostPortClaim(
+      input: HostPortClaimIdentity,
+    ): Promise<HostPortClaim | null> {
+      validateIdentity(input);
+      assertWorkloadOwner(input);
+
+      return db.transaction(async (rawTx) => {
+        const tx = rawTx as RepoTransaction;
+        const [byPort] = await tx
+          .select()
+          .from(hostPortClaim)
+          .where(
+            and(eq(hostPortClaim.targetKey, input.targetKey), eq(hostPortClaim.port, input.port)),
+          )
+          .for("update")
+          .limit(1);
+
+        if (!byPort) return null;
+        if (sameOwner(byPort, input)) return byPort;
+        const isExactQuarantine =
+          byPort.projectId === HOST_PORT_QUARANTINE_OWNER &&
+          byPort.serviceId === HOST_PORT_QUARANTINE_OWNER &&
+          byPort.containerPort === input.port;
+        if (!isExactQuarantine) {
+          throw new HostPortClaimConflictError("port", input.targetKey, input.port);
+        }
+
+        const [byOwner] = await tx
+          .select()
+          .from(hostPortClaim)
+          .where(
+            and(
+              eq(hostPortClaim.targetKey, input.targetKey),
+              eq(hostPortClaim.projectId, input.projectId),
+              nullableServiceCondition(input.serviceId),
+              nullableContainerPortCondition(input.containerPort),
+            ),
+          )
+          .for("update")
+          .limit(1);
+        if (byOwner) {
+          throw new HostPortClaimConflictError("owner", input.targetKey, input.port);
+        }
+
+        const [replaced] = await tx
+          .update(hostPortClaim)
+          .set({
+            projectId: input.projectId,
+            serviceId: input.serviceId,
+            containerPort: input.containerPort,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(hostPortClaim.id, byPort.id),
+              eq(hostPortClaim.projectId, HOST_PORT_QUARANTINE_OWNER),
+              eq(hostPortClaim.serviceId, HOST_PORT_QUARANTINE_OWNER),
+              eq(hostPortClaim.containerPort, input.port),
+            ),
+          )
+          .returning();
+        if (!replaced) {
+          throw new Error(`Host-port quarantine changed concurrently on ${input.targetKey}`);
+        }
+        return replaced;
+      });
     },
 
     /**

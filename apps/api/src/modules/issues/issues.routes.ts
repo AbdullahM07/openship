@@ -56,6 +56,21 @@ r.get(
   ctrl.healthSnapshot,
 );
 
+r.post(
+  "/health/scan",
+  {
+    tag: "project:list",
+    readOnly: true,
+    collection: true,
+    localOnly: true,
+    mcp: {
+      description:
+        "Check the current container state of every deployed workload in the caller's organization. Reuses the health watch scanner and refreshes only its in-memory snapshots: it does not enable a job, update incident history, send alerts, or start Docker event subscriptions. Available on desktop and self-hosted runtimes while Openship is running.",
+    },
+  },
+  ctrl.scanCurrentHealth,
+);
+
 /**
  * Firing the scheduled checkers early. Tagged `job:write` — NOT `server:write` —
  * because that is literally what this does: it calls the jobs module's run-now, and

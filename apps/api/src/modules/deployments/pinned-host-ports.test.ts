@@ -16,6 +16,7 @@ import type { HostPortTargetIdentity } from "../../lib/host-port-target";
 const claimRepo = vi.hoisted(() => ({
   reserve: vi.fn(),
   quarantine: vi.fn(),
+  replaceQuarantine: vi.fn(),
   release: vi.fn(),
   releaseQuarantine: vi.fn(),
   list: vi.fn(),
@@ -35,6 +36,7 @@ vi.mock("@repo/db", () => ({
       listHostPortClaims: claimRepo.list,
       reserveHostPortClaim: claimRepo.reserve,
       reserveQuarantinedHostPortClaim: claimRepo.quarantine,
+      replaceQuarantinedHostPortClaim: claimRepo.replaceQuarantine,
       releaseHostPortClaim: claimRepo.release,
       releaseQuarantinedHostPortClaim: claimRepo.releaseQuarantine,
     },
@@ -71,6 +73,7 @@ describe("pinnedHostPortsToAvoid", () => {
   beforeEach(() => {
     claimRepo.reserve.mockReset();
     claimRepo.quarantine.mockReset();
+    claimRepo.replaceQuarantine.mockReset();
     claimRepo.list.mockReset();
     claimRepo.release.mockReset().mockResolvedValue(true);
     claimRepo.releaseQuarantine.mockReset().mockResolvedValue(true);
@@ -86,6 +89,12 @@ describe("pinnedHostPortsToAvoid", () => {
       projectId: "__host_port_quarantine__",
       serviceId: "__host_port_quarantine__",
       containerPort: input.port,
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    }));
+    claimRepo.replaceQuarantine.mockImplementation(async (input) => ({
+      id: "hpc_replaced_quarantine",
+      ...input,
       createdAt: new Date(0),
       updatedAt: new Date(0),
     }));
@@ -189,6 +198,51 @@ describe("pinnedHostPortsToAvoid", () => {
     });
     expect(claimRepo.quarantine).not.toHaveBeenCalled();
     expect(result).toEqual(expect.arrayContaining([expect.objectContaining({ port: 20008 })]));
+  });
+
+  it("lets a live-verified owner atomically supersede an earlier quarantine", async () => {
+    const quarantine = storedClaim("quarantine", remoteTarget.targetKey, {
+      projectId: "__host_port_quarantine__",
+      serviceId: "__host_port_quarantine__",
+      containerPort: 20008,
+      port: 20008,
+    });
+    const replacement = storedClaim("reclaimed", remoteTarget.targetKey, {
+      projectId: "compose",
+      serviceId: "api",
+      containerPort: 4000,
+      port: 20008,
+    });
+    const canonicalClaims = [quarantine];
+    claimRepo.list.mockImplementation(async (targetKey: string) =>
+      targetKey === remoteTarget.targetKey ? canonicalClaims : [],
+    );
+    claimRepo.replaceQuarantine.mockImplementationOnce(async () => {
+      canonicalClaims.splice(0, 1, replacement);
+      return replacement;
+    });
+
+    const result = await prepareTargetPinnedHostPorts({
+      target: remoteTarget,
+      edgeProxy: { listLoopbackUpstreamPortsStrict: async () => new Set([20008]) },
+      verifiedCarriedHostPorts: [
+        {
+          owner: { projectId: "compose", serviceId: "api", containerPort: 4000 },
+          hostPort: 20008,
+          liveHostPortByContainerPort: { 4000: 20008 },
+        },
+      ],
+    });
+
+    expect(claimRepo.replaceQuarantine).toHaveBeenCalledWith({
+      targetKey: remoteTarget.targetKey,
+      projectId: "compose",
+      serviceId: "api",
+      containerPort: 4000,
+      port: 20008,
+    });
+    expect(claimRepo.quarantine).not.toHaveBeenCalled();
+    expect(result).toEqual([replacement]);
   });
 
   it("does not repair a cached port when the live binding disagrees", async () => {

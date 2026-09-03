@@ -118,6 +118,28 @@ export interface WorkloadHealthRow {
   observedAt: string;
 }
 
+export interface HealthCheckSummary {
+  servers: number;
+  projects: number;
+  workloads: number;
+  opened: number;
+  escalated: number;
+  resolved: number;
+  stale: number;
+  unreachable: number;
+  unresolved: number;
+  skipped: number;
+  indeterminate: number;
+  pending: number;
+  recovering: number;
+  errors: number;
+}
+
+export interface CurrentHealthScanResult {
+  completedAt: string;
+  summary: HealthCheckSummary;
+}
+
 /**
  * Run an item's carried fix.
  *
@@ -141,8 +163,16 @@ export const issuesApi = {
     api.get<{
       data: WorkloadHealthRow[];
       watching: boolean;
-      watcher: { key: string; schedule: string | null; eventsEnabled: boolean };
+      capabilities: { current: boolean; continuous: boolean };
+      currentScan: CurrentHealthScanResult | null;
+      watcher: { key: string; schedule: string | null; available: boolean; eventsEnabled: boolean };
     }>(endpoints.issues.health),
+
+  /** One current-state pass. Shares the watcher scanner but no watcher side effects. */
+  scanHealth: () =>
+    api.post<{ data: CurrentHealthScanResult }>(endpoints.issues.healthScan, undefined, {
+      timeout: 300_000,
+    }),
 
   // `GET /issues/summary` (counts without rows) has no client wrapper on purpose: the
   // page reads its counts off the feed it already fetched, and the nav entry carries no

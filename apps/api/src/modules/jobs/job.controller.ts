@@ -39,8 +39,9 @@ async function assertJobServersWritable(c: Context, serverIds: string[]): Promis
 }
 
 /**
- * Write gate for an EXISTING job, by key — the one gate every `/:key` write goes
- * through (update, remove, run).
+ * Write gate for a job by key — the one gate every `/:key` write goes through
+ * (update, remove, run). Update may opt into authorizing an available registered
+ * built-in before its row exists; the service creates it only after this gate.
  *
  * The job KEY is not an authorization boundary: jobs are instance-global, and
  * `job:write` only checks org membership. Built-in jobs act across the instance,
@@ -59,10 +60,23 @@ export async function assertJobWritable(
   c: Context,
   key: string,
   patch?: { serverId?: string; serverIds?: string[] },
+  opts: { allowMissingRegisteredSystem?: boolean } = {},
 ): Promise<Response | null> {
   const row = await repos.job.findByKey(key);
-  // Same 404 the service's NotFoundError produced, just reached before the write.
-  if (!row) return jobNotFound(c);
+  // PATCH may repair a missing code-registered row, but authorization must run
+  // before that write. Only an available definition qualifies; an arbitrary key
+  // and a built-in unavailable on this platform remain indistinguishable 404s.
+  if (!row) {
+    if (
+      !opts.allowMissingRegisteredSystem ||
+      jobService.systemJobAvailability(key) !== "available"
+    ) {
+      return jobNotFound(c);
+    }
+    await assertInstanceAdmin(getRequestContext(c));
+    return null;
+  }
+  if (jobService.systemJobAvailability(key) === "unavailable") return jobNotFound(c);
   if (row.actionType === "builtin") {
     await assertInstanceAdmin(getRequestContext(c));
     return null;
@@ -259,7 +273,9 @@ export async function update(c: Context) {
   const key = param(c, "key");
   const body = await c.req.json<TUpdateJobBody>();
   // The job's CURRENT targets as well as any the patch adds — see assertJobWritable.
-  const denied = await assertJobWritable(c, key, body);
+  const denied = await assertJobWritable(c, key, body, {
+    allowMissingRegisteredSystem: true,
+  });
   if (denied) return denied;
   const updated = await jobService.updateJob(key, body);
   return c.json({ data: await jobService.getJob(updated.key) });

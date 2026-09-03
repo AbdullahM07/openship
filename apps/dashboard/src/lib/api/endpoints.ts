@@ -529,6 +529,7 @@ export const endpoints = {
     open: "issues",
     resolved: "issues?status=resolved",
     health: "issues/health",
+    healthScan: "issues/health/scan",
     rescan: "issues/rescan",
     rescanStatus: "issues/rescan/status",
   },
