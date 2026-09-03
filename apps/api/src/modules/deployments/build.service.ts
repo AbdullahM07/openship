@@ -28,7 +28,6 @@ import {
   isReleaseProvider,
   releaseArtifactKind,
   renderReleaseImage,
-  looksLikeSecretKey,
   resolveProjectVolumes,
   type StackId,
   type DeployTarget,
@@ -96,6 +95,7 @@ import {
 } from "../../lib/release-resolver";
 import { commitSourceKey, projectBranch } from "../projects/project-crud.service";
 import { env } from "../../config";
+import { resolveBuildAccessEnv } from "./build-access-env";
 
 function throwPreflightFailure(preflight: PreflightResult): never {
   const failedChecks = preflight.checks.filter((check) => check.status === "fail");
@@ -1495,20 +1495,26 @@ export async function requestBuildAccess(
     snapshot.branch,
   );
 
-  // Caller-supplied envVars win (and get persisted as the new project
-  // defaults below); when this deploy request didn't include any — the
-  // typical wizard/CLI "just redeploy" call — fall back to the project's
-  // already-saved env vars, the same way triggerDeployment's fresh-deploy
-  // path does. Without this, a bare/server-build deploy silently ships with
-  // no env at all even though `PATCH /api/projects/:id/env` succeeded.
-  let deploymentEnvVars = encryptEnvVars(envVars);
-  if (!deploymentEnvVars) {
-    // A deployment snapshot is project-scoped. Service-scoped rows are loaded
-    // live, per service, by the compose deployer; flattening them into this map
-    // leaks one service's values into every other service and destroys scope.
-    const rawEnvMap = await repos.project.getEnvMap(project.id, env, null);
-    deploymentEnvVars = Object.keys(rawEnvMap).length > 0 ? rawEnvMap : null;
-  }
+  // Resolve a supplied map against project-level rows before freezing the
+  // deployment snapshot. Existing secret values are never returned to the
+  // dashboard, so an empty/masked placeholder means "unchanged", not "replace
+  // this secret with blank". A deploy that supplied no env map keeps the cheap
+  // encrypted-map lookup used by redeploy callers.
+  const resolvedEnv =
+    envVars && Object.keys(envVars).length > 0
+      ? resolveBuildAccessEnv(
+          envVars,
+          // Explicit `null` scope is load-bearing: service env belongs to the
+          // compose deployer and must not leak into this project map.
+          await repos.project.listEnvVars(project.id, env, null),
+          encrypt,
+        )
+      : {
+          deploymentEnvVars: await repos.project
+            .getEnvMap(project.id, env, null)
+            .then((stored) => (Object.keys(stored).length > 0 ? stored : null)),
+          projectEnvVars: null,
+        };
 
   const dep = await createQueuedDeployment({
     projectId: project.id,
@@ -1519,7 +1525,7 @@ export async function requestBuildAccess(
     environment: env,
     framework: snapshot.framework,
     meta: metaWithPrevious(snapshot, project),
-    envVars: deploymentEnvVars,
+    envVars: resolvedEnv.deploymentEnvVars,
     rollbackStrategy,
     commitShaBefore,
     // Service-scoped folder-upload/MCP deploy: only these services are (re)built;
@@ -1532,26 +1538,8 @@ export async function requestBuildAccess(
   });
 
   // Store env vars on project as "latest defaults"
-  if (envVars && Object.keys(envVars).length > 0) {
-    // These arrive as a flat name→value map — a pasted `.env`, an upload, a CLI deploy —
-    // carrying no per-variable intent, and every one of them used to be stored
-    // `isSecret: false`. So an `OPENAI_API_KEY`, or a `DATABASE_URL` with a password in
-    // it, was flagged an ordinary value: returned in cleartext by GET /env and rendered
-    // as readable text in the editor to anyone with project access (#587). The name is
-    // the only signal available here, so default from it and let the operator correct it
-    // with the editor's per-row secret toggle.
-    //
-    // An EXISTING variable keeps its stored flag. `bulkSetEnvVars` replaces the whole
-    // set, so re-deriving the default every time would overturn that toggle on the
-    // operator's very next deploy.
-    const prior = await repos.project.listEnvVars(project.id, env).catch(() => []);
-    const priorSecret = new Map(prior.map((v) => [v.key, v.isSecret]));
-    const vars = Object.entries(envVars).map(([key, value]) => ({
-      key,
-      value: encrypt(value),
-      isSecret: priorSecret.get(key) ?? looksLikeSecretKey(key),
-    }));
-    await repos.project.bulkSetEnvVars(project.id, env, vars);
+  if (resolvedEnv.projectEnvVars) {
+    await repos.project.bulkSetEnvVars(project.id, env, resolvedEnv.projectEnvVars);
   }
 
   // Kick off the build BEFORE returning so the dashboard can attach via the

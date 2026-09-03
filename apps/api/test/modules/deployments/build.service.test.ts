@@ -27,6 +27,8 @@ const {
     project: {
       findById: vi.fn(),
       getEnvMap: vi.fn(),
+      listEnvVars: vi.fn(),
+      bulkSetEnvVars: vi.fn(),
       listEnvVarChangeMeta: vi.fn(),
       update: vi.fn(),
     },
@@ -1406,6 +1408,8 @@ describe("requestBuildAccess — folder-upload compose services", () => {
       baseProject({ gitProvider: "upload", localPath: null, runtimeMode: null }),
     );
     repos.project.getEnvMap.mockResolvedValue({});
+    repos.project.listEnvVars.mockResolvedValue([]);
+    repos.project.bulkSetEnvVars.mockResolvedValue(undefined);
     repos.deployment.findById.mockResolvedValue(null);
     repos.deployment.listByProject.mockResolvedValue({ rows: [] });
     repos.deployment.getLatestSuccessfulForBranch.mockResolvedValue(null);
@@ -1475,6 +1479,35 @@ describe("requestBuildAccess — folder-upload compose services", () => {
         composeServices: scannedServices,
       }),
     );
+  });
+
+  it("freezes and persists the stored ciphertext when a secret placeholder is submitted", async () => {
+    const uploadSessionId = seedSession();
+    repos.project.listEnvVars.mockResolvedValue([
+      {
+        id: "env-1",
+        projectId: "project-1",
+        environment: "production",
+        serviceId: null,
+        key: "API_TOKEN",
+        value: "cipher:original-secret",
+        isSecret: true,
+      },
+    ]);
+
+    await requestBuildAccess(ctx, {
+      projectId: "project-1",
+      uploadSessionId,
+      envVars: { API_TOKEN: "" },
+    });
+
+    expect(repos.project.listEnvVars).toHaveBeenCalledWith("project-1", "production", null);
+    expect(repos.deployment.create).toHaveBeenCalledWith(
+      expect.objectContaining({ envVars: { API_TOKEN: "cipher:original-secret" } }),
+    );
+    expect(repos.project.bulkSetEnvVars).toHaveBeenCalledWith("project-1", "production", [
+      { key: "API_TOKEN", value: "cipher:original-secret", isSecret: true },
+    ]);
   });
 
   it("prefers the caller's services over the session's", async () => {
