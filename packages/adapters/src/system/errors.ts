@@ -25,9 +25,6 @@ const RETRYABLE_CONNECTION_ERROR_PATTERNS = [
   // "first redeploy fails, second click works" pattern.
   "Channel open failure",
   "open failed",
-  // ssh2 emits "Unable to exec" when the SSH server rejects an exec channel
-  // request (SSH_MSG_CHANNEL_FAILURE) on an open session channel.
-  "Unable to exec",
   // NOT "socket hang up": it is what an HTTP client reports for ANY far end that vanished
   // mid-request, including a permission-denied Docker socket and a wedged channel, neither
   // of which a fresh connection fixes. A match here makes `withExecutor` replay its whole
@@ -49,6 +46,26 @@ export class SshDisconnectedError extends Error {
     super(message);
     this.name = "SshDisconnectedError";
   }
+}
+
+/**
+ * `ssh2.Client.exec()` reached the server, but the server rejected the exec
+ * request before returning a command stream. The distinction is important:
+ * arbitrary remote stderr is also surfaced as an Error, and must never become
+ * a reason to replay a command merely because it contains similar words.
+ */
+export class SshExecRequestError extends Error {
+  constructor(cause: Error) {
+    super(cause.message, { cause });
+    this.name = "SshExecRequestError";
+  }
+}
+
+export function isSshExecRequestError(err: unknown): boolean {
+  return (
+    err instanceof SshExecRequestError ||
+    (err instanceof Error && err.name === "SshExecRequestError")
+  );
 }
 
 export function isSshDisconnectedError(err: unknown): err is SshDisconnectedError {
@@ -110,7 +127,15 @@ export function isRetryableRemoteConnectionError(err: unknown): boolean {
 }
 
 export function isRemoteConnectionError(err: unknown): boolean {
-  return isSshAuthError(err) || isRetryableRemoteConnectionError(err);
+  // An exec-request rejection is remote/protocol failure, so human-facing
+  // probes must abort instead of claiming a binary is absent. It deliberately
+  // is NOT globally retryable: SshExecutor already retries that command once,
+  // while a manager-level retry would replay the caller's entire callback.
+  return (
+    isSshAuthError(err) ||
+    isRetryableRemoteConnectionError(err) ||
+    isSshExecRequestError(err)
+  );
 }
 
 const MAX_COMMAND_CHARS = 120;

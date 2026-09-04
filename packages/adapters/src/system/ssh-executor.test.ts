@@ -53,6 +53,13 @@ const untilExec = (client: ReturnType<typeof fakeClient>) =>
     if (!client.exec.mock.calls.length) throw new Error("exec not called yet");
   });
 
+const untilExecCount = (client: ReturnType<typeof fakeClient>, count: number) =>
+  vi.waitFor(() => {
+    if (client.exec.mock.calls.length < count) {
+      throw new Error(`exec called ${client.exec.mock.calls.length}/${count} times`);
+    }
+  });
+
 beforeEach(() => {
   connectSshClient.mockReset();
 });
@@ -167,5 +174,81 @@ describe("channel retry", () => {
     await expect(p).resolves.toBe("git version 2.55.0");
     expect(attempts).toBe(2);
     expect(client1.end).toHaveBeenCalled();
+  });
+
+  it("does not retry an executed command whose stderr equals the ssh2 sentinel", async () => {
+    const channel = new FakeChannel();
+    const client = fakeClient((_cmd, cb) => cb(null, channel));
+    connectSshClient.mockResolvedValue(client);
+
+    const executor = new SshExecutor(CONFIG);
+    const pending = executor.exec("run-mutating-command");
+
+    await untilExec(client);
+    channel.stderr.emit("data", Buffer.from("Unable to exec\n"));
+    channel.emit("exit", 1);
+    channel.emit("close", 1);
+
+    await expect(pending).rejects.toThrow("Unable to exec");
+    expect(client.exec).toHaveBeenCalledTimes(1);
+    expect(connectSshClient).toHaveBeenCalledTimes(1);
+    expect(client.end).not.toHaveBeenCalled();
+    expect(client.destroy).not.toHaveBeenCalled();
+  });
+
+  it("retries a rejected request without interrupting another in-flight command", async () => {
+    const liveChannel = new FakeChannel();
+    const retryChannel = new FakeChannel();
+    const client = fakeClient((_cmd, cb) => {
+      const attempt = client.exec.mock.calls.length;
+      if (attempt === 1) cb(null, liveChannel);
+      else if (attempt === 2) cb(new Error("Unable to exec"), null as unknown as FakeChannel);
+      else cb(null, retryChannel);
+    });
+    connectSshClient.mockResolvedValue(client);
+
+    const executor = new SshExecutor(CONFIG);
+    const live = executor.exec("long-running-command");
+    await untilExecCount(client, 1);
+
+    const retried = executor.exec("git --version");
+    await untilExecCount(client, 3);
+    retryChannel.emit("data", Buffer.from("git version 2.55.0\n"));
+    retryChannel.emit("exit", 0);
+    retryChannel.emit("close", 0);
+
+    await expect(retried).resolves.toBe("git version 2.55.0");
+    expect(connectSshClient).toHaveBeenCalledTimes(1);
+    expect(client.end).not.toHaveBeenCalled();
+    expect(client.destroy).not.toHaveBeenCalled();
+
+    liveChannel.emit("data", Buffer.from("done\n"));
+    liveChannel.emit("exit", 0);
+    liveChannel.emit("close", 0);
+    await expect(live).resolves.toBe("done");
+  });
+
+  it("retries streamExec when ssh2 rejects the exec request", async () => {
+    const channel = new FakeChannel();
+    const client1 = fakeClient((_cmd, cb) =>
+      cb(new Error("Unable to exec"), null as unknown as FakeChannel),
+    );
+    const client2 = fakeClient((_cmd, cb) => cb(null, channel));
+    connectSshClient.mockResolvedValueOnce(client1).mockResolvedValueOnce(client2);
+
+    const executor = new SshExecutor(CONFIG);
+    const logs: string[] = [];
+    const pending = executor.streamExec("echo ready", (entry) => logs.push(entry.message));
+
+    await untilExec(client2);
+    channel.emit("data", Buffer.from("ready\n"));
+    channel.emit("exit", 0);
+    channel.emit("close", 0);
+
+    await expect(pending).resolves.toEqual({ code: 0, output: "ready\n" });
+    expect(logs).toEqual(["ready\n"]);
+    expect(client1.end).toHaveBeenCalled();
+    expect(client1.exec).toHaveBeenCalledTimes(1);
+    expect(client2.exec).toHaveBeenCalledTimes(1);
   });
 });
