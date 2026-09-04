@@ -536,8 +536,16 @@ export const projectsApi = {
   /** Clear CDN / proxy cache */
   clearCache: (id: string | number) => api.post<any>(endpoints.projects.clearCache(id)),
 
-  /** Clear build artifacts */
-  clearBuild: (id: string | number) => api.post<any>(endpoints.projects.clearBuild(id)),
+  /** Clear unused Docker build cache on this project's host. The cache is host-wide. */
+  clearBuild: (id: string | number) =>
+    api.post<{
+      success: true;
+      hostScoped: true;
+      target: "local" | "server";
+      serverId: string | null;
+      cachesDeleted: number;
+      bytesReclaimed: number;
+    }>(endpoints.projects.clearBuild(id)),
 
   /** Container incidents recorded by the health watch. `watching: false` means
    *  the watch job is off — an empty list then proves nothing. */

@@ -174,6 +174,13 @@ export const AUDIT_EVENTS: Record<string, AuditEventDef> = {
     tone: "warning",
     description: "Cleanup did not complete, so the app record was kept for a safe retry.",
   },
+  "project.build_cache.cleared": {
+    category: "apps",
+    action: "cleared the Docker build cache for",
+    label: "Build cache cleared",
+    tone: "warning",
+    description: "Unused build cache was removed from the app's Docker host.",
+  },
   "project:write": {
     category: "apps",
     action: "changed",

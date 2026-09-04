@@ -278,12 +278,15 @@
       "runningStatus": "Sürüyor — {status}"
     },
     "cache": {
-      "title": "Önbellek",
-      "description": "Önbelleğe alınmış derleme çıktılarını ve bağımlılık kurulumlarını temizleyin",
+      "title": "Docker Derleme Önbelleği",
+      "description": "Kullanılmayan derleme önbelleği sunucu başına otomatik olarak 5 GB ile sınırlandırılır",
       "clearInstall": "Kurulum Önbelleğini Temizle",
       "clearInstallDesc": "Önbelleğe alınmış node_modules klasörünü kaldır",
       "clearBuild": "Derleme Önbelleğini Temizle",
-      "clearBuildDesc": "Önbelleğe alınmış derleme çıktısını kaldır"
+      "clearBuildDesc": "Bu projenin Docker sunucusundaki kullanılmayan önbelleği kaldır",
+      "clearBuildConfirm": "Bu sunucudaki tüm kullanılmayan Docker derleme önbelleği temizlensin mi? Diğer projeler bir sonraki dağıtımda bağımlılıkları yeniden derleyebilir.",
+      "clearBuildSuccess": "{size} derleme önbelleği geri kazanıldı",
+      "clearBuildEmpty": "Temizlenecek kullanılmayan derleme önbelleği yok"
     },
     "transfer": {
       "title": "Taşıma ve Klonlama",

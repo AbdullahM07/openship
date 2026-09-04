@@ -189,6 +189,27 @@ import {
 // ─── Connection config ───────────────────────────────────────────────────────
 export type { DockerConnectionOptions } from "./docker-transport";
 
+/**
+ * Docker Engine build-cache prune options. These intentionally mirror the
+ * small, stable subset of POST /build/prune that OpenShip needs instead of
+ * dockerode's PruneBuilderOptions: dockerode 4.0.9 accepts an options object but
+ * drops every pruning option before making the request.
+ */
+export interface BuildCachePruneOptions {
+  /** Include reusable (not only dangling) cache records. Active builds remain protected by Docker. */
+  all?: boolean;
+  /** Leave at least this many bytes of reusable cache on the daemon. Omit for a full prune. */
+  keepStorageBytes?: number;
+  /** Docker build-cache filters, for example `{ until: ["24h"] }`. */
+  filters?: Record<string, string[]>;
+  abortSignal?: AbortSignal;
+}
+
+export interface BuildCachePruneResult {
+  cachesDeleted: string[];
+  spaceReclaimed: number;
+}
+
 interface DockerSystemManager {
   ensureFeature(feature: Feature, onLog?: (log: SystemLog) => void): Promise<void>;
 }
@@ -3378,6 +3399,73 @@ export class DockerRuntime implements RuntimeAdapter {
     } catch {
       /* best-effort — a prune failure must never fail a build/deploy */
     }
+  }
+
+  /**
+   * Reclaim BuildKit/classic-builder cache through Docker Engine's native API.
+   *
+   * Build cache belongs to the DAEMON, not to a project: intermediate records
+   * do not reliably retain OpenShip's final-image labels. Callers therefore own
+   * the host-wide policy (bounded automatic retention vs an explicit full
+   * clear). Docker itself excludes records leased by an active build.
+   *
+   * dockerode 4.0.9's `pruneBuilder(opts)` silently discards `opts`, so use its
+   * modem directly until upstream forwards the query parameters.
+   */
+  async pruneBuildCache(options: BuildCachePruneOptions = {}): Promise<BuildCachePruneResult> {
+    const keepStorageBytes = options.keepStorageBytes;
+    if (
+      keepStorageBytes !== undefined &&
+      (!Number.isSafeInteger(keepStorageBytes) || keepStorageBytes < 0)
+    ) {
+      throw new RangeError("keepStorageBytes must be a non-negative safe integer");
+    }
+
+    const query: Record<string, boolean | number | Record<string, string[]>> = {
+      all: options.all ?? false,
+    };
+    if (keepStorageBytes !== undefined) query["keep-storage"] = keepStorageBytes;
+    if (options.filters && Object.keys(options.filters).length > 0) {
+      query.filters = options.filters;
+    }
+
+    const raw = await new Promise<unknown>((resolve, reject) => {
+      this.docker.modem.dial(
+        {
+          path: "/build/prune?",
+          method: "POST",
+          // `_body: {}` prevents docker-modem from serializing the query object
+          // into an irrelevant POST body while preserving its normal query
+          // encoding (including JSON-encoded filter maps).
+          options: { _query: query, _body: {} },
+          abortSignal: options.abortSignal,
+          statusCodes: {
+            200: true,
+            500: "server error",
+          },
+        },
+        (err, data) => {
+          if (err) reject(err);
+          else resolve(data);
+        },
+      );
+    });
+
+    const response = (raw ?? {}) as {
+      CachesDeleted?: unknown;
+      SpaceReclaimed?: unknown;
+    };
+    return {
+      cachesDeleted: Array.isArray(response.CachesDeleted)
+        ? response.CachesDeleted.filter((id): id is string => typeof id === "string")
+        : [],
+      spaceReclaimed:
+        typeof response.SpaceReclaimed === "number" &&
+        Number.isFinite(response.SpaceReclaimed) &&
+        response.SpaceReclaimed >= 0
+          ? response.SpaceReclaimed
+          : 0,
+    };
   }
 
   /**

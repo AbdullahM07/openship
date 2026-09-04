@@ -172,12 +172,15 @@
       "runningStatus": "Läuft — {status}"
     },
     "cache": {
-      "title": "Cache",
-      "description": "Zwischengespeicherte Build-Artefakte und Abhängigkeitsinstallationen leeren",
+      "title": "Docker-Build-Cache",
+      "description": "Ungenutzter Build-Cache wird automatisch auf 5 GB pro Server begrenzt",
       "clearInstall": "Installations-Cache leeren",
       "clearInstallDesc": "Zwischengespeicherte node_modules entfernen",
       "clearBuild": "Build-Cache leeren",
-      "clearBuildDesc": "Zwischengespeicherte Build-Ausgabe entfernen"
+      "clearBuildDesc": "Ungenutzten Cache auf dem Docker-Server dieses Projekts entfernen",
+      "clearBuildConfirm": "Gesamten ungenutzten Docker-Build-Cache auf diesem Server leeren? Andere Projekte müssen beim nächsten Deployment möglicherweise Abhängigkeiten neu bauen.",
+      "clearBuildSuccess": "{size} Build-Cache freigegeben",
+      "clearBuildEmpty": "Kein ungenutzter Build-Cache vorhanden"
     },
     "transfer": {
       "title": "Übertragen & Klonen",

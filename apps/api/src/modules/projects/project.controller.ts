@@ -83,6 +83,8 @@ import {
   observedLoopbackPublishFromUrl,
 } from "../deployments/observed-host-port-claims";
 import { withLiveProjectRuntimeMutation } from "../../lib/project-runtime-lock";
+import { clearProjectBuildCache } from "../deployments/build-cache-gc";
+import { assertInstanceAdmin } from "../../middleware/instance-admin";
 
 // Track which servers have had Lua scripts deployed this session
 const luaDeployedServers = new Set<string>();
@@ -751,6 +753,47 @@ export async function deletionPreview(c: Context) {
   }
   const preview = await projectService.previewProjectDeletion(project);
   return c.json({ success: true, preview });
+}
+
+/** POST /projects/:id/clear-build — explicit host-wide unused build-cache prune. */
+export async function clearBuildCache(c: Context) {
+  const ctx = getRequestContext(c);
+  const { userId, organizationId } = ctx;
+  const id = param(c, "id");
+  await permission.assert(ctx, {
+    resourceType: "project",
+    resourceId: id,
+    action: "admin",
+  });
+  // BuildKit cache is daemon-wide and may include other organizations' builds;
+  // an org/project role is therefore not a sufficient authorization boundary.
+  await assertInstanceAdmin(ctx);
+
+  const project = await repos.project.findById(id);
+  assertResourceInOrg(project, "Project", organizationId, id);
+  const result = await clearProjectBuildCache(project);
+
+  audit.recordAsync(auditContextFrom(c, organizationId, userId), {
+    eventType: "project.build_cache.cleared",
+    resourceType: "project",
+    resourceId: id,
+    after: {
+      hostScoped: true,
+      target: result.target,
+      serverId: result.serverId,
+      cachesDeleted: result.cachesDeleted.length,
+      bytesReclaimed: result.spaceReclaimed,
+    },
+  });
+
+  return c.json({
+    success: true,
+    hostScoped: true,
+    target: result.target,
+    serverId: result.serverId,
+    cachesDeleted: result.cachesDeleted.length,
+    bytesReclaimed: result.spaceReclaimed,
+  });
 }
 
 // ─── Environment variables ───────────────────────────────────────────────────

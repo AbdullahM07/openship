@@ -172,12 +172,15 @@
       "runningStatus": "进行中 — {status}"
     },
     "cache": {
-      "title": "缓存",
-      "description": "清除缓存的构建产物和依赖安装",
+      "title": "Docker 构建缓存",
+      "description": "每台服务器的未使用构建缓存会自动限制为 5 GB",
       "clearInstall": "清除安装缓存",
       "clearInstallDesc": "移除缓存的 node_modules",
       "clearBuild": "清除构建缓存",
-      "clearBuildDesc": "移除缓存的构建输出"
+      "clearBuildDesc": "移除此项目所在 Docker 服务器上的未使用缓存",
+      "clearBuildConfirm": "清除此服务器上所有未使用的 Docker 构建缓存？其他项目下次部署时可能需要重新构建依赖项。",
+      "clearBuildSuccess": "已释放 {size} 构建缓存",
+      "clearBuildEmpty": "没有可清除的未使用构建缓存"
     },
     "transfer": {
       "title": "转移与克隆",
