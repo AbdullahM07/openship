@@ -18,8 +18,11 @@ import { DeployCredentialModal } from "@/components/deployments/DeployCredential
 import { useServerGitHubConnectModal } from "@/components/github/ServerGitHubConnect";
 import type { DeploymentConfig, DeploymentState, DeploymentStatus, ServiceDeployStatus } from "./types";
 import { syncActiveModeSnapshot } from "./mode-config";
-import { planDeploymentEnvPersistence } from "./env-payload";
-import type { ProjectEnvDiff } from "@/lib/project-env-diff";
+import {
+  planDeploymentEnvPersistence,
+  planMatchedExistingProjectEnvPersistence,
+} from "./env-payload";
+import { createProjectEnvEditState, type ProjectEnvDiff } from "@/lib/project-env-diff";
 import {
   BUILD_PHASES,
   DEFAULT_CONFIG,
@@ -861,11 +864,29 @@ export function useDeploymentBuild(
       // errors but the project row already exists at this point.
       ensuredProjectId = projectData.project_id;
 
+      let resolvedEnvPlan = envPlan;
+      if (!config.projectId && projectData.created !== true) {
+        // `ensure` de-duplicates by project slug/branch. A wizard opened as a
+        // nominally new repo can therefore resolve to an existing project even
+        // though it never loaded that project's env. Re-read the authoritative
+        // store and turn the wizard rows into a non-destructive partial merge:
+        // submitted values may update matching keys, omitted saved keys remain.
+        const envRes = await projectsApi.getEnv(projectData.project_id);
+        const matchedEnvPlan = planMatchedExistingProjectEnvPersistence({
+          envVars: config.envVars,
+          persisted: createProjectEnvEditState(envRes?.data ?? []),
+        });
+        if (!matchedEnvPlan.ok) {
+          throw new Error(matchedEnvPlan.error);
+        }
+        resolvedEnvPlan = matchedEnvPlan;
+      }
+
       // Existing-project env is authoritative in its project store. Apply only
       // the editor diff before build/access; omitting its envVars payload avoids
-      // the endpoint's legacy full-replace behavior. New projects still send
-      // their initial values through build/access, which creates that store.
-      await persistProjectEnvDiff(projectData.project_id, envPlan.merge);
+      // the endpoint's legacy full-replace behavior. A genuinely new project
+      // still sends its initial values through build/access to create the store.
+      await persistProjectEnvDiff(projectData.project_id, resolvedEnvPlan.merge);
 
       // Step 2: Create deployment with config snapshot + env vars
       const data = await deployApi.buildAccess({
@@ -873,7 +894,8 @@ export function useDeploymentBuild(
         branch: config.branch || undefined,
         // Folder-upload: adopt the uploaded source (workspace or staging dir).
         uploadSessionId: config.uploadSessionId || undefined,
-        envVars: envPlan.buildAccessEnvVars,
+        envVars: resolvedEnvPlan.buildAccessEnvVars,
+        sourceEnvKeys: resolvedEnvPlan.sourceEnvKeys,
         // "None" routing → explicit [] (no public URL). Must be [], not
         // undefined: undefined makes the backend auto-derive a free subdomain.
         publicEndpoints: !isServiceDeployment

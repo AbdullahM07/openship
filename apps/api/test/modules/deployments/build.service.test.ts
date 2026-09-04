@@ -1971,6 +1971,36 @@ describe("requestBuildAccess — folder-upload compose services", () => {
     expect(captured.NOT_IMPORTED).toBeUndefined();
   });
 
+  it("imports selected root .env keys without replacing an existing project env", async () => {
+    const storedSecret = encrypt("keep-me");
+    const uploadSessionId = seedSession({
+      rootEnv: { IMPORTED: "from-dotenv", NOT_IMPORTED: "leave-out" },
+    });
+    scanFolderSession.mockResolvedValueOnce({
+      services: scannedServices,
+      rootEnv: { IMPORTED: "from-dotenv", NOT_IMPORTED: "leave-out" },
+    });
+    repos.project.getEnvMap.mockResolvedValue({ AUTH_SECRET: storedSecret });
+
+    await requestBuildAccess(ctx, {
+      projectId: "project-1",
+      uploadSessionId,
+      sourceEnvKeys: ["IMPORTED"],
+    });
+
+    const captured = repos.deployment.create.mock.calls.at(-1)?.[0]?.envVars;
+    expect(captured.AUTH_SECRET).toBe(storedSecret);
+    expect(decrypt(captured.IMPORTED)).toBe("from-dotenv");
+    expect(captured.NOT_IMPORTED).toBeUndefined();
+    expect(repos.project.bulkSetEnvVars).not.toHaveBeenCalled();
+    expect(repos.project.mergeEnvVars).toHaveBeenCalledWith(
+      "project-1",
+      "production",
+      [expect.objectContaining({ key: "IMPORTED" })],
+      [],
+    );
+  });
+
   it("keeps a literal image override made after folder scan", async () => {
     const initial = {
       ...scannedServices[0],

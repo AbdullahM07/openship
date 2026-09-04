@@ -899,11 +899,22 @@ export interface DeploymentContextType {
     owner: string,
     repo: string,
     force?: string,
-    context?: { branch?: string; projectId?: string; composePath?: string },
+    context?: {
+      branch?: string;
+      projectId?: string;
+      composePath?: string;
+      env?: Record<string, string>;
+      preserveEnvState?: boolean;
+    },
   ) => Promise<{ success: boolean; error?: string; errorType?: string; buildInProgress?: boolean }>;
   initializeFromLocal: (
     path: string,
-    context?: { projectId?: string; composePath?: string },
+    context?: {
+      projectId?: string;
+      composePath?: string;
+      env?: Record<string, string>;
+      preserveEnvState?: boolean;
+    },
   ) => Promise<{ success: boolean; error?: string; errorType?: string }>;
   /**
    * Re-run detection pinned to an explicit compose file path (or clear it with
