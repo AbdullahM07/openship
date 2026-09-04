@@ -30,7 +30,10 @@ function tarEntries(archive: Buffer): string[] {
       continue;
     }
     const name = header.subarray(0, 100).toString("latin1").replace(/\0.*$/, "");
-    const size = parseInt(header.subarray(124, 136).toString("latin1").replace(/\0.*$/, "").trim() || "0", 8);
+    const size = parseInt(
+      header.subarray(124, 136).toString("latin1").replace(/\0.*$/, "").trim() || "0",
+      8,
+    );
     if (name) names.push(name.replace(/\/$/, ""));
     offset += 512 + Math.ceil(size / 512) * 512;
   }
@@ -62,7 +65,10 @@ async function makeRepo(): Promise<string> {
   await writeFile(join(repo, "Dockerfile"), "FROM node:22\n");
   await writeFile(join(repo, "root-only.txt"), "root\n");
   await mkdir(join(repo, "svc"), { recursive: true });
-  await writeFile(join(repo, "svc", "Dockerfile.api"), "FROM python:3.12\nCOPY requirements.txt /\n");
+  await writeFile(
+    join(repo, "svc", "Dockerfile.api"),
+    "FROM python:3.12\nCOPY requirements.txt /\n",
+  );
   await writeFile(join(repo, "svc", "requirements.txt"), "flask\n");
 
   await exec("git", ["-C", repo, "add", "-A", "-f"]);
@@ -239,6 +245,7 @@ describe("remote docker build — declared build context (#634)", () => {
     // exactly one builder.
     expect(buildCmd).toContain("--progress=plain");
     expect(buildCmd).not.toContain("--force-rm");
+    expect(buildCmd).not.toContain("--add-host");
   });
 
   it("keeps the legacy builder — and drops --progress — when the probe is unanswered", async () => {
@@ -250,6 +257,7 @@ describe("remote docker build — declared build context (#634)", () => {
     expect(buildCmd).not.toContain("DOCKER_BUILDKIT=1");
     expect(buildCmd).not.toContain("--progress");
     expect(buildCmd).toContain("--force-rm");
+    expect(buildCmd).toMatch(/--add-host 'openship-build-[0-9a-f-]+\.invalid:127\.0\.0\.1'/);
   });
 
   it("does not read a version banner as buildx", async () => {
@@ -303,7 +311,8 @@ describe("mixed batch — one tree, different contexts (#634)", () => {
       dockerfiles.set(name, String(opts.dockerfile));
       buildArgs.set(name, opts.buildargs);
       const chunks: Buffer[] = [];
-      for await (const chunk of body.pipe(createGunzip())) chunks.push(Buffer.from(chunk as Buffer));
+      for await (const chunk of body.pipe(createGunzip()))
+        chunks.push(Buffer.from(chunk as Buffer));
       packed.set(name, tarEntries(Buffer.concat(chunks)));
       return { on: () => {}, pipe: () => {} } as unknown as NodeJS.ReadableStream;
     });
