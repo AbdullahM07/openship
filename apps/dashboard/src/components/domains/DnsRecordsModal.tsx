@@ -17,6 +17,7 @@ interface DnsRecordsModalProps {
   }>;
   /** Selected remote deployment target, so A records point at that server. */
   serverId?: string;
+  confirmLabel?: string;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -30,6 +31,7 @@ interface DnsRecordsModalProps {
 export default function DnsRecordsModal({
   targets,
   serverId,
+  confirmLabel,
   onConfirm,
   onCancel,
 }: DnsRecordsModalProps) {
@@ -52,33 +54,17 @@ export default function DnsRecordsModal({
           targets.map(async (target) => {
             try {
               const res = target.domainId
-                ? await domainsApi.records(target.domainId)
+                ? await domainsApi.records(target.domainId, serverId)
                 : await domainsApi.previewRecords(
                     target.hostname,
                     target.includeWww === true,
                     serverId,
                   );
               const mode = res.data.mode === "cloud" ? "cloud" as const : "selfhosted" as const;
-              let records = res.data.records;
-              if (
-                target.includeWww &&
-                mode === "selfhosted" &&
-                !records.some((record) => record.type === "CNAME" && record.host.startsWith("www"))
-              ) {
-                records = [
-                  ...records,
-                  {
-                    type: "CNAME" as const,
-                    host: "www",
-                    name: `www.${target.hostname}`,
-                    value: target.hostname,
-                  },
-                ];
-              }
               return {
                 hostname: target.hostname,
                 domainId: target.domainId ?? undefined,
-                records,
+                records: res.data.records,
                 mode,
               };
             } catch {
@@ -142,6 +128,7 @@ export default function DnsRecordsModal({
               mode={section.mode}
               showHeader={targets.length > 1}
               domainId={section.domainId}
+              serverId={serverId}
             />
           ))}
         </div>
@@ -160,7 +147,7 @@ export default function DnsRecordsModal({
           onClick={onConfirm}
           className="rounded-xl bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
         >
-          {d.deployAction}
+          {confirmLabel ?? d.deployAction}
         </button>
       </div>
     </div>

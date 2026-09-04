@@ -90,18 +90,24 @@ export const domainsApi = {
 
   /** Fetch the DNS records for an EXISTING (e.g. pending) domain so the user can
    *  re-see exactly what to add at any time — not only right after connect. */
-  records: (domainId: string) =>
-    api.get<{ data: DomainDnsRecords }>(endpoints.domains.records(domainId)),
+  records: (domainId: string, serverId?: string) =>
+    api.get<{ data: DomainDnsRecords }>(endpoints.domains.records(domainId), {
+      params: { serverId },
+    }),
 
   /** Dry-run auto-configure: preview what a connected provider would write for
    *  this domain, before touching anything. Powers the on-demand button. */
-  dnsPlan: (domainId: string) =>
-    api.get<{ data: DnsPlanResult }>(endpoints.domains.dnsPlan(domainId)),
+  dnsPlan: (domainId: string, serverId?: string) =>
+    api.get<{ data: DnsPlanResult }>(endpoints.domains.dnsPlan(domainId), {
+      params: { serverId },
+    }),
 
   /** Write this domain's records through the connected provider, on press.
    *  Atomic per record — in-sync records are skipped, conflicts refused. */
-  dnsApply: (domainId: string) =>
-    api.post<{ data: DnsProvisionResult }>(endpoints.domains.dnsApply(domainId)),
+  dnsApply: (domainId: string, serverId?: string) =>
+    api.post<{ data: DnsProvisionResult }>(endpoints.domains.dnsApply(domainId), undefined, {
+      params: { serverId },
+    }),
 
   /**
    * Recheck SSL: read-only verification that the Let's Encrypt cert is actually

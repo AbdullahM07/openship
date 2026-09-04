@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 
-import { deploymentDnsTargets } from "./deployment-dns";
+import {
+  appInstallDnsTargets,
+  attachDeploymentDomainIds,
+  deploymentDnsTargets,
+} from "./deployment-dns";
 
 const endpoint = (customDomain: string) => ({
   id: customDomain,
@@ -88,6 +92,47 @@ describe("deploymentDnsTargets", () => {
     } as never)).toEqual([{ hostname: "app.example.com", includeWww: false }]);
   });
 
+  it("derives the app install gate from custom routes only", () => {
+    expect(appInstallDnsTargets([
+      { mode: "port" },
+      { mode: "free", customDomain: "ignored.example.com" },
+      { mode: "custom", customDomain: "HTTPS://App.Example.com/" },
+      { mode: "custom", customDomain: "app.example.com" },
+    ])).toEqual([{ hostname: "app.example.com", includeWww: false }]);
+  });
+
+  it("attaches persisted domain ids by normalized hostname without mutating targets", () => {
+    const targets = [
+      { hostname: "app.example.com", includeWww: false, domainId: "draft_not_a_domain" },
+      { hostname: "missing.example.com", includeWww: false },
+    ];
+
+    expect(attachDeploymentDomainIds(targets, [
+      { id: "dom_app", hostname: "APP.EXAMPLE.COM" },
+      { id: 123, hostname: "missing.example.com" },
+    ])).toEqual([
+      { hostname: "app.example.com", includeWww: false, domainId: "dom_app" },
+      { hostname: "missing.example.com", includeWww: false, domainId: null },
+    ]);
+    expect(targets).toEqual([
+      { hostname: "app.example.com", includeWww: false, domainId: "draft_not_a_domain" },
+      { hostname: "missing.example.com", includeWww: false },
+    ]);
+  });
+
+  it("expands an apex/www preview pair so each persisted row gets Auto DNS", () => {
+    expect(attachDeploymentDomainIds(
+      [{ hostname: "example.com", includeWww: true }],
+      [
+        { id: "dom_apex", hostname: "example.com" },
+        { id: "dom_www", hostname: "www.example.com" },
+      ],
+    )).toEqual([
+      { hostname: "example.com", includeWww: false, domainId: "dom_apex" },
+      { hostname: "www.example.com", includeWww: false, domainId: "dom_www" },
+    ]);
+  });
+
   it("is the source used by the Deploy-click DNS gate", () => {
     const sidebar = readFileSync(
       new URL("../app/(dashboard)/(deployment)/deploy/[slug]/components/Sidebar.tsx", import.meta.url),
@@ -96,5 +141,15 @@ describe("deploymentDnsTargets", () => {
     expect(sidebar).toContain("deploymentDnsTargets(config)");
     expect(sidebar).toContain("<DnsRecordsModal");
     expect(sidebar).toContain("targets={dnsTargets}");
+  });
+
+  it("wires the app install DNS targets into the pre-deploy modal", () => {
+    const installPage = readFileSync(
+      new URL("../app/(dashboard)/apps/new/[appId]/page.tsx", import.meta.url),
+      "utf8",
+    );
+    expect(installPage).toContain("appInstallDnsTargets(routes ?? [])");
+    expect(installPage).toContain("<DnsRecordsModal");
+    expect(installPage).toContain("selfHosted && pendingDnsTargets.length > 0");
   });
 });
