@@ -116,8 +116,10 @@ describe("service routing patch", () => {
 
   /** What the edge was asked to stop serving on this save. */
   const removedHosts = () =>
-    ((reconcileProjectRoutes.mock.calls.at(-1)?.[1] as { removes?: Array<{ hostname: string }> })
-      ?.removes ?? []).map((r) => r.hostname);
+    (
+      (reconcileProjectRoutes.mock.calls.at(-1)?.[1] as { removes?: Array<{ hostname: string }> })
+        ?.removes ?? []
+    ).map((r) => r.hostname);
 
   it("persists a scalar custom-domain patch and keeps the sibling route", async () => {
     const updated = {
@@ -130,9 +132,7 @@ describe("service routing patch", () => {
         { port: 3211, domainType: "free", domain: "acme-backend-http" },
       ],
     };
-    serviceRepo.findById
-      .mockResolvedValueOnce(multiRouteService())
-      .mockResolvedValueOnce(updated);
+    serviceRepo.findById.mockResolvedValueOnce(multiRouteService()).mockResolvedValueOnce(updated);
 
     await updateService(ctx, project.id, "svc_1", {
       domainType: "custom",
@@ -239,10 +239,11 @@ describe("service routing patch", () => {
 
     await updateService(ctx, project.id, "svc_1", { exposed: false } as never);
 
-    expect(removedHosts().map((h) => h.split(".")[0]).sort()).toEqual([
-      "acme-backend",
-      "acme-backend-http",
-    ]);
+    expect(
+      removedHosts()
+        .map((h) => h.split(".")[0])
+        .sort(),
+    ).toEqual(["acme-backend", "acme-backend-http"]);
     // Config is untouched, so nothing is de-configured — a mere pause must never
     // delete a domain row the operator verified.
     expect(domainService.removeServiceDomain).not.toHaveBeenCalled();
@@ -273,9 +274,9 @@ describe("service routing patch", () => {
   });
 
   it("refuses a cleared subdomain instead of dropping the sibling route", async () => {
-    await expect(
-      updateService(ctx, project.id, "svc_1", { domain: "" } as never),
-    ).rejects.toThrow(/free route needs a subdomain/i);
+    await expect(updateService(ctx, project.id, "svc_1", { domain: "" } as never)).rejects.toThrow(
+      /free route needs a subdomain/i,
+    );
 
     expect(serviceRepo.update).not.toHaveBeenCalled();
     expect(reconcileProjectRoutes).not.toHaveBeenCalled();
@@ -368,6 +369,34 @@ describe("service routing patch", () => {
     );
   });
 
+  it("makes a manual image update literal without dropping other advanced config", async () => {
+    serviceRepo.findById.mockResolvedValue({
+      ...multiRouteService(),
+      image: "ghcr.io/acme/api:v1",
+      advanced: {
+        imageTemplate: {
+          expression: "ghcr.io/acme/api:${IMAGE_TAG}",
+          unresolvedVariables: ["IMAGE_TAG"],
+        },
+        readiness: { enabled: true },
+      },
+    });
+
+    await updateService(ctx, project.id, "svc_1", {
+      image: "ghcr.io/acme/api:v2",
+    } as never);
+
+    expect(serviceRepo.update).toHaveBeenCalledWith(
+      "svc_1",
+      expect.objectContaining({
+        image: "ghcr.io/acme/api:v2",
+        advanced: {
+          readiness: { enabled: true },
+        },
+      }),
+    );
+  });
+
   it("applies build args when an upstream drift is accepted (#689)", async () => {
     const drifted = {
       ...multiRouteService(),
@@ -377,13 +406,11 @@ describe("service routing patch", () => {
       importedSpec: { buildArgs: { APP_PACKAGE: "@myorg/old" } },
       driftSpec: { buildArgs: { APP_PACKAGE: "@myorg/api" } },
     };
-    serviceRepo.findById
-      .mockResolvedValueOnce(drifted)
-      .mockResolvedValueOnce({
-        ...drifted,
-        buildArgs: { APP_PACKAGE: "@myorg/api" },
-        driftSpec: null,
-      });
+    serviceRepo.findById.mockResolvedValueOnce(drifted).mockResolvedValueOnce({
+      ...drifted,
+      buildArgs: { APP_PACKAGE: "@myorg/api" },
+      driftSpec: null,
+    });
 
     await acceptServiceDrift(ctx, project.id, "svc_1");
 
@@ -431,7 +458,7 @@ describe("service routing patch", () => {
       expect(serviceRepo.create).not.toHaveBeenCalled();
     });
 
-    it("create: a normalized-duplicate name is rejected (\"My DB\" vs \"my-db\")", async () => {
+    it('create: a normalized-duplicate name is rejected ("My DB" vs "my-db")', async () => {
       serviceRepo.listByProject.mockResolvedValue([{ id: "svc_2", name: "My DB" }]);
 
       await expect(

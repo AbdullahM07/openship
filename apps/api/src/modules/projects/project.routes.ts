@@ -15,6 +15,7 @@
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { secureRouter } from "../../lib/secure-router";
+import { requireInstanceAdmin } from "../../middleware/instance-admin";
 import { cloudProjectProxy } from "../../lib/cloud/project-router";
 import * as ctrl from "./project.controller";
 import * as folder from "./folder/folder.controller";
@@ -275,6 +276,19 @@ r.post(
   },
   cloudProjectProxy,
   ctrl.outputCheck,
+);
+r.post(
+  "/:id/clear-build",
+  {
+    tag: "project:admin",
+    localOnly: true,
+    mcp: {
+      description:
+        "Clear all unused Docker build cache on the project's self-hosted Docker server. Build cache is host-wide, so other projects on that server may rebuild dependencies on their next deployment. Returns reclaimed bytes.",
+    },
+  },
+  requireInstanceAdmin(),
+  ctrl.clearBuildCache,
 );
 
 /* ─── Enable / Disable ─────────────────────────────────────────────────── */

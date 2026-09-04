@@ -29,7 +29,12 @@ export {
 } from "./build-pipeline";
 
 // ─── Runtime classes ─────────────────────────────────────────────────────────
-export { DockerRuntime, type DockerConnectionOptions } from "./docker";
+export {
+  DockerRuntime,
+  type BuildCachePruneOptions,
+  type BuildCachePruneResult,
+  type DockerConnectionOptions,
+} from "./docker";
 export { containerInfoFromDockerSummary } from "./docker-container-info";
 export { BareRuntime, type BareRuntimeOptions } from "./bare";
 export { CloudRuntime } from "./cloud";

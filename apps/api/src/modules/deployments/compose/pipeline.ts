@@ -76,6 +76,8 @@ export interface ComposePipelineOpts {
   ctx: LifecycleContext;
   snapshot: BuildConfigSnapshotLike & { composeServices?: DeployableService[]; serverId?: string };
   buildSessionId: string;
+  /** Decrypted project env, without internal build-only defaults. */
+  composeInterpolationEnv: Record<string, string>;
   buildEnvVars: Record<string, string>;
   buildResources: ResourceConfig;
   runtimeResources: ResourceConfig;
@@ -228,6 +230,7 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
     ctx,
     snapshot,
     buildSessionId,
+    composeInterpolationEnv,
     buildEnvVars,
     buildResources,
     runtimeResources,
@@ -295,6 +298,7 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
     logger,
     snapshot,
     buildSessionId,
+    composeInterpolationEnv,
     buildEnvVars,
     buildResources,
     gitToken,
@@ -530,8 +534,7 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
       ? routeIssuesWarning(composeResult.routeWarnings ?? [], composeResult.tlsPendingDomains ?? [])
       : undefined;
   const successWarning = routingWarning ?? composeResult.warning;
-  const decisionPending =
-    composeResult.summary.failed > 0 && composeResult.summary.successful > 0;
+  const decisionPending = composeResult.summary.failed > 0 && composeResult.summary.successful > 0;
   sessionManager.broadcastInstallPhase(dep.id, { id: "ready", status: "done" });
 
   // Every service was carried forward: this row owns no container and no image, so

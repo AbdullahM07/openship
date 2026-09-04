@@ -445,47 +445,42 @@ export function convergeTargetHostPortClaims(
 export function findOwnedPinnedHostPort(
   claims: readonly PinnedHostPort[],
   owner: PinnedHostPortOwner,
-  opts?: { allowLegacyContainerPort?: boolean },
+  opts?: { allowLegacyContainerPort?: boolean; preferredPort?: number | null },
 ): PinnedHostPort | undefined {
   const sameService = (claim: PinnedHostPort) =>
     !isQuarantineClaim(claim) &&
     claim.projectId === owner.projectId &&
     claim.serviceId === owner.serviceId;
-  return (
-    claims.find((claim) => sameService(claim) && claim.containerPort === owner.containerPort) ??
-    (opts?.allowLegacyContainerPort
-      ? claims.find((claim) => sameService(claim) && claim.containerPort === null)
-      : undefined)
+  const exact = claims.filter(
+    (claim) => sameService(claim) && claim.containerPort === owner.containerPort,
   );
+  const legacy = opts?.allowLegacyContainerPort
+    ? claims.filter((claim) => sameService(claim) && claim.containerPort === null)
+    : [];
+  const preferredPort = opts?.preferredPort;
+  if (preferredPort !== undefined && preferredPort !== null) {
+    const preferred = [...exact, ...legacy].find((claim) => claim.port === preferredPort);
+    if (preferred) return preferred;
+  }
+  return exact[0] ?? legacy[0];
 }
 
 export interface AllocateAndReservePinnedHostPortInput {
   target: HostPortTargetIdentity;
   claims: readonly PinnedHostPort[];
   owner: PinnedHostPortOwner;
-  /** Compatibility cache only; a reservation on this target always wins. */
+  /**
+   * Compatibility cache and active-route hint. When an owner temporarily has
+   * old and replacement claims, the active release's cached port wins.
+   */
   cachedPreferred?: number | null;
   /**
-   * Keep the resolved preferred port immutable on this physical target. This
-   * closes the legacy-cache gap where no durable claim exists yet: the database
-   * owner constraint protects claimed ports, while this gate protects the
-   * carried route before its first canonical claim is written.
+   * Explicit live-occupancy policy for the resolved preferred port. This may be
+   * a callback because the durable claim/cache is resolved inside this shared
+   * allocator. A running container with the exact published binding may reuse
+   * its occupied port; otherwise an occupied preference is relocated.
    */
-  lockPreferred?: { ownerLabel: string };
-  /**
-   * Explicit live-occupancy policy for the resolved preferred port. A running
-   * container with the exact published binding may reuse its occupied port;
-   * a stopped container may reuse the same configured port only while it is
-   * actually free. When omitted, durable exact ownership retains the existing
-   * behavior for callers that do not inspect container state themselves.
-   */
-  reuseOccupiedPreferred?: boolean;
-  /**
-   * Optional interactive recovery for a preferred port that the allocator
-   * found unavailable. It runs before any reservation is written, then the
-   * allocator must prove the port is available on a fresh scan.
-   */
-  recoverUnavailablePreferred?: (port: number) => Promise<void>;
+  reuseOccupiedPreferred?: boolean | ((port: number) => boolean);
   allowLegacyContainerPort?: boolean;
   additionalAvoid?: Iterable<number>;
   allocate: (options: AllocateHostPortOptions) => Promise<HostPortAllocation>;
@@ -494,22 +489,26 @@ export interface AllocateAndReservePinnedHostPortInput {
 export interface AllocatedPinnedHostPort extends HostPortAllocation {
   preferred?: number;
   previousClaim?: PinnedHostPort;
+  /** True only when this attempt added a claim that pre-route rollback may remove. */
+  claimWasCreated: boolean;
   claim: HostPortClaim;
 }
 
 /**
  * Roll back reservations created by an activation attempt that never wrote a
- * route. Carried claims are never touched: an older vhost or stopped workload
- * may still depend on them. Callers must invoke this only while holding the
- * target lock and only before any route for the attempted workload was written.
+ * route. Pre-existing claims are never touched: an older vhost or stopped
+ * workload may still depend on them. A relocation can have both a previous
+ * claim and a newly-created replacement, so creation is tracked explicitly.
+ * Callers must invoke this only while holding the target lock and only before
+ * any route for the attempted workload was written.
  */
 export async function releaseNewPinnedHostPortClaims(
   target: HostPortTargetIdentity,
-  allocations: Iterable<Pick<AllocatedPinnedHostPort, "claim" | "previousClaim">>,
+  allocations: Iterable<Pick<AllocatedPinnedHostPort, "claim" | "claimWasCreated">>,
 ): Promise<number> {
   let released = 0;
   for (const allocation of allocations) {
-    if (allocation.previousClaim) continue;
+    if (!allocation.claimWasCreated) continue;
     const claim = allocation.claim;
     if (claim.targetKey !== target.targetKey) {
       throw new Error("Cannot release a host-port claim from another physical target");
@@ -541,6 +540,7 @@ export async function allocateAndReservePinnedHostPort(
 ): Promise<AllocatedPinnedHostPort> {
   const previousClaim = findOwnedPinnedHostPort(input.claims, input.owner, {
     allowLegacyContainerPort: input.allowLegacyContainerPort,
+    preferredPort: input.cachedPreferred,
   });
   const preferred = previousClaim?.port ?? input.cachedPreferred ?? undefined;
   const reusable = previousClaim
@@ -553,46 +553,23 @@ export async function allocateAndReservePinnedHostPort(
   const avoid = pinnedHostPortsToAvoid(input.claims, reusable);
   for (const port of input.additionalAvoid ?? []) avoid.add(port);
 
+  const explicitReuseOccupiedPreferred =
+    typeof input.reuseOccupiedPreferred === "function"
+      ? preferred === undefined
+        ? false
+        : input.reuseOccupiedPreferred(preferred)
+      : input.reuseOccupiedPreferred;
   const reuseOccupiedPreferred =
-    input.reuseOccupiedPreferred ??
+    explicitReuseOccupiedPreferred ??
     (reusable
       ? ownsReusablePinnedHostPort(input.claims, reusable) && !avoid.has(reusable.port)
       : false);
-  const allocationOptions: AllocateHostPortOptions = {
+  const allocation = await input.allocate({
     preferred,
     avoid,
     reuseOccupiedPreferred,
-  };
-  let allocation = await input.allocate(allocationOptions);
-  if (
-    input.lockPreferred &&
-    preferred !== undefined &&
-    allocation.port !== preferred &&
-    !reuseOccupiedPreferred &&
-    !avoid.has(preferred) &&
-    input.recoverUnavailablePreferred
-  ) {
-    await input.recoverUnavailablePreferred(preferred);
-    allocation = await input.allocate(allocationOptions);
-  }
-  if (
-    input.lockPreferred &&
-    preferred !== undefined &&
-    !reuseOccupiedPreferred &&
-    !allocation.scanned
-  ) {
-    throw new Error(
-      `Refusing to reuse the locked host port for ${input.lockPreferred.ownerLabel} at ` +
-        `${preferred} during a same-server redeploy because live port occupancy could not be verified.`,
-    );
-  }
-  if (input.lockPreferred && preferred !== undefined && allocation.port !== preferred) {
-    throw new Error(
-      `Refusing to change the locked host port for ${input.lockPreferred.ownerLabel} from ` +
-        `${preferred} to ${allocation.port} during a same-server redeploy. ` +
-        `Preflight could not prove that the existing binding was safely reusable.`,
-    );
-  }
+  });
+  const claimWasCreated = previousClaim?.port !== allocation.port;
   const claim = await reserveTargetPinnedHostPort(input.target, {
     ...input.owner,
     // `null` is a real legacy identity, not a missing value. Preserve it until
@@ -600,7 +577,7 @@ export async function allocateAndReservePinnedHostPort(
     containerPort: previousClaim ? previousClaim.containerPort : input.owner.containerPort,
     port: allocation.port,
   });
-  return { ...allocation, preferred, previousClaim, claim };
+  return { ...allocation, preferred, previousClaim, claimWasCreated, claim };
 }
 
 /**

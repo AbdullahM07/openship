@@ -4,6 +4,25 @@ import { compileCloudDockerfilePlan } from "./cloud";
 import { resolveDockerBuildArgs } from "./docker-build-args";
 
 describe("resolveDockerBuildArgs (#689)", () => {
+  it("#795 forwards project env to Dockerfile ARG without a duplicate service map", () => {
+    expect(
+      resolveDockerBuildArgs({
+        envVars: {
+          DATABASE_URI: "postgres://db/app",
+          PAYLOAD_SECRET: "payload-secret",
+          SERVER_URL: "https://admin.example.com",
+          R4_SECRET_KEY: "r4-secret",
+        },
+      }),
+    ).toEqual({
+      DATABASE_URI: "postgres://db/app",
+      PAYLOAD_SECRET: "payload-secret",
+      SERVER_URL: "https://admin.example.com",
+      R4_SECRET_KEY: "r4-secret",
+      NODE_ENV: "production",
+    });
+  });
+
   it("keeps compatibility defaults while explicit service args win", () => {
     expect(
       resolveDockerBuildArgs({

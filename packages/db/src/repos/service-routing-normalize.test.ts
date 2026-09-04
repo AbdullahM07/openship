@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  composeWritePatch,
   createServiceRepo,
   isComposeProvenanceUpgrade,
   normalizeRoutingFields,
@@ -218,6 +219,194 @@ describe("legacy compose provenance baselines", () => {
     expect(writes).toHaveLength(1);
     expect(writes[0]).toMatchObject({ importedSpec: toComposeSpec(parsedNow), driftSpec: null });
     expect(writes[0]).not.toHaveProperty("environment");
+  });
+
+  it("does not attach new image provenance to an image the operator already changed", async () => {
+    const writes: Array<Record<string, unknown>> = [];
+    const parsedWithImageTemplate = {
+      ...oldBaseline,
+      advanced: {
+        ...oldBaseline.advanced,
+        imageTemplate: {
+          expression: "example/api:${VERSION:-1}",
+          unresolvedVariables: [],
+        },
+      },
+    };
+    const db = {
+      query: {
+        service: {
+          findMany: async () => [
+            {
+              id: "svc_1",
+              projectId: "proj_1",
+              kind: "compose",
+              ...oldBaseline,
+              image: "registry.example.com/acme/api:manual",
+              importedSpec: oldBaseline,
+              driftSpec: null,
+            },
+          ],
+        },
+      },
+      update: () => ({
+        set: (data: Record<string, unknown>) => {
+          writes.push(data);
+          return { where: async () => undefined };
+        },
+      }),
+    } as unknown as Database;
+
+    await createServiceRepo(db).reconcileFromCompose("proj_1", [parsedWithImageTemplate]);
+
+    expect(writes).toHaveLength(1);
+    expect(writes[0].advanced).toBeUndefined();
+    expect(writes[0]).toMatchObject({
+      importedSpec: toComposeSpec(parsedWithImageTemplate),
+      driftSpec: null,
+    });
+  });
+});
+
+describe("Compose image provenance (#809)", () => {
+  const stored = {
+    image: "ghcr.io/acme/api:1.0.0",
+    advanced: {
+      imageTemplate: {
+        expression: "ghcr.io/acme/api:${MY_VERSION}",
+        unresolvedVariables: [],
+      },
+      readiness: { enabled: true },
+    },
+  };
+
+  it("preserves the source expression when a parser-owned image is replayed", () => {
+    const patch = composeWritePatch(
+      {
+        name: "api",
+        image: "ghcr.io/acme/api:2.0.0",
+        advanced: {
+          imageTemplate: {
+            expression: "ghcr.io/acme/api:${MY_VERSION}",
+            unresolvedVariables: [],
+          },
+        },
+      },
+      stored,
+    );
+
+    expect(patch.advanced).toMatchObject({
+      readiness: { enabled: true },
+      imageTemplate: { expression: "ghcr.io/acme/api:${MY_VERSION}" },
+    });
+  });
+
+  it("clears stale source provenance when the image is a literal override", () => {
+    const patch = composeWritePatch(
+      { name: "api", image: "registry.example.com/acme/api:manual" },
+      stored,
+    );
+
+    expect(patch.image).toBe("registry.example.com/acme/api:manual");
+    expect(patch.advanced).toEqual({ readiness: { enabled: true } });
+  });
+
+  it("does not graft a newer expression onto an old literal rollback snapshot", () => {
+    const patch = composeWritePatch({ name: "api", image: stored.image }, stored);
+
+    expect(patch.image).toBe(stored.image);
+    expect(patch.advanced).toEqual({ readiness: { enabled: true } });
+  });
+
+  it("records an authoritative import baseline so later literal edits have clear ownership", async () => {
+    const writes: Array<Record<string, unknown>> = [];
+    const row = {
+      id: "svc_1",
+      projectId: "proj_1",
+      name: "api",
+      kind: "compose",
+      image: stored.image,
+      advanced: stored.advanced,
+      exposed: false,
+      importedSpec: null,
+      driftSpec: null,
+    };
+    const db = {
+      query: { service: { findMany: async () => [row] } },
+      update: () => ({
+        set: (data: Record<string, unknown>) => ({
+          where: async () => writes.push(data),
+        }),
+      }),
+    } as unknown as Database;
+    const parsed = {
+      name: "api",
+      image: stored.image,
+      advanced: stored.advanced,
+    };
+
+    await createServiceRepo(db).syncFromCompose("proj_1", [parsed], {
+      removeMissing: false,
+      composeAuthoritative: true,
+    });
+
+    expect(writes[0]).toMatchObject({
+      importedSpec: toComposeSpec(parsed),
+      driftSpec: null,
+    });
+  });
+
+  it("repairs an untouched legacy scan without taking ownership of a manual image", async () => {
+    const reconcile = async (image: string) => {
+      const writes: Array<Record<string, unknown>> = [];
+      const row = {
+        id: "svc_1",
+        projectId: "proj_1",
+        name: "api",
+        kind: "compose",
+        image,
+        buildArgs: {},
+        environment: {},
+        advanced: { readiness: { enabled: true } },
+        exposed: false,
+        importedSpec: null,
+        driftSpec: null,
+      };
+      const db = {
+        query: { service: { findMany: async () => [row] } },
+        update: () => ({
+          set: (data: Record<string, unknown>) => ({
+            where: async () => writes.push(data),
+          }),
+        }),
+      } as unknown as Database;
+      const parsed = {
+        name: "api",
+        image: "ghcr.io/acme/api:2.0.0",
+        advanced: {
+          imageTemplate: {
+            expression: "ghcr.io/acme/api:${MY_VERSION}",
+            unresolvedVariables: [],
+            sourceValue: "ghcr.io/acme/api:",
+          },
+        },
+      };
+
+      await createServiceRepo(db).reconcileFromCompose("proj_1", [parsed]);
+      return writes[0];
+    };
+
+    const untouched = await reconcile("ghcr.io/acme/api:");
+    expect(untouched.advanced).toMatchObject({
+      readiness: { enabled: true },
+      imageTemplate: { expression: "ghcr.io/acme/api:${MY_VERSION}" },
+    });
+
+    const manual = await reconcile("registry.example.com/acme/api:pinned");
+    expect(manual.advanced).toEqual({
+      readiness: { enabled: true },
+      environmentTemplateKeys: [],
+    });
   });
 });
 

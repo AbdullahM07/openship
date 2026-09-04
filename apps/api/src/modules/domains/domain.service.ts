@@ -502,10 +502,22 @@ export async function previewRecords(
 
 // ─── Get DNS records (existing domain) ───────────────────────────────────────
 
-export async function getDomainRecords(ctx: RequestContext, domainId: string) {
+export async function getDomainRecords(
+  ctx: RequestContext,
+  domainId: string,
+  targetServerId?: string,
+) {
   const { domain, project } = await getDomainWithAuth(domainId, ctx.organizationId);
   const token = domain.verificationToken ?? generateToken(domain.hostname);
-  return buildRecords(domain.hostname, token, project, domain.externalIngress, ctx.organizationId);
+  return buildRecords(
+    domain.hostname,
+    token,
+    project,
+    domain.externalIngress,
+    ctx.organizationId,
+    false,
+    targetServerId,
+  );
 }
 
 // ─── Auto-configure DNS (on-demand) ──────────────────────────────────────────
@@ -522,6 +534,7 @@ export async function getDomainRecords(ctx: RequestContext, domainId: string) {
 async function desiredDnsInputs(
   ctx: RequestContext,
   domainId: string,
+  targetServerId?: string,
 ): Promise<{ hostname: string; inputs: DnsRecordInput[] }> {
   const { domain, project } = await getDomainWithAuth(domainId, ctx.organizationId);
   const token = domain.verificationToken ?? generateToken(domain.hostname);
@@ -531,6 +544,8 @@ async function desiredDnsInputs(
     project,
     domain.externalIngress,
     ctx.organizationId,
+    false,
+    targetServerId,
   );
   const { routeName, txtName } = dnsRecordHosts(domain.hostname);
   const own = new Set([routeName.toLowerCase(), txtName.toLowerCase()]);
@@ -541,8 +556,12 @@ async function desiredDnsInputs(
 }
 
 /** Dry-run: what auto-configuring this domain's DNS would do. Reads only. */
-export async function planDomainDns(ctx: RequestContext, domainId: string): Promise<DnsPlanResult> {
-  const { hostname, inputs } = await desiredDnsInputs(ctx, domainId);
+export async function planDomainDns(
+  ctx: RequestContext,
+  domainId: string,
+  targetServerId?: string,
+): Promise<DnsPlanResult> {
+  const { hostname, inputs } = await desiredDnsInputs(ctx, domainId, targetServerId);
   return planRecords(ctx.organizationId, hostname, inputs);
 }
 
@@ -558,8 +577,9 @@ export async function planDomainDns(ctx: RequestContext, domainId: string): Prom
 export async function applyDomainDns(
   ctx: RequestContext,
   domainId: string,
+  targetServerId?: string,
 ): Promise<DnsProvisionResult> {
-  const { hostname, inputs } = await desiredDnsInputs(ctx, domainId);
+  const { hostname, inputs } = await desiredDnsInputs(ctx, domainId, targetServerId);
   return provisionRecords(ctx.organizationId, hostname, inputs);
 }
 
@@ -1638,7 +1658,7 @@ async function buildRecords(
    *  saw only the apex record, then wondered why www never resolved. */
   includeWww = false,
   /** Explicit pre-deploy target. Existing domain rows resolve through project. */
-  previewServerId?: string,
+  targetServerId?: string,
 ): Promise<{ mode: "cloud" | "selfhosted" | "external"; records: DnsRecord[] }> {
   const wwwHostname = includeWww ? wwwSiblingHostname(hostname) : null;
   const { target, runtime } = platform();
@@ -1698,15 +1718,15 @@ async function buildRecords(
   // box's public address (resolved once at ensure-server): the deployed project's
   // server, else this org's "This Server" row for the pre-deploy preview.
   let serverIp =
-    previewServerId && organizationId
-      ? await resolveServerHost(organizationId, previewServerId).catch(() => null)
+    targetServerId && organizationId
+      ? await resolveServerHost(organizationId, targetServerId).catch(() => null)
       : ((await resolveProjectServerHost(project)) ??
         (organizationId ? await resolveLocalServerHost(organizationId) : null));
   // A loopback is the local row's display host when no public IP was known at
   // registration — useless as "point your domain here". Re-detect live for this
   // (user-initiated, off-hot-path) preview; leave EMPTY so the UI shows a
   // placeholder rather than a dead `127.0.0.1` the operator would copy verbatim.
-  if ((!serverIp || isLoopbackHost(serverIp)) && !previewServerId) {
+  if ((!serverIp || isLoopbackHost(serverIp)) && !targetServerId) {
     const detected = await resolveInstancePublicIp().catch(() => null);
     serverIp = detected && !isLoopbackHost(detected) ? detected : null;
   }

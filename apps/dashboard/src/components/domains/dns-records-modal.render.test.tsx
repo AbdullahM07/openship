@@ -42,4 +42,20 @@ describe("DnsRecordsModal", () => {
     expect(out).toContain("Deploy");
     expect(out).toContain("Cancel");
   });
+
+  it("renders a custom confirmLabel when provided", () => {
+    const out = text(renderToStaticMarkup(
+      <I18nProvider>
+        <DnsRecordsModal
+          targets={[{ hostname: "app.example.com" }]}
+          confirmLabel="Install"
+          onConfirm={() => {}}
+          onCancel={() => {}}
+        />
+      </I18nProvider>,
+    ));
+
+    expect(out).toContain("Install");
+    expect(out).not.toContain("Deploy");
+  });
 });

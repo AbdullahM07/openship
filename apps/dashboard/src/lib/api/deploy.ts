@@ -185,6 +185,8 @@ export interface PrepareProjectResponse extends PrepareAppConfig {
   monorepoApps?: PrepareMonorepoApp[];
   monorepoWorkspace?: PrepareMonorepoWorkspace;
   rootEnv?: Record<string, string>;
+  /** Names explicitly declared under openship.json `env` (values stay masked). */
+  openshipEnvKeys?: string[];
   /** Routing config parsed from the repo's vercel.json (persisted on the project). */
   routing?: RoutingConfig;
   // ── Declared overlay (repo-root openship.json) — present only when the repo
@@ -333,6 +335,8 @@ export const deployApi = {
     branch?: string;
     environment?: string;
     envVars?: Record<string, string>;
+    /** Masked root .env rows explicitly selected for trusted server-side import. */
+    sourceEnvKeys?: string[];
     publicEndpoints?: Array<{
       port?: string;
       targetPath?: string;

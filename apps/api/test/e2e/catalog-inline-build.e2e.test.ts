@@ -126,11 +126,18 @@ describeDockerE2E("catalog inline build through the real build pipeline", () => 
         localPath: null,
         workspacePrepareCommand: null,
       } as never,
-      dep: { id: "d-widget", branch: "main", commitSha: null, trigger: "deploy", meta: null } as never,
+      dep: {
+        id: "d-widget",
+        branch: "main",
+        commitSha: null,
+        trigger: "deploy",
+        meta: null,
+      } as never,
       runtime,
       logger: new BuildLogger(() => {}),
       snapshot: SNAPSHOT as never,
       buildSessionId: "e2e-inline-build",
+      composeInterpolationEnv: {},
       buildEnvVars: {},
       buildResources: DEFAULT_RESOURCE_CONFIG,
     });
@@ -144,7 +151,9 @@ describeDockerE2E("catalog inline build through the real build pipeline", () => 
     // Run the produced image. Its ENTRYPOINT is the COPY'd script; the marker on
     // stdout proves the script is actually baked in, i.e. the prefix resolved and
     // the file was inside the build context — not merely that `docker build` exited 0.
-    const { stdout } = await execFileAsync("docker", ["run", "--rm", builtRef!], { env: dockerEnv });
+    const { stdout } = await execFileAsync("docker", ["run", "--rm", builtRef!], {
+      env: dockerEnv,
+    });
     expect(stdout).toContain(MARKER);
   }, 300_000);
 });

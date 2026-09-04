@@ -28,6 +28,7 @@ import {
   isReleaseProvider,
   releaseArtifactKind,
   renderReleaseImage,
+  looksLikeSecretKey,
   resolveProjectVolumes,
   type StackId,
   type DeployTarget,
@@ -37,22 +38,28 @@ import {
   type SourceKind,
   type BuildKind,
   type WorkloadType,
+  type OpenshipEnv,
 } from "@repo/core";
 import type { LogEntry, ResourceConfig } from "@repo/adapters";
 import { resolveCloudResourceConfig } from "./cloud-resources";
 import { resolveEnvDirtyServiceIds } from "./env-drift";
 import type { TBuildAccessBody } from "./deployment.schema";
 import { platform } from "../../lib/controller-helpers";
-import { encrypt } from "../../lib/encryption";
+import { decryptEnvMap, encrypt } from "../../lib/encryption";
 import { getCommitByRef, getLatestCommit, getRepository } from "../github/github.service";
 import { assertGitHubRepoAccess } from "../github/github-access";
 import { resolveSmartRoute } from "./smart-route";
 import { snapshotNeedsGitSource, withoutPinnedArtifacts } from "./pinned-artifacts";
 import { deploymentWorkload, projectToClass, snapshotToClass } from "./deployment-class";
-import { resolveProjectInfo } from "./prepare.service";
+import {
+  resolveProjectInfo,
+  resolveProjectSourceEnv,
+  type ProjectInfo,
+  type ProjectSourceEnv,
+} from "./prepare.service";
 import { ComposeConfigurationError } from "./compose-configuration-error";
 import { getFolderSession } from "../projects/folder/session-store";
-import { hasMaskedValue, unmaskEnv } from "../../lib/secret-env";
+import { hasMaskedValue, isMaskedValue, unmaskEnv } from "../../lib/secret-env";
 import { assertValidCustomDomains, customHostnamesOf } from "../../lib/custom-domain-guard";
 import {
   assertBuildMinutesAvailable,
@@ -95,7 +102,6 @@ import {
 } from "../../lib/release-resolver";
 import { commitSourceKey, projectBranch } from "../projects/project-crud.service";
 import { env } from "../../config";
-import { resolveBuildAccessEnv } from "./build-access-env";
 
 function throwPreflightFailure(preflight: PreflightResult): never {
   const failedChecks = preflight.checks.filter((check) => check.status === "fail");
@@ -602,6 +608,130 @@ async function resolveProjectBranch(ctx: RequestContext, project: Project, branc
   return "main";
 }
 
+function withComposeImageSource(
+  service: DeployableService,
+  source: Pick<DeployableService, "image" | "advanced">,
+): DeployableService {
+  const advanced = { ...(service.advanced ?? {}) };
+  const imageTemplate = source.advanced?.imageTemplate;
+  if (imageTemplate) {
+    // Copy the unresolved-variable array too: this becomes release metadata and
+    // must not share mutable request/session state with a later scan.
+    advanced.imageTemplate = {
+      expression: imageTemplate.expression,
+      unresolvedVariables: [...imageTemplate.unresolvedVariables],
+      ...(imageTemplate.sourceValue !== undefined && { sourceValue: imageTemplate.sourceValue }),
+    };
+  } else {
+    delete advanced.imageTemplate;
+  }
+
+  return {
+    ...service,
+    image: source.image,
+    ...(Object.keys(advanced).length > 0 ? { advanced } : { advanced: undefined }),
+  };
+}
+
+/** Copy the source-owned Docker build arguments and their interpolation marker
+ * without replacing unrelated advanced settings edited in the wizard. */
+function withComposeBuildArgsSource(
+  service: DeployableService,
+  source: Pick<DeployableService, "buildArgs" | "advanced">,
+): DeployableService {
+  const advanced = { ...(service.advanced ?? {}) };
+  if (Object.hasOwn(source.advanced ?? {}, "buildArgTemplateKeys")) {
+    advanced.buildArgTemplateKeys = [...(source.advanced?.buildArgTemplateKeys ?? [])];
+  } else {
+    delete advanced.buildArgTemplateKeys;
+  }
+
+  return {
+    ...service,
+    buildArgs: source.buildArgs ? { ...source.buildArgs } : undefined,
+    ...(Object.keys(advanced).length > 0 ? { advanced } : { advanced: undefined }),
+  };
+}
+
+function withComposeBuildSource(
+  service: DeployableService,
+  source: Pick<DeployableService, "image" | "buildArgs" | "advanced">,
+): DeployableService {
+  return withComposeBuildArgsSource(withComposeImageSource(service, source), source);
+}
+
+/**
+ * A deploy-wizard payload is allowed to own routing/runtime edits, but a fresh
+ * source reconciliation owns image/build inputs and their interpolation
+ * provenance. Re-attach those fields from the canonical rows so an older
+ * browser tab cannot overwrite a just-resolved image or build argument with its
+ * scan-time value.
+ */
+function mergeCanonicalComposeBuildSource(
+  requested: DeployableService[],
+  canonical: DeployableService[],
+): DeployableService[] {
+  const byName = new Map(
+    canonical
+      .filter((service) => serviceKind(service) === "compose")
+      .map((service) => [service.name, service]),
+  );
+  return requested.map((service) => {
+    if (serviceKind(service) !== "compose") return service;
+    const source = byName.get(service.name);
+    return source ? withComposeBuildSource(service, source) : service;
+  });
+}
+
+/**
+ * Folder scans happen before the wizard collects project env. Re-scan the same
+ * uploaded bytes with the final deployment env, then replace source-owned build
+ * inputs. A caller that actually changed the image after the initial scan keeps
+ * that literal override and loses the stale image-template marker; build args
+ * have no wizard editor and always come from the refreshed source.
+ */
+function mergeRefreshedFolderBuildSource(
+  current: DeployableService[],
+  initialScan: DeployableService[],
+  refreshedScan: DeployableService[],
+): DeployableService[] {
+  const initialByName = new Map(initialScan.map((service) => [service.name, service]));
+  const refreshedByName = new Map(refreshedScan.map((service) => [service.name, service]));
+
+  return current.map((service) => {
+    if (serviceKind(service) !== "compose") return service;
+    const refreshed = refreshedByName.get(service.name);
+    if (!refreshed) return service;
+
+    const initial = initialByName.get(service.name);
+    if (initial && service.image !== initial.image) {
+      // The image changed after scan, so it is operator-owned literal input.
+      // Never leave the scan's expression attached to reinterpret that edit.
+      return withComposeBuildArgsSource(
+        withComposeImageSource(service, { image: service.image, advanced: undefined }),
+        refreshed,
+      );
+    }
+    return withComposeBuildSource(service, refreshed);
+  });
+}
+
+function sameComposeBuildSource(a: DeployableService[], b: DeployableService[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((service, index) => {
+    const other = b[index];
+    return (
+      other?.name === service.name &&
+      other.image === service.image &&
+      JSON.stringify(other.buildArgs ?? null) === JSON.stringify(service.buildArgs ?? null) &&
+      JSON.stringify(other.advanced?.imageTemplate ?? null) ===
+        JSON.stringify(service.advanced?.imageTemplate ?? null) &&
+      JSON.stringify(other.advanced?.buildArgTemplateKeys ?? null) ===
+        JSON.stringify(service.advanced?.buildArgTemplateKeys ?? null)
+    );
+  });
+}
+
 /**
  * Re-parse the project's current docker-compose source and 3-way reconcile it against the
  * stored service rows (repos.service.reconcileFromCompose): services the user
@@ -617,12 +747,17 @@ async function resolveProjectBranch(ctx: RequestContext, project: Project, branc
  * scans for an already-materialized project. Bootstrap always scans once: an
  * optimization must not leave a declared compose project with zero services.
  * When the list is absent (manual redeploy) or empty, reconcile runs to be safe.
+ * Image-only Compose rows also always refresh: old rows cannot prove whether
+ * their stored string was authored literally or produced by missing interpolation.
  */
 const COMPOSE_PATH_RE = /(^|\/)(docker-compose|compose)\.ya?ml$/i;
 function composeCouldHaveChanged(project: Project, changedPaths: string[]): boolean {
   const declared = project.composePath?.trim().replace(/^\.\//, "").replace(/\/$/, "");
   return changedPaths.some((rawPath) => {
     const changed = rawPath.replace(/^\.\//, "");
+    // openship.json can itself declare the complete native service set and its
+    // buildArgs, so it is a Compose-source change even when no YAML changed.
+    if (changed.toLowerCase() === "openship.json") return true;
     if (COMPOSE_PATH_RE.test(changed)) return true;
     if (!declared) return false;
     return changed === declared || changed.startsWith(`${declared}/`);
@@ -648,8 +783,11 @@ async function reconcileComposeSource(
   ctx: RequestContext,
   project: Project,
   branch: string,
-  changedPaths?: string[] | null,
-) {
+  options: {
+    changedPaths?: string[] | null;
+    interpolationEnv?: Record<string, string>;
+  } = {},
+): Promise<ProjectInfo | undefined> {
   let bootstrapping = false;
   const localPath = project.localPath?.trim();
   const isLocalSource = Boolean(localPath);
@@ -657,6 +795,15 @@ async function reconcileComposeSource(
     if (!isLocalSource && (!project.gitOwner || !project.gitRepo)) return;
     const composeRows = await listProjectComposeServices(project.id);
     const hasComposeRows = composeRows.some((s) => s.kind === "compose");
+    // Image-only rows created by an older release carry no provenance, so we
+    // cannot tell a literal image from one whose `${VAR}` was already erased.
+    // Re-read those sources even for code-only webhooks. Current templated rows
+    // need the same refresh when project env changes; literal image-only rows
+    // pay a conservative source read in exchange for never guessing about an
+    // artifact. Source-built rows keep the changed-path fast path.
+    const needsImageSourceRefresh = composeRows.some(
+      (service) => serviceKind(service) === "compose" && !service.build,
+    );
     bootstrapping = !hasComposeRows && isMultiServiceProject(project);
     if (!hasComposeRows && !bootstrapping) return; // not a compose project
     const needsBaselineUpgrade = composeRowsNeedBaselineUpgrade(composeRows);
@@ -668,9 +815,10 @@ async function reconcileComposeSource(
       !bootstrapping &&
       !needsBaselineUpgrade &&
       !isLocalSource &&
-      changedPaths &&
-      changedPaths.length > 0 &&
-      !composeCouldHaveChanged(project, changedPaths)
+      options.changedPaths &&
+      options.changedPaths.length > 0 &&
+      !needsImageSourceRefresh &&
+      !composeCouldHaveChanged(project, options.changedPaths)
     ) {
       return; // this push didn't touch the compose file → no drift possible
     }
@@ -684,6 +832,7 @@ async function reconcileComposeSource(
           source: "local",
           path: localPath!,
           composePath,
+          env: options.interpolationEnv,
         })
       : await resolveProjectInfo({
           source: "github",
@@ -692,6 +841,7 @@ async function reconcileComposeSource(
           branch,
           ctx,
           composePath,
+          env: options.interpolationEnv,
         });
     const services = info.services ?? [];
     if (services.length === 0) {
@@ -708,6 +858,7 @@ async function reconcileComposeSource(
         `[compose-drift] ${project.id}: kept user edits on ${driftedNames.join(", ")} (pending review)`,
       );
     }
+    return info;
   } catch (err) {
     if (bootstrapping || isLocalSource) {
       const action = bootstrapping ? "initialize" : "refresh";
@@ -728,6 +879,47 @@ async function reconcileComposeSource(
       );
     }
     console.warn(`[compose-source] reconcile skipped for ${project.id}:`, err);
+    return undefined;
+  }
+}
+
+/**
+ * Read the small environment-only slice of a Git/local source when Compose
+ * reconciliation did not already return it. This keeps explicit single-app
+ * mode free of Compose parsing while giving every deployment entry point the
+ * same openship.json environment semantics.
+ */
+async function resolveLifecycleSourceEnv(
+  ctx: RequestContext,
+  project: Project,
+  branch: string,
+): Promise<ProjectSourceEnv | undefined> {
+  if (isReleaseProvider(project.gitProvider)) return undefined;
+  const localPath = project.localPath?.trim();
+  if (!localPath && (!project.gitOwner || !project.gitRepo)) return undefined;
+
+  try {
+    return localPath
+      ? await resolveProjectSourceEnv(
+          { source: "local", path: localPath },
+          project.rootDirectory ?? "",
+        )
+      : await resolveProjectSourceEnv(
+          {
+            source: "github",
+            owner: project.gitOwner!,
+            repo: project.gitRepo!,
+            branch,
+            ctx,
+          },
+          project.rootDirectory ?? "",
+        );
+  } catch (err) {
+    if (localPath) {
+      throw new AppError(`Could not read project environment: ${safeErrorMessage(err)}`, 400);
+    }
+    console.warn(`[source-env] refresh skipped for ${project.id}:`, err);
+    return undefined;
   }
 }
 
@@ -876,6 +1068,116 @@ export function encryptEnvVars(envVars?: Record<string, string>): Record<string,
     encrypted[k] = encrypt(v);
   }
   return encrypted;
+}
+
+type StoredProjectEnv = {
+  key: string;
+  value: string;
+  isSecret: boolean;
+};
+
+/**
+ * Resolve the env map submitted by the deploy wizard without destroying values
+ * the browser was never allowed to read.
+ *
+ * The shared mask sentinel means "keep the stored value"; it is never itself an
+ * environment value. Every real value, including an explicitly empty one, is
+ * encrypted normally. A sentinel with no stored secret behind it is dropped.
+ */
+function resolveSubmittedProjectEnv(
+  submitted: Record<string, string>,
+  storedRows: StoredProjectEnv[],
+): {
+  encrypted: Record<string, string> | null;
+  rows: Array<{ key: string; value: string; isSecret: boolean }>;
+} {
+  const storedByKey = new Map(storedRows.map((row) => [row.key, row]));
+  const rows: Array<{ key: string; value: string; isSecret: boolean }> = [];
+
+  for (const [key, submittedValue] of Object.entries(submitted)) {
+    const stored = storedByKey.get(key);
+    const preservesUnreadableSecret = stored?.isSecret === true && isMaskedValue(submittedValue);
+
+    if (isMaskedValue(submittedValue) && !preservesUnreadableSecret) {
+      // The mask is a transport sentinel, never an environment value. With no
+      // matching saved secret there is nothing safe to recover.
+      continue;
+    }
+
+    rows.push({
+      key,
+      value: preservesUnreadableSecret ? stored.value : encrypt(submittedValue),
+      isSecret: stored?.isSecret ?? looksLikeSecretKey(key),
+    });
+  }
+
+  const encrypted = Object.fromEntries(rows.map(({ key, value }) => [key, value]));
+  return { encrypted: rows.length > 0 ? encrypted : null, rows };
+}
+
+type PersistableProjectEnv = { key: string; value: string; isSecret: boolean };
+type SourceEnvInfo = ProjectSourceEnv;
+
+function openshipEnvValue(value: OpenshipEnv[string]): { value: string; isSecret: boolean } {
+  return typeof value === "string"
+    ? { value, isSecret: false }
+    : { value: value.value, isSecret: value.secret === true };
+}
+
+/**
+ * Layer source-owned environment defaults underneath the project environment.
+ *
+ * The source is never trusted through the browser: `openship.json` and an
+ * explicitly imported root `.env` arrive at build/access only as masked names,
+ * then this server-side source scan recovers their values. Existing/supplied
+ * project rows win. Newly inherited values are returned separately so callers
+ * can persist them without replacing unrelated project-owned rows.
+ */
+function mergeSourceEnvDefaults(
+  encryptedProjectEnv: Record<string, string> | null,
+  sourceInfo: SourceEnvInfo | undefined,
+  submitted?: Record<string, string>,
+  selectedSourceEnvKeys: readonly string[] = [],
+): {
+  encrypted: Record<string, string> | null;
+  additions: PersistableProjectEnv[];
+} {
+  const encrypted = { ...(encryptedProjectEnv ?? {}) };
+  const sourceDefaults = new Map<string, { value: string; isSecret: boolean }>();
+
+  for (const [key, value] of Object.entries(sourceInfo?.openshipEnv ?? {})) {
+    sourceDefaults.set(key, openshipEnvValue(value));
+  }
+
+  // A root `.env` remains opt-in. New clients send a values-free key list so an
+  // existing project's full env map stays server-owned; masked entries in the
+  // legacy full payload remain supported. Recover only those selected keys,
+  // never every value discovered beside the source tree.
+  const selectedRootEnvKeys = new Set(selectedSourceEnvKeys);
+  for (const [key, value] of Object.entries(submitted ?? {})) {
+    if (isMaskedValue(value)) selectedRootEnvKeys.add(key);
+  }
+  for (const key of selectedRootEnvKeys) {
+    if (!sourceDefaults.has(key) && sourceInfo?.rootEnv && Object.hasOwn(sourceInfo.rootEnv, key)) {
+      sourceDefaults.set(key, {
+        value: sourceInfo.rootEnv[key]!,
+        isSecret: looksLikeSecretKey(key),
+      });
+    }
+  }
+
+  const additions: PersistableProjectEnv[] = [];
+  for (const [key, source] of sourceDefaults) {
+    if (Object.hasOwn(encrypted, key)) continue;
+    const row = { key, value: encrypt(source.value), isSecret: source.isSecret };
+    encrypted[key] = row.value;
+    additions.push(row);
+  }
+
+  return {
+    encrypted: Object.keys(encrypted).length > 0 ? encrypted : null,
+    additions,
+  };
 }
 
 /**
@@ -1120,6 +1422,7 @@ export async function requestBuildAccess(
     branch,
     environment,
     envVars,
+    sourceEnvKeys,
     publicEndpoints,
     buildStrategy,
     deployTarget,
@@ -1164,22 +1467,78 @@ export async function requestBuildAccess(
     throw new AppError("Upload session not found or expired — re-upload the folder.", 400);
   }
 
-  // The uploaded folder's compose file is the ONLY description a folder deploy
-  // has of its service set, and the scan already parsed it — so adopt those
-  // services when the caller didn't forward them itself (the documented
-  // session → scan → ensure → deploy flow has no step that does, so a
-  // multi-service upload deployed with ZERO service rows and failed with "No
-  // services were found for this project"). Narrow on purpose: only for a project
-  // with no service rows yet, so an existing services project keeps its own rows
-  // and any operator edits, and an explicit "single" request is left alone.
-  let effectiveServices: DeployableService[] | undefined = services;
+  // Resolve the deployment's project environment before parsing Compose. Image
+  // interpolation is part of deployment configuration, so the source refresh
+  // and the eventual build must see the exact same values. Keep the encrypted
+  // map for the deployment row and decrypt only the in-memory interpolation copy.
+  const deployEnvironment = environment || "production";
+  let deploymentEnvVars: Record<string, string> | null;
+  let submittedProjectEnv: Array<{ key: string; value: string; isSecret: boolean }> | undefined;
+  if (envVars && Object.keys(envVars).length > 0) {
+    const storedRows = await repos.project.listEnvVars(project.id, deployEnvironment, null);
+    const resolved = resolveSubmittedProjectEnv(envVars, storedRows);
+    deploymentEnvVars = resolved.encrypted;
+    submittedProjectEnv = resolved.rows;
+  } else {
+    // A deployment snapshot is project-scoped. Service-scoped rows are loaded
+    // live, per service, by the compose deployer and must not enter image
+    // interpolation or leak into sibling services.
+    const rawEnvMap = await repos.project.getEnvMap(project.id, deployEnvironment, null);
+    deploymentEnvVars = Object.keys(rawEnvMap).length > 0 ? rawEnvMap : null;
+  }
+  const composeInterpolationEnv = decryptEnvMap(deploymentEnvVars ?? {});
+
+  // A folder scan happens before the wizard collects project env. Re-read the
+  // exact staged source now, against the deployment's frozen env, so Compose's
+  // adjacent `.env` and the submitted project values participate in ONE
+  // interpolation pass. Session-held parser output remains the comparison base
+  // that lets us distinguish an unchanged preview from a literal caller edit.
+  const initialUploadServices = uploadSession?.services ?? [];
+  let refreshedUploadServices: DeployableService[] | undefined;
+  let sourceInfo: SourceEnvInfo | undefined =
+    uploadSession &&
+    (uploadSession.rootEnv !== undefined || uploadSession.openshipEnv !== undefined)
+      ? {
+          rootEnv: uploadSession.rootEnv,
+          openshipEnv: uploadSession.openshipEnv,
+        }
+      : undefined;
+  if (uploadSession && serviceDeploymentMode !== "single" && uploadSession.services !== undefined) {
+    try {
+      const { scanFolderSession } = await import("../projects/folder/folder.service");
+      const refreshed = await scanFolderSession(uploadSession, {
+        env: composeInterpolationEnv,
+        composePath: project.composePath ?? undefined,
+        rememberServices: false,
+      });
+      sourceInfo = refreshed;
+      refreshedUploadServices = refreshed.services;
+    } catch (err) {
+      throw new AppError(
+        `Could not refresh the uploaded Compose source: ${safeErrorMessage(err)}`,
+        400,
+      );
+    }
+  }
+
+  // The uploaded folder's compose file is the only description a new folder
+  // deploy has of its service set. Adopt the refreshed scan when neither the
+  // request nor the canonical table has rows yet.
+  // `imageTemplate` is parser provenance, never client authority. Strip any
+  // copy supplied on the wire; the canonical repo row / server-side upload scan
+  // below is the only producer allowed to attach it again.
+  let effectiveServices: DeployableService[] | undefined = services?.map((service) =>
+    serviceKind(service) === "compose"
+      ? withComposeImageSource(service, { image: service.image, advanced: undefined })
+      : service,
+  );
   if (
     !effectiveServices?.length &&
     serviceDeploymentMode !== "single" &&
-    uploadSession?.services?.length &&
+    refreshedUploadServices?.length &&
     (await listProjectComposeServices(project.id)).length === 0
   ) {
-    effectiveServices = uploadSession.services;
+    effectiveServices = refreshedUploadServices;
   }
 
   const resolvedBranch = await resolveProjectBranch(ctx, project, branch);
@@ -1196,7 +1555,84 @@ export async function requestBuildAccess(
   // authoritative topology choice: do not parse, materialize, or validate the
   // declared compose file behind the caller's back.
   if (serviceDeploymentMode !== "single") {
-    await reconcileComposeSource(ctx, project, resolvedBranch);
+    const reconciled = await reconcileComposeSource(ctx, project, resolvedBranch, {
+      interpolationEnv: composeInterpolationEnv,
+    });
+    sourceInfo ??= reconciled;
+  }
+
+  if (!sourceInfo) {
+    if (uploadSession) {
+      try {
+        const { resolveFolderSessionSourceEnv } = await import("../projects/folder/folder.service");
+        sourceInfo = await resolveFolderSessionSourceEnv(
+          uploadSession,
+          project.rootDirectory ?? "",
+        );
+      } catch (err) {
+        throw new AppError(
+          `Could not read uploaded project environment: ${safeErrorMessage(err)}`,
+          400,
+        );
+      }
+    } else {
+      sourceInfo = await resolveLifecycleSourceEnv(ctx, project, resolvedBranch);
+    }
+  }
+
+  // `openship.json.env` is a source-owned DEFAULT layer. Resolve it again from
+  // the trusted source here (never from the masked browser payload), put saved /
+  // explicitly submitted project values above it, and freeze the result onto
+  // this deployment. This is the missing link in #795: the downstream Docker
+  // adapter already consumes deployment env as build args, but the declared
+  // values previously never entered that snapshot.
+  const sourceEnv = mergeSourceEnvDefaults(
+    deploymentEnvVars,
+    sourceInfo,
+    envVars,
+    sourceEnvKeys,
+  );
+  deploymentEnvVars = sourceEnv.encrypted;
+
+  // Source interpolation and the wizard payload have different ownership. The
+  // source owns `image` + its raw expression; the wizard owns routing/runtime
+  // edits. Merge after reconciliation so a stale browser scan cannot overwrite
+  // the value just resolved from this deployment's env. Folder uploads use the
+  // initial session scan as their edit baseline and the final-env re-scan as
+  // their source of truth.
+  if (serviceDeploymentMode !== "single") {
+    const canonicalRows = await listProjectComposeServices(project.id);
+    const canonicalServices = projectServicesToDeployableServices(canonicalRows);
+
+    if (refreshedUploadServices) {
+      let current = effectiveServices;
+      if (!current?.length && canonicalServices.length > 0) {
+        current = canonicalServices.filter((service) => service.enabled !== false);
+      }
+      if (!current?.length) current = refreshedUploadServices;
+
+      // With no explicit request list, newly discovered services belong to the
+      // uploaded source too. An explicit list remains an intentional topology
+      // selection (the wizard supports removing a service before deploy).
+      if (!services?.length) {
+        const names = new Set(current.map((service) => service.name));
+        current = [
+          ...current,
+          ...refreshedUploadServices.filter((service) => !names.has(service.name)),
+        ];
+      }
+
+      const merged = mergeRefreshedFolderBuildSource(
+        current,
+        initialUploadServices,
+        refreshedUploadServices,
+      );
+      if (effectiveServices?.length || !sameComposeBuildSource(current, merged)) {
+        effectiveServices = merged;
+      }
+    } else if (effectiveServices?.length && canonicalServices.length > 0) {
+      effectiveServices = mergeCanonicalComposeBuildSource(effectiveServices, canonicalServices);
+    }
   }
 
   // Migration handover refs bypass build/pull, so they are both internal-only
@@ -1484,7 +1920,7 @@ export async function requestBuildAccess(
     appTemplateId: project.appTemplateId,
     firstDeploy: !project.activeDeploymentId,
   });
-  const env = environment || "production";
+  const env = deployEnvironment;
 
   // ── Resolve commit info from the branch HEAD ────
   const { commitSha, commitMessage } = await resolveLatestCommitInfo(ctx, project, snapshot.branch);
@@ -1495,27 +1931,6 @@ export async function requestBuildAccess(
     snapshot.branch,
   );
 
-  // Resolve a supplied map against project-level rows before freezing the
-  // deployment snapshot. Existing secret values are never returned to the
-  // dashboard, so an empty/masked placeholder means "unchanged", not "replace
-  // this secret with blank". A deploy that supplied no env map keeps the cheap
-  // encrypted-map lookup used by redeploy callers.
-  const resolvedEnv =
-    envVars && Object.keys(envVars).length > 0
-      ? resolveBuildAccessEnv(
-          envVars,
-          // Explicit `null` scope is load-bearing: service env belongs to the
-          // compose deployer and must not leak into this project map.
-          await repos.project.listEnvVars(project.id, env, null),
-          encrypt,
-        )
-      : {
-          deploymentEnvVars: await repos.project
-            .getEnvMap(project.id, env, null)
-            .then((stored) => (Object.keys(stored).length > 0 ? stored : null)),
-          projectEnvVars: null,
-        };
-
   const dep = await createQueuedDeployment({
     projectId: project.id,
     organizationId: project.organizationId,
@@ -1525,7 +1940,7 @@ export async function requestBuildAccess(
     environment: env,
     framework: snapshot.framework,
     meta: metaWithPrevious(snapshot, project),
-    envVars: resolvedEnv.deploymentEnvVars,
+    envVars: deploymentEnvVars,
     rollbackStrategy,
     commitShaBefore,
     // Service-scoped folder-upload/MCP deploy: only these services are (re)built;
@@ -1538,8 +1953,17 @@ export async function requestBuildAccess(
   });
 
   // Store env vars on project as "latest defaults"
-  if (resolvedEnv.projectEnvVars) {
-    await repos.project.bulkSetEnvVars(project.id, env, resolvedEnv.projectEnvVars);
+  if (submittedProjectEnv) {
+    // These arrive as a flat map with no per-variable flag. New keys therefore
+    // use the name heuristic, while resolveSubmittedProjectEnv keeps an existing
+    // row's explicit flag and (for an unreadable secret) its exact ciphertext.
+    await repos.project.bulkSetEnvVars(project.id, env, submittedProjectEnv);
+  }
+  if (sourceEnv.additions.length > 0) {
+    // Add only missing source defaults after the optional full wizard replace.
+    // This preserves the ownership rule: a saved/operator value always wins,
+    // while headless and folder deploys gain newly declared defaults.
+    await repos.project.mergeEnvVars(project.id, env, sourceEnv.additions, []);
   }
 
   // Kick off the build BEFORE returning so the dashboard can attach via the
@@ -1826,8 +2250,18 @@ export async function redeployBuildSession(
   // reconcileComposeSource. A composePath bootstrap is intentionally strict;
   // an explicitly frozen single-app deployment must remain single and must not
   // materialize compose rows as a side effect of redeploying it.
+  let currentProjectEnv = await repos.project.getEnvMap(project.id, oldDep.environment, null);
+  let currentSourceInfo: SourceEnvInfo | undefined;
   if (meta.serviceDeploymentMode !== "single") {
-    await reconcileComposeSource(ctx, project, branch);
+    currentSourceInfo = await reconcileComposeSource(ctx, project, branch, {
+      interpolationEnv: decryptEnvMap(currentProjectEnv),
+    });
+  }
+  currentSourceInfo ??= await resolveLifecycleSourceEnv(ctx, project, branch);
+  const sourceEnv = mergeSourceEnvDefaults(currentProjectEnv, currentSourceInfo);
+  currentProjectEnv = sourceEnv.encrypted ?? {};
+  if (sourceEnv.additions.length > 0) {
+    await repos.project.mergeEnvVars(project.id, oldDep.environment, sourceEnv.additions, []);
   }
 
   const currentComposeRows = await listProjectComposeServices(project.id).catch(() => []);
@@ -1852,8 +2286,6 @@ export async function redeployBuildSession(
   // deployment's envVars is a release snapshot and belongs only to rollback.
   // Service-scoped rows stay out of this flat capture: the compose deployer
   // reads them live per service and applies them after compose inline env.
-  const currentProjectEnv = await repos.project.getEnvMap(project.id, oldDep.environment, null);
-
   const dep = await createQueuedDeployment({
     projectId: project.id,
     organizationId: project.organizationId,
@@ -2118,8 +2550,28 @@ export async function triggerDeployment(
     throw new AppError("An exact deployment scope requires at least one service ID", 400);
   }
 
+  // Freeze the project env before source reconciliation. This same encrypted
+  // map is attached to the deployment below, so Compose image interpolation
+  // and the worker cannot observe two different configuration revisions.
+  let encryptedEnvVars: Record<string, string> | null;
+  if (data.reuseSnapshot) {
+    encryptedEnvVars = data.reuseSnapshot.envVars;
+  } else {
+    const rawEnvMap = await repos.project.getEnvMap(project.id, environment, null);
+    encryptedEnvVars = Object.keys(rawEnvMap).length > 0 ? rawEnvMap : null;
+  }
+
   if (!data.reuseSnapshot && data.trigger !== "rollback") {
-    await reconcileComposeSource(ctx, project, branch, data.changedPaths);
+    let sourceInfo: SourceEnvInfo | undefined = await reconcileComposeSource(ctx, project, branch, {
+      changedPaths: data.changedPaths,
+      interpolationEnv: decryptEnvMap(encryptedEnvVars ?? {}),
+    });
+    sourceInfo ??= await resolveLifecycleSourceEnv(ctx, project, branch);
+    const sourceEnv = mergeSourceEnvDefaults(encryptedEnvVars, sourceInfo);
+    encryptedEnvVars = sourceEnv.encrypted;
+    if (sourceEnv.additions.length > 0) {
+      await repos.project.mergeEnvVars(project.id, environment, sourceEnv.additions, []);
+    }
   }
 
   // Scoped internal callers (incoming deploy hooks) require an exact target
@@ -2243,17 +2695,6 @@ export async function triggerDeployment(
     appTemplateId: project.appTemplateId,
     firstDeploy: !project.activeDeploymentId,
   });
-
-  // Env: a reused snapshot ships the EXACT encrypted env captured with the
-  // target deployment (atomic rollback); a fresh deploy reads the project's
-  // current (already-encrypted) env_var table.
-  let encryptedEnvVars: Record<string, string> | null;
-  if (reuse) {
-    encryptedEnvVars = reuse.envVars;
-  } else {
-    const rawEnvMap = await repos.project.getEnvMap(project.id, environment, null);
-    encryptedEnvVars = Object.keys(rawEnvMap).length > 0 ? rawEnvMap : null;
-  }
 
   // ── Resolve commit info: fetch HEAD from GitHub if not provided ────
   let commitSha = requestedCommitSha;

@@ -5,15 +5,14 @@ import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 
 import { prepareSourceTarArgs } from "../archive";
-import type {
-  CommandExecutor,
-  LogEntry,
-  ShellOptions,
-  ShellSession,
-  SshConfig,
-} from "../types";
+import type { CommandExecutor, LogEntry, ShellOptions, ShellSession, SshConfig } from "../types";
 import { logEntry, sq } from "./local-shell";
-import { canUseRemoteRsync, extractRemoteArchive, packLocalArchive, uploadFileWithRsync } from "./remote-transfer";
+import {
+  canUseRemoteRsync,
+  extractRemoteArchive,
+  packLocalArchive,
+  uploadFileWithRsync,
+} from "./remote-transfer";
 import type { Client as SshClient, ClientChannel, SFTPWrapper } from "ssh2";
 import type { Readable, Duplex } from "node:stream";
 import {
@@ -23,7 +22,12 @@ import {
   openDockerDialStdioChannel,
   type StreamLocalCapableClient,
 } from "./ssh-client";
-import { commandForError, SshDisconnectedError } from "./errors";
+import {
+  commandForError,
+  isSshExecRequestError,
+  SshDisconnectedError,
+  SshExecRequestError,
+} from "./errors";
 import { TRANSFER_EXCLUDES, formatBytes } from "@repo/core";
 
 /**
@@ -46,6 +50,16 @@ const SFTP_OPERATION_TIMEOUT_MS = 30_000;
  * can no longer receive mutations before the deployment lock is released. */
 const CHANNEL_CLOSE_GRACE_MS = 750;
 const TRANSPORT_CLOSE_GRACE_MS = 250;
+
+/**
+ * ssh2 exposes SSH_MSG_CHANNEL_FAILURE for an exec request as one untyped
+ * sentinel. Tag it while we still know the error came from `Client.exec`'s
+ * pre-stream callback; matching later would confuse remote command stderr with
+ * a command that never started.
+ */
+function tagExecRequestError(error: Error): Error {
+  return error.message === "Unable to exec" ? new SshExecRequestError(error) : error;
+}
 
 function abortError(operation: string, signal: AbortSignal): Error {
   const reason = signal.reason;
@@ -448,9 +462,10 @@ export class SshExecutor implements CommandExecutor {
     else this.resetConnection();
   }
 
-  /** Returns true if the error is an SSH channel-open failure. */
+  /** Returns true if the error is an SSH channel-open or channel-exec failure. */
   private static isChannelError(err: unknown): boolean {
     if (!(err instanceof Error)) return false;
+    if (isSshExecRequestError(err)) return true;
     const msg = err.message.toLowerCase();
     return msg.includes("channel open failure") || msg.includes("open failed");
   }
@@ -458,9 +473,10 @@ export class SshExecutor implements CommandExecutor {
   /**
    * Run an operation, and if it fails opening an SSH channel on a half-dead
    * cached connection ("Channel open failure: open failed" — common after the
-   * idle timeout drops the socket), drop the connection and retry ONCE on a
-   * fresh one. This is why `exec` survives a stale connection; the SFTP-based
-   * ops (writeFile/readFile/exists) must go through it too, or a deploy's route
+   * idle timeout drops the socket), recover channel capacity and retry ONCE.
+   * An idle connection is replaced; a busy one stays alive so its other command
+   * is not aborted (see recoverFromChannelError). The SFTP-based ops
+   * (writeFile/readFile/exists) must go through this too, or a deploy's route
    * write fails spuriously and only succeeds on a manual redeploy.
    */
   private async withChannelRetry<T>(fn: () => Promise<T>): Promise<T> {
@@ -544,7 +560,7 @@ export class SshExecutor implements CommandExecutor {
       timer.unref?.();
 
       client.exec(SshExecutor.ENV_PREFIX + command, (err, stream) => {
-        if (err) return finish(() => reject(err));
+        if (err) return finish(() => reject(tagExecRequestError(err)));
         channel = stream;
         if (terminating) {
           try { stream.close(); } catch {}
@@ -657,7 +673,7 @@ export class SshExecutor implements CommandExecutor {
       }
 
       client.exec(SshExecutor.ENV_PREFIX + command, (err, stream) => {
-        if (err) return finish(() => reject(err));
+        if (err) return finish(() => reject(tagExecRequestError(err)));
         channel = stream;
         // The abort may have fired between the check above and the channel opening.
         if (terminating || signal?.aborted) {

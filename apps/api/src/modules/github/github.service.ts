@@ -10,11 +10,12 @@ import { githubFetch, getGitHubAuthMode } from "./github.auth";
 import { ghFetch, ghSend } from "./github.http";
 import { mapRepositories } from "./sources/mappers";
 import { isIgnoredRepoPath } from "../../lib/project-root-detector";
+import { cacheStore, type CacheStore } from "../../lib/cache-store";
 import type { RequestContext } from "../../lib/request-context";
 import { buildBackgroundContext } from "../../lib/request-context";
 import { resolveOrgOwner } from "../../lib/org-actor";
 import { assertGitHubRepoAccess, canUseGitHubRepo } from "./github-access";
-import { AppError, safeErrorMessage } from "@repo/core";
+import { AppError, isFullCommitSha, safeErrorMessage } from "@repo/core";
 import { repos as dbRepos } from "@repo/db";
 import { encrypt, decrypt } from "../../lib/encryption";
 import type {
@@ -34,6 +35,15 @@ import { hasActiveGitHubSource } from "./github-source.service";
 
 export const GITHUB_DEPLOY_WEBHOOK_EVENTS = ["push"] as const;
 const MAX_FALLBACK_TREE_ENTRIES = 5000;
+const MAX_COMPARE_FILES_PER_RESPONSE = 300;
+const COMPARE_CACHE_TTL_SECONDS = 6 * 60 * 60;
+const compareInFlight = new Map<string, Promise<CompareCommitsResult | null>>();
+
+export interface CompareCommitsResult {
+  files: string[];
+  /** GitHub capped the response, so absence from `files` is not proof of no change. */
+  truncated: boolean;
+}
 
 /**
  * Length in bytes of a per-project webhook signing secret. 32 raw bytes
@@ -534,8 +544,13 @@ export async function getRecentCommits(
  * may have omitted some) and they need the FULL changed-files set for
  * smart per-service routing.
  *
- * Returns `null` on any API error so callers can degrade to the truncated
- * commits[] list rather than failing the deploy.
+ * Results for full-SHA pairs are immutable, so cache and coalesce them. The
+ * update-status read path can otherwise issue the same comparison once per
+ * project and once per dashboard surface even while its upstream HEAD is cached.
+ *
+ * GitHub caps a single comparison response at 300 files. We cannot prove a
+ * negative match from a capped set, so expose `truncated` and let routing/drift
+ * callers fall back conservatively. Returns `null` on any API error.
  */
 export async function compareCommits(
   ctx: RequestContext,
@@ -543,24 +558,66 @@ export async function compareCommits(
   repo: string,
   base: string,
   head: string,
-): Promise<{ files: string[] } | null> {
-  try {
-    const data = await githubFetch<{
-      files?: Array<{ filename: string; previous_filename?: string }>;
-    }>({
-      ctx,
-      owner,
-      repo,
-      url: `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`,
-    });
-    const out = new Set<string>();
-    for (const f of data.files ?? []) {
-      if (f.filename) out.add(f.filename);
-      if (f.previous_filename) out.add(f.previous_filename);
+): Promise<CompareCommitsResult | null> {
+  const key = JSON.stringify([
+    ctx.organizationId,
+    ctx.userId,
+    ctx.sessionKind,
+    ctx.principalKind ?? null,
+    ctx.tokenScope?.tokenId ?? null,
+    owner.toLowerCase(),
+    repo.toLowerCase(),
+    base.toLowerCase(),
+    head.toLowerCase(),
+  ]);
+  const cacheable = isFullCommitSha(base) && isFullCommitSha(head);
+  let store: CacheStore<CompareCommitsResult> | null = null;
+
+  if (cacheable) {
+    store = await cacheStore<CompareCommitsResult>("github-commit-comparisons", {
+      maxSize: 5_000,
+    }).catch(() => null);
+    const cached = await store?.get(key).catch(() => null);
+    if (cached) return cached;
+  }
+
+  const shared = compareInFlight.get(key);
+  if (shared) return shared;
+
+  const request = (async (): Promise<CompareCommitsResult | null> => {
+    try {
+      const data = await githubFetch<{
+        files?: Array<{ filename: string; previous_filename?: string }>;
+      }>({
+        ctx,
+        owner,
+        repo,
+        url: `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`,
+      });
+      const returnedFiles = data.files ?? [];
+      const out = new Set<string>();
+      for (const f of returnedFiles) {
+        if (f.filename) out.add(f.filename);
+        if (f.previous_filename) out.add(f.previous_filename);
+      }
+      const result = {
+        files: Array.from(out),
+        // Exactly 300 may be complete, but treating it as unknown is safer than
+        // suppressing a real update whose matching file was omitted by GitHub.
+        truncated: returnedFiles.length >= MAX_COMPARE_FILES_PER_RESPONSE,
+      };
+      if (store) await store.set(key, result, COMPARE_CACHE_TTL_SECONDS).catch(() => {});
+      return result;
+    } catch {
+      return null;
     }
-    return { files: Array.from(out) };
-  } catch {
-    return null;
+  })();
+
+  compareInFlight.set(key, request);
+  try {
+    return await request;
+  } finally {
+    if (compareInFlight.get(key) === request) compareInFlight.delete(key);
   }
 }
 

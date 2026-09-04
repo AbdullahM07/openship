@@ -172,12 +172,15 @@
       "runningStatus": "実行中 — {status}"
     },
     "cache": {
-      "title": "キャッシュ",
-      "description": "キャッシュされたビルド成果物と依存関係のインストールを消去します",
+      "title": "Docker ビルドキャッシュ",
+      "description": "未使用のビルドキャッシュはサーバーごとに自動で 5 GB に制限されます",
       "clearInstall": "インストールキャッシュを消去",
       "clearInstallDesc": "キャッシュされた node_modules を削除します",
       "clearBuild": "ビルドキャッシュを消去",
-      "clearBuildDesc": "キャッシュされたビルド出力を削除します"
+      "clearBuildDesc": "このプロジェクトの Docker サーバー全体から未使用キャッシュを削除します",
+      "clearBuildConfirm": "このサーバー上の未使用 Docker ビルドキャッシュをすべて消去しますか？他のプロジェクトは次回のデプロイ時に依存関係を再ビルドする場合があります。",
+      "clearBuildSuccess": "ビルドキャッシュを {size} 解放しました",
+      "clearBuildEmpty": "消去できる未使用のビルドキャッシュはありません"
     },
     "transfer": {
       "title": "移行とクローン",
