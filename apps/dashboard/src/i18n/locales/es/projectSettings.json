@@ -172,12 +172,15 @@
       "runningStatus": "En curso — {status}"
     },
     "cache": {
-      "title": "Caché",
-      "description": "Borra los artefactos de compilación y las instalaciones de dependencias en caché",
+      "title": "Caché de compilación de Docker",
+      "description": "La caché de compilación sin usar se limita automáticamente a 5 GB por servidor",
       "clearInstall": "Borrar caché de instalación",
       "clearInstallDesc": "Eliminar node_modules en caché",
       "clearBuild": "Borrar caché de compilación",
-      "clearBuildDesc": "Eliminar la salida de compilación en caché"
+      "clearBuildDesc": "Eliminar la caché sin usar del servidor Docker de este proyecto",
+      "clearBuildConfirm": "¿Borrar toda la caché de compilación de Docker sin usar en este servidor? Es posible que otros proyectos reconstruyan dependencias en su próximo despliegue.",
+      "clearBuildSuccess": "Se recuperaron {size} de caché de compilación",
+      "clearBuildEmpty": "No hay caché de compilación sin usar para borrar"
     },
     "transfer": {
       "title": "Transferir y clonar",

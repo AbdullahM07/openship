@@ -83,6 +83,8 @@ export {
   DockerRuntime,
   buildNetworkAliases,
   ownsBuiltImage,
+  type BuildCachePruneOptions,
+  type BuildCachePruneResult,
   type DockerConnectionOptions,
 } from "./runtime/docker";
 export { containerInfoFromDockerSummary } from "./runtime/docker-container-info";

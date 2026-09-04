@@ -172,12 +172,15 @@
       "runningStatus": "En cours — {status}"
     },
     "cache": {
-      "title": "Cache",
-      "description": "Videz les artefacts de build et les installations de dépendances mis en cache",
+      "title": "Cache de build Docker",
+      "description": "Le cache de build inutilisé est automatiquement limité à 5 Go par serveur",
       "clearInstall": "Vider le cache d'installation",
       "clearInstallDesc": "Supprimer les node_modules mis en cache",
       "clearBuild": "Vider le cache de build",
-      "clearBuildDesc": "Supprimer la sortie de build mise en cache"
+      "clearBuildDesc": "Supprimer le cache inutilisé du serveur Docker de ce projet",
+      "clearBuildConfirm": "Vider tout le cache de build Docker inutilisé sur ce serveur ? D'autres projets devront peut-être reconstruire leurs dépendances au prochain déploiement.",
+      "clearBuildSuccess": "{size} de cache de build récupérés",
+      "clearBuildEmpty": "Aucun cache de build inutilisé à vider"
     },
     "transfer": {
       "title": "Transfert et clonage",

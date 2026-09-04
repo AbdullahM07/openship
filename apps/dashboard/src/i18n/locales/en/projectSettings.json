@@ -309,12 +309,15 @@
       "runningStatus": "In progress — {status}"
     },
     "cache": {
-      "title": "Cache",
-      "description": "Clear cached build artifacts and dependency installs",
+      "title": "Docker Build Cache",
+      "description": "Unused build cache is automatically limited to 5 GB per server",
       "clearInstall": "Clear Install Cache",
       "clearInstallDesc": "Remove cached node_modules",
       "clearBuild": "Clear Build Cache",
-      "clearBuildDesc": "Remove cached build output"
+      "clearBuildDesc": "Remove unused cache across this project's Docker server",
+      "clearBuildConfirm": "Clear all unused Docker build cache on this server? Other projects may rebuild dependencies on their next deployment.",
+      "clearBuildSuccess": "Reclaimed {size} of build cache",
+      "clearBuildEmpty": "No unused build cache to clear"
     },
     "transfer": {
       "title": "Transfer & Clone",
