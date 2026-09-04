@@ -47,16 +47,19 @@ import {
   readApiVersion,
 } from "../../lib/release-resolver";
 import { resolveLatestImageDigest } from "../../lib/image-registry";
+import { normalizeProjectRootDirectory } from "../../lib/project-root-detector";
 import { env } from "../../config";
 import { assertResourceInOrg } from "../../lib/controller-helpers";
 import type { RequestContext } from "../../lib/request-context";
 import {
   resolveDefaultBranch,
   listBranches as listGitHubBranches,
+  compareCommits,
   getLatestCommit,
   getWebhookStrategy,
   resolveWebhookStrategy,
 } from "../github/github.service";
+import { projectMatchesChanges } from "../github/webhook-changed-files";
 import { getInstallationIdByOrg, resolveInstallUrl } from "../github/github.auth";
 import { hasActiveGitHubSource, resolveGitHubWebBaseUrl } from "../github/github-source.service";
 import { domainWebhookUrl } from "../../lib/public-url";
@@ -2317,7 +2320,11 @@ export async function resolveDeployedDrift(
  * private registry) or a project with no successful deploy reports
  * `behind:false`, so we never show an "outdated" nudge we can't substantiate.
  */
-export async function evaluateDrift(p: Project, upstream: UpstreamDrift) {
+export async function evaluateDrift(
+  p: Project,
+  upstream: UpstreamDrift,
+  ctx?: RequestContext | null,
+) {
   if (!upstream.supported) return { supported: false as const };
   // A cached upstream describes the source it was polled from. If the project has
   // since been repointed (different repo, branch, release source), it answers a
@@ -2333,7 +2340,14 @@ export async function evaluateDrift(p: Project, upstream: UpstreamDrift) {
     // supplied (an abbreviated `--commit`, a tag), so only a PROVABLE difference is
     // drift — otherwise a project deployed at `1eeaf76` is told a new commit
     // `1eeaf76` is available, forever. See compareCommitSha.
-    const behind = compareCommitSha(latestSha, deployedSha) === "different";
+    let behind = compareCommitSha(latestSha, deployedSha) === "different";
+    const root = normalizeProjectRootDirectory(p.rootDirectory ?? undefined);
+    if (behind && ctx && root) {
+      const compare = await compareCommits(ctx, p.gitOwner!, p.gitRepo!, deployedSha!, latestSha!);
+      if (compare && !compare.truncated) {
+        behind = projectMatchesChanges(root, compare.files, p.monorepoSharedPaths);
+      }
+    }
     // Is the latest commit already deploying? Then there's nothing to redeploy —
     // it's in flight, so the nudge is suppressed. Computed live, which is why
     // pressing Update quiets every surface immediately.
