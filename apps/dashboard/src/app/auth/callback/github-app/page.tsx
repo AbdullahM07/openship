@@ -1,14 +1,29 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { getApiOrigin } from "@/lib/api/urls";
-import { GITHUB_CONNECT_ERROR_KEY } from "@/lib/github-connect-error";
+import { useEffect, useRef, useState } from "react";
+import { getApiErrorMessage, githubApi } from "@/lib/api";
+import { storeGitHubConnectError } from "@/lib/github-connect-error";
+import { closeAuthWindowAfterSuccess } from "@/utils/authWindow";
 
 /** GitHub App Setup URL landing page for an operator-owned self-hosted App. */
 export default function GitHubAppSetupCallback() {
   const [message, setMessage] = useState("Verifying the GitHub App installation…");
+  const claimStarted = useRef(false);
 
   useEffect(() => {
+    // React's development Strict Mode replays effects. The installation nonce
+    // is intentionally one-shot, so never submit the same claim twice.
+    if (claimStarted.current) return;
+    claimStarted.current = true;
+
+    const fail = (detail: string) => {
+      storeGitHubConnectError(detail);
+      setMessage(detail);
+      // Leave enough time to read the local explanation; the opener also
+      // receives it from localStorage and shows the durable toast.
+      closeAuthWindowAfterSuccess(2200);
+    };
+
     async function claim() {
       const query = new URLSearchParams(window.location.search);
       const flow = query.get("flow");
@@ -18,30 +33,13 @@ export default function GitHubAppSetupCallback() {
       const setupAction = query.get("setup_action");
 
       if (!state || (flow === "manifest" ? !code : !installationId)) {
-        setMessage(
-          "GitHub did not return the required installation details. Start again from Settings.",
-        );
+        fail("GitHub did not return the required installation details. Start again from Settings.");
         return;
       }
 
       try {
-        const base = getApiOrigin(window.location.origin);
-        const endpoint =
-          flow === "manifest"
-            ? `${base}/api/github/sources/manifest/convert`
-            : `${base}/api/github/installations/claim`;
-        const response = await fetch(endpoint, {
-          method: "POST",
-          credentials: "include",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(
-            flow === "manifest" ? { code, state } : { installationId, state, setupAction },
-          ),
-        });
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(data?.message || "Could not verify the installation.");
-
         if (flow === "manifest") {
+          const data = await githubApi.convertSourceManifest(state, code!);
           if (!data?.installUrl)
             throw new Error("GitHub App was created, but its install URL is missing.");
           setMessage("GitHub App created. Opening repository access…");
@@ -49,23 +47,23 @@ export default function GitHubAppSetupCallback() {
           return;
         }
 
+        const data = await githubApi.claimInstallation({
+          state,
+          installationId: installationId!,
+          setupAction: setupAction ?? undefined,
+        });
         if (data?.pendingApproval) {
           setMessage("Installation requested. A GitHub organization owner must approve it.");
+          closeAuthWindowAfterSuccess(2200);
           return;
         }
         setMessage(
           `${data?.installation?.login || "GitHub"} is connected. You can close this window.`,
         );
-        window.setTimeout(() => window.close(), 1200);
+        closeAuthWindowAfterSuccess(1200);
       } catch (error) {
-        const detail =
-          error instanceof Error ? error.message : "Could not verify the installation.";
-        try {
-          localStorage.setItem(GITHUB_CONNECT_ERROR_KEY, detail);
-        } catch {
-          /* unavailable */
-        }
-        setMessage(detail);
+        const detail = getApiErrorMessage(error, "Could not verify the installation.");
+        fail(detail);
       }
     }
     void claim();

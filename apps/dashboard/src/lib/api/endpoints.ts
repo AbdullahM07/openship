@@ -234,6 +234,7 @@ export const endpoints = {
     connect: "github/connect",
     connectRedirect: "github/connect/redirect",
     connectPoll: "github/connect/poll",
+    installationClaim: "github/installations/claim",
     disconnect: "github/disconnect",
     instanceToken: "github/instance-token",
     sources: "github/sources",

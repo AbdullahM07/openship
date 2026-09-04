@@ -205,6 +205,14 @@ export const githubApi = {
   /** Poll device flow status */
   pollConnect: () => api.get<any>(endpoints.github.connectPoll),
 
+  /** Finalize a workspace-bound GitHub App installation callback. */
+  claimInstallation: (input: { state: string; installationId: string; setupAction?: string }) =>
+    api.post<{
+      ok: boolean;
+      pendingApproval?: boolean;
+      installation?: { login?: string };
+    }>(endpoints.github.installationClaim, input),
+
   /**
    * Disconnect a GitHub source.
    *   - "oauth" → remove the Openship App / OAuth account row
