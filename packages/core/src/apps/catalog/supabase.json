@@ -97,6 +97,7 @@
         "GOTRUE_API_HOST": "0.0.0.0",
         "GOTRUE_API_PORT": "9999",
         "API_EXTERNAL_URL": "{{publicUrl:kong}}",
+        "GOTRUE_SAML_EXTERNAL_URL": "{{publicUrl:kong}}/auth/v1",
         "GOTRUE_DB_DRIVER": "postgres",
         "GOTRUE_DB_DATABASE_URL": "postgres://supabase_auth_admin:{{config:POSTGRES_PASSWORD}}@db:5432/postgres",
         "GOTRUE_SITE_URL": "{{publicUrl:kong}}",
