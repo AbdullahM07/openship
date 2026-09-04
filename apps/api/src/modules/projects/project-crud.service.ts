@@ -59,7 +59,7 @@ import {
   getWebhookStrategy,
   resolveWebhookStrategy,
 } from "../github/github.service";
-import { serviceMatchesChanges } from "../github/webhook-changed-files";
+import { projectMatchesChanges } from "../github/webhook-changed-files";
 import { getInstallationIdByOrg, resolveInstallUrl } from "../github/github.auth";
 import { hasActiveGitHubSource, resolveGitHubWebBaseUrl } from "../github/github-source.service";
 import { domainWebhookUrl } from "../../lib/public-url";
@@ -2344,7 +2344,9 @@ export async function evaluateDrift(
     const root = normalizeProjectRootDirectory(p.rootDirectory ?? undefined);
     if (behind && ctx && root) {
       const compare = await compareCommits(ctx, p.gitOwner!, p.gitRepo!, deployedSha!, latestSha!);
-      if (compare) behind = serviceMatchesChanges(root, compare.files);
+      if (compare && !compare.truncated) {
+        behind = projectMatchesChanges(root, compare.files, p.monorepoSharedPaths);
+      }
     }
     // Is the latest commit already deploying? Then there's nothing to redeploy —
     // it's in flight, so the nudge is suppressed. Computed live, which is why
