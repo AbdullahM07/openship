@@ -72,6 +72,7 @@ import { LocalDeployComingSoonModal } from "@/components/LocalDeployComingSoonMo
 import { useLocalDeployGate } from "@/hooks/useLocalDeployGate";
 import { defaultDomainType } from "@/lib/default-domain-type";
 import { installSettledMessage } from "@/lib/install-settled-message";
+import { appInstallDnsTargets, attachDeploymentDomainIds } from "@/lib/deployment-dns";
 import { OptionCard } from "@/app/(dashboard)/(deployment)/deploy/[slug]/components/DeployTargetStep";
 import { AppLogo } from "@/components/AppLogo";
 import { VerifiedBadge } from "@/components/apps/VerifiedBadge";
@@ -1070,27 +1071,13 @@ export default function AppInstallPage() {
       // Pre-deploy DNS gate (self-hosted custom domain): surface the records to add
       // or auto-configure BEFORE the deploy so DNS is pointed when the first-deploy
       // SSL attempt runs.
-      const customRoutes = (routes ?? []).filter(
-        (r) => r.mode === "custom" && r.customDomain?.trim(),
-      );
-      if (selfHosted && customRoutes.length > 0) {
+      const pendingDnsTargets = appInstallDnsTargets(routes ?? []);
+      if (selfHosted && pendingDnsTargets.length > 0) {
         const projectInfo = await projectsApi.getInfo(pid).catch(() => null);
         const domainRows = Array.isArray(projectInfo?.data?.project?.domains)
           ? projectInfo.data.project.domains
           : [];
-        const domainByHost = new Map<string, string>();
-        for (const d of domainRows) {
-          if (typeof d?.hostname === "string" && typeof d?.id === "string") {
-            domainByHost.set(d.hostname.toLowerCase(), d.id);
-          }
-        }
-        const dnsTargets = customRoutes.map((r) => {
-          const host = normalizeCustomHostname(r.customDomain!);
-          return {
-            hostname: host,
-            domainId: domainByHost.get(host.toLowerCase()) ?? null,
-          };
-        });
+        const dnsTargets = attachDeploymentDomainIds(pendingDnsTargets, domainRows);
         if (dnsTargets.length > 0) {
           setBusy(false);
           let modalId = "";

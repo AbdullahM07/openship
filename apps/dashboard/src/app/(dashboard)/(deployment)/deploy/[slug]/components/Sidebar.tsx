@@ -27,7 +27,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { invalidateProjectCaches } from "@/hooks/useProjectEndpoints";
 import { projectsApi, githubApi, getApiErrorMessage } from "@/lib/api";
 import { useToast } from "@/context/ToastContext";
-import { deploymentDnsTargets } from "@/lib/deployment-dns";
+import { attachDeploymentDomainIds, deploymentDnsTargets } from "@/lib/deployment-dns";
 
 // ─── Deploy checklist for compose ────────────────────────────────────────────
 
@@ -243,22 +243,14 @@ const Sidebar: React.FC = () => {
     // BEFORE the deploy so DNS is pointed when the first-deploy SSL attempt runs.
     // A failed attempt just marks the domain Action Required — never blocks the
     // deploy. Informational-blocking: Deploy proceeds, Cancel aborts.
-    const dnsTargets = selfHosted ? deploymentDnsTargets(config) : [];
+    let dnsTargets = selfHosted ? deploymentDnsTargets(config) : [];
     if (dnsTargets.length > 0) {
       if (config.projectId) {
         const projectInfo = await projectsApi.getInfo(config.projectId).catch(() => null);
         const domainRows = Array.isArray(projectInfo?.data?.project?.domains)
           ? projectInfo.data.project.domains
           : [];
-        const domainByHost = new Map<string, string>();
-        for (const d of domainRows) {
-          if (typeof d?.hostname === "string" && typeof d?.id === "string") {
-            domainByHost.set(d.hostname.toLowerCase(), d.id);
-          }
-        }
-        for (const target of dnsTargets) {
-          target.domainId = domainByHost.get(target.hostname.toLowerCase()) ?? null;
-        }
+        dnsTargets = attachDeploymentDomainIds(dnsTargets, domainRows);
       }
       let modalId = "";
       modalId = showModal({

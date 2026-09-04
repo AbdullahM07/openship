@@ -54,33 +54,17 @@ export default function DnsRecordsModal({
           targets.map(async (target) => {
             try {
               const res = target.domainId
-                ? await domainsApi.records(target.domainId)
+                ? await domainsApi.records(target.domainId, serverId)
                 : await domainsApi.previewRecords(
                     target.hostname,
                     target.includeWww === true,
                     serverId,
                   );
               const mode = res.data.mode === "cloud" ? "cloud" as const : "selfhosted" as const;
-              let records = res.data.records;
-              if (
-                target.includeWww &&
-                mode === "selfhosted" &&
-                !records.some((record) => record.type === "CNAME" && record.host.startsWith("www"))
-              ) {
-                records = [
-                  ...records,
-                  {
-                    type: "CNAME" as const,
-                    host: "www",
-                    name: `www.${target.hostname}`,
-                    value: target.hostname,
-                  },
-                ];
-              }
               return {
                 hostname: target.hostname,
                 domainId: target.domainId ?? undefined,
-                records,
+                records: res.data.records,
                 mode,
               };
             } catch {
@@ -144,6 +128,7 @@ export default function DnsRecordsModal({
               mode={section.mode}
               showHeader={targets.length > 1}
               domainId={section.domainId}
+              serverId={serverId}
             />
           ))}
         </div>
