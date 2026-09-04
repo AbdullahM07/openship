@@ -15,6 +15,7 @@ import { m } from '@/paraglide/messages';
 import type { Sender } from '@/types';
 import { useQueryState } from 'nuqs';
 import { useEffect } from 'react';
+import { useParams } from 'react-router';
 import posthog from 'posthog-js';
 import { toast } from 'sonner';
 
@@ -24,6 +25,7 @@ interface ReplyComposeProps {
 
 export default function ReplyCompose({ messageId }: ReplyComposeProps) {
   const [mode, setMode] = useQueryState('mode');
+  const { folder } = useParams<{ folder: string }>();
   const { enableScope, disableScope } = useHotkeysContext();
   const { data: aliases } = useEmailAliases();
 
@@ -199,6 +201,7 @@ export default function ReplyCompose({ messageId }: ReplyComposeProps) {
         isForward: mode === 'forward',
         originalMessage: replyToMessage.decodedBody,
         originalMessageId: replyToMessage?.id,
+        originalFolder: folder,
         scheduleAt: data.scheduleAt,
       });
 
@@ -207,7 +210,7 @@ export default function ReplyCompose({ messageId }: ReplyComposeProps) {
       // Reset states
       setMode(null);
       await refetch();
-      
+
       handleUndoSend(result, settings, {
         to: data.to,
         cc: data.cc,
