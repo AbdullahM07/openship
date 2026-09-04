@@ -31,6 +31,7 @@
 /// <reference path="./tar-fs.d.ts" />
 import Dockerode from "dockerode";
 import * as tarFs from "tar-fs";
+import { randomUUID } from "node:crypto";
 import { createGzip } from "node:zlib";
 
 import type {
@@ -185,6 +186,20 @@ import {
   type DockerTransport,
   resolveDockerTransport,
 } from "./docker-transport";
+import {
+  chooseDockerBuildFailureHint,
+  dockerBuildExitMessage,
+  dockerBuildIdleTimeoutError,
+  extractDockerBuildFailureHint,
+  getDockerBuildIdleTimeoutMs,
+  startDockerBuildIdleMonitor,
+  type DockerBuildDiagnosticContext,
+} from "./docker-build-diagnostics";
+import {
+  LegacyBuildContainerTracker,
+  type LegacyBuildContainerInspect,
+  type LegacyBuildContainerTermination,
+} from "./docker-build-container-tracker";
 
 // ─── Connection config ───────────────────────────────────────────────────────
 export type { DockerConnectionOptions } from "./docker-transport";
@@ -223,7 +238,64 @@ const RESTART_POLICIES: Record<string, { Name: string; MaximumRetryCount: number
   no: { Name: "no", MaximumRetryCount: 0 },
 };
 
-const DOCKER_BUILD_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+interface DockerodeBuildStreamOptions {
+  trace?: BuildKitTraceDecoder;
+  diagnosticContext?: DockerBuildDiagnosticContext;
+  abortBuild?: (reason?: unknown) => void;
+  cancelSignal?: AbortSignal;
+  /** Present only for the classic builder, whose RUN container id appears in the stream. */
+  legacyBuilder?: { expectedMemoryBytes?: number; ownershipHost: string };
+}
+
+const BUILD_CONTAINER_CLEANUP_TIMEOUT_MS = 5_000;
+const BUILD_CONTAINER_IDENTIFICATION_GRACE_MS = 500;
+
+function newBuildOwnershipHost(): string {
+  // ExtraHosts is transient container configuration: it neither persists in
+  // the image nor changes classic-builder cache keys. The random hostname is a
+  // proof that an intermediate container belongs to this exact build request.
+  return `openship-build-${randomUUID()}.invalid`;
+}
+
+async function boundedBuildContainerCleanup(
+  cleanup: Promise<LegacyBuildContainerTermination>,
+): Promise<LegacyBuildContainerTermination | null> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  // Handle a late rejection even if the deadline wins the race.
+  const guarded = cleanup.catch(() => null);
+  const deadline = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), BUILD_CONTAINER_CLEANUP_TIMEOUT_MS);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([guarded, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function stopTrackedBuildContainer(
+  tracker: LegacyBuildContainerTracker | null,
+  log: BuildLogger,
+  reason: "timed-out" | "interrupted",
+): Promise<void> {
+  if (!tracker) return;
+  tracker.flush();
+  const cleanup = await boundedBuildContainerCleanup(tracker.terminateActive());
+  if (cleanup?.status === "killed") {
+    log.log(`Stopped ${reason} Docker build container ${cleanup.id.slice(0, 12)}.`);
+  } else if (cleanup?.status === "unverified") {
+    log.log(
+      `${reason === "timed-out" ? "Timed-out" : "Interrupted"} build container ${cleanup.id.slice(0, 12)} did not match this build's verified step; it was left untouched.`,
+      "warn",
+    );
+  } else if (cleanup === null) {
+    log.log(
+      `${reason === "timed-out" ? "Timed-out" : "Interrupted"} Docker build cleanup could not be confirmed within 5 seconds; Docker may still be releasing the build container.`,
+      "warn",
+    );
+  }
+}
 
 /**
  * A deployment build and its cancellation request may resolve separate
@@ -576,8 +648,17 @@ export function packBuildContext(
   entries: string[],
   cancelSignal?: AbortSignal,
   ignoreContextPath?: (relativePosixPath: string) => boolean,
-): { body: NodeJS.ReadableStream; abortSignal: AbortSignal; takeError: () => Error | null } {
+): {
+  body: NodeJS.ReadableStream;
+  abortSignal: AbortSignal;
+  abort: (reason?: unknown) => void;
+  detachCancellation: () => void;
+  takeError: () => Error | null;
+} {
   const controller = new AbortController();
+  const abort = (reason?: unknown) => {
+    if (!controller.signal.aborted) controller.abort(reason);
+  };
   // tar-fs hands the predicate an absolute path; `.dockerignore` matches
   // context-relative ones. Only set when the tree was NOT pruned destructively
   // (per-service build contexts) — see ResolvedDockerfile.ignoreContextPath.
@@ -590,21 +671,31 @@ export function packBuildContext(
   let contextError: Error | null = null;
   const capture = (err: unknown) => {
     contextError ??= err instanceof Error ? err : new Error(String(err));
-    if (!controller.signal.aborted) controller.abort();
+    abort(contextError);
   };
   // A cancelled build has to abort the in-flight buildImage request too: dockerode
   // forwards `abortSignal` to it, and on this path there is no remote process to
   // kill — aborting the request is the only thing that stops the daemon's build.
+  const onCancel = () => abort(cancelSignal?.reason);
   if (cancelSignal) {
-    if (cancelSignal.aborted) controller.abort();
-    else cancelSignal.addEventListener("abort", () => controller.abort(), { once: true });
+    if (cancelSignal.aborted) abort(cancelSignal.reason);
+    else cancelSignal.addEventListener("abort", onCancel, { once: true });
   }
   // pipe() does NOT forward source errors, so a tar-fs walk failure is only
   // observable on the pack itself — this listener is what keeps it from killing
   // the process. Guard the gzip side too for completeness.
   pack.once("error", capture);
   body.once("error", capture);
-  return { body, abortSignal: controller.signal, takeError: () => contextError };
+  return {
+    body,
+    abortSignal: controller.signal,
+    abort,
+    // Once buildImage has returned the response stream, streamDockerodeBuild
+    // owns cancellation. It briefly keeps that stream alive to receive Docker's
+    // exact intermediate-container id before aborting the request.
+    detachCancellation: () => cancelSignal?.removeEventListener("abort", onCancel),
+    takeError: () => contextError,
+  };
 }
 
 const DURATION_UNITS_NS: Record<string, number> = {
@@ -1191,11 +1282,12 @@ export class DockerRuntime implements RuntimeAdapter {
     },
     logger: BuildLogger,
     trace?: BuildKitTraceDecoder,
+    diagnosticContext: DockerBuildDiagnosticContext = {},
   ): string | null {
     const errorMessage = event.errorDetail?.message ?? event.error;
     if (errorMessage) {
       logger.log(errorMessage, "error");
-      return errorMessage;
+      return this.extractBuildFailureHint(errorMessage, diagnosticContext) ?? errorMessage;
     }
 
     // A BuildKit build emits its whole progress stream as protobuf traces instead of
@@ -1210,7 +1302,10 @@ export class DockerRuntime implements RuntimeAdapter {
         // are the only thing that turns a bare exit code into an explanation, and
         // BuildKit builds are precisely the ones with no other diagnostic.
         logger.log(line.message, line.level === "error" ? "error" : parseLogLevel(line.message));
-        hint ??= this.extractBuildFailureHint(line.message);
+        hint = chooseDockerBuildFailureHint(
+          hint,
+          this.extractBuildFailureHint(line.message, diagnosticContext),
+        );
       }
       return hint;
     }
@@ -1247,7 +1342,7 @@ export class DockerRuntime implements RuntimeAdapter {
       }
 
       logger.log(line, parseLogLevel(line));
-      return this.extractBuildFailureHint(line);
+      return this.extractBuildFailureHint(line, diagnosticContext);
     }
 
     if (event.status) {
@@ -1282,10 +1377,12 @@ export class DockerRuntime implements RuntimeAdapter {
     return DockerRuntime.DOCKER_BUILDER_NOISE.some((p) => p.test(line));
   }
 
-  private extractBuildFailureHint(line: string): string | null {
-    if (/returned a non-zero code:\s*\d+/i.test(line)) {
-      return line;
-    }
+  private extractBuildFailureHint(
+    line: string,
+    diagnosticContext: DockerBuildDiagnosticContext = {},
+  ): string | null {
+    const processFailure = extractDockerBuildFailureHint(line, diagnosticContext);
+    if (processFailure) return processFailure;
 
     // The legacy builder's own wording for "this Dockerfile needs BuildKit". Reached
     // when the syntax sniff missed a construct, or on a remote host whose docker CLI
@@ -1464,12 +1561,15 @@ export class DockerRuntime implements RuntimeAdapter {
     // containers to remove), so it goes when BuildKit is on.
     const buildKit = await this.remoteBuildKitAvailable();
     const builderEnv = buildKit ? "DOCKER_BUILDKIT=1 " : "";
+    const ownershipHost = buildKit ? null : newBuildOwnershipHost();
     // `--progress` is a buildx flag, NOT a docker-build flag: a CLI without the
     // plugin rejects it outright with `unknown flag: --progress` and exit 125, before
     // it ever looks at the context. `--force-rm` is the mirror image — a legacy-only
     // concept (BuildKit keeps no intermediate containers to remove). So the flag set
     // follows the builder; passing either unconditionally breaks one of the two.
-    const builderFlags = buildKit ? " --progress=plain" : " --force-rm";
+    const builderFlags = buildKit
+      ? " --progress=plain"
+      : ` --force-rm --add-host ${sq(`${ownershipHost}:127.0.0.1`)}`;
     if (buildKit) {
       log.log("Builder: BuildKit (docker buildx detected on the host)");
     } else if (opts?.requiresBuildKit) {
@@ -1509,22 +1609,92 @@ export class DockerRuntime implements RuntimeAdapter {
       "Running install inside container (docker build)",
     );
 
-    const { code } = await executor.streamExec(
-      buildCmd,
-      (entry) => {
-        // Pass docker's real output straight through.
-        log.log(entry.message, parseLogLevel(entry.message));
+    // Native SSH builds do not pass Docker's --memory flag, even when the
+    // project has a configured build limit. Keep that distinction explicit so
+    // an exit-137 diagnostic never claims a cap this path did not enforce.
+    const diagnosticContext: DockerBuildDiagnosticContext = {
+      configuredMemoryMb: config.resources.memoryMb,
+      memoryLimitApplied: false,
+    };
+    const buildContainerTracker = buildKit
+      ? null
+      : this.remoteLegacyBuildContainerTracker(executor, ownershipHost!);
+    const commandAbort = new AbortController();
+    const forwardCancellation = () => {
+      buildContainerTracker?.flush();
+      if (buildContainerTracker) void buildContainerTracker.terminateActive();
+      commandAbort.abort(signal?.reason);
+    };
+    if (signal?.aborted) forwardCancellation();
+    else signal?.addEventListener("abort", forwardCancellation, { once: true });
+
+    let timeoutError: Error | null = null;
+    let streamedFailureHint: string | null = null;
+    const timeoutMs = getDockerBuildIdleTimeoutMs();
+    const idleMonitor = startDockerBuildIdleMonitor({
+      timeoutMs,
+      onIdle: (idleMs) => {
+        log.log(`Still building... (no output for ${Math.floor(idleMs / 60_000)}m)`);
       },
-      { signal },
-    );
+      onTimeout: () => {
+        timeoutError = dockerBuildIdleTimeoutError(timeoutMs, diagnosticContext);
+        buildContainerTracker?.flush();
+        if (buildContainerTracker) void buildContainerTracker.terminateActive();
+        commandAbort.abort(timeoutError);
+      },
+    });
+
+    let code: number | null = null;
+    let execError: unknown = null;
+    try {
+      const result = await executor.streamExec(
+        buildCmd,
+        (entry) => {
+          idleMonitor.progress();
+          buildContainerTracker?.observeChunk(entry.message);
+          streamedFailureHint = chooseDockerBuildFailureHint(
+            streamedFailureHint,
+            this.extractBuildFailureHint(entry.message, diagnosticContext),
+          );
+          // Pass docker's real output straight through.
+          log.log(entry.message, parseLogLevel(entry.message));
+        },
+        { signal: commandAbort.signal },
+      );
+      code = result.code;
+    } catch (error) {
+      execError = error;
+    } finally {
+      idleMonitor.stop();
+      buildContainerTracker?.flush();
+      signal?.removeEventListener("abort", forwardCancellation);
+    }
 
     log.log("─── end docker build output ───");
     // SshExecutor intentionally resolves an aborted stream so browser log
     // teardown is not reported as a transport failure. A deployment cancel is
     // different: surface it as a cancelled BuildResult instead of continuing
     // through image verification and deploy.
-    if (signal?.aborted) throw new BuildCancelledError();
-    if (code !== 0) throw new Error(`docker build exited with code ${code}`);
+    if (timeoutError) {
+      await stopTrackedBuildContainer(buildContainerTracker, log, "timed-out");
+      throw timeoutError;
+    }
+    if (signal?.aborted) {
+      await stopTrackedBuildContainer(buildContainerTracker, log, "interrupted");
+      throw new BuildCancelledError();
+    }
+    if (execError) {
+      await stopTrackedBuildContainer(buildContainerTracker, log, "interrupted");
+      throw execError;
+    }
+    if (code === null) {
+      await stopTrackedBuildContainer(buildContainerTracker, log, "interrupted");
+      throw new Error("docker build ended without an exit code");
+    }
+    if (code !== 0) {
+      await stopTrackedBuildContainer(buildContainerTracker, log, "interrupted");
+      throw new Error(dockerBuildExitMessage(code, streamedFailureHint, diagnosticContext));
+    }
     this.emitDockerStep(log, "install", "completed", "Image build finished");
   }
 
@@ -1848,6 +2018,65 @@ export class DockerRuntime implements RuntimeAdapter {
   }
 
   /**
+   * Bind legacy-builder cleanup to the exact container id Docker announces in
+   * this build's own progress stream. A 404 is an ordinary "already cleaned"
+   * result; every other inspection failure remains inconclusive and therefore
+   * can never authorize a kill.
+   */
+  private legacyBuildContainerTracker(
+    expectedMemoryBytes: number | undefined,
+    ownershipHost: string,
+  ): LegacyBuildContainerTracker {
+    return new LegacyBuildContainerTracker(
+      {
+        inspect: async (id) => {
+          try {
+            return await this.docker.getContainer(id).inspect();
+          } catch (error) {
+            if (isDockerNotFoundError(error)) return null;
+            throw error;
+          }
+        },
+        kill: async (id) => {
+          await this.docker.getContainer(id).kill({ signal: "SIGKILL" });
+        },
+      },
+      expectedMemoryBytes,
+      ownershipHost,
+    );
+  }
+
+  /** Same proof model as the Engine-API tracker, using the already-live SSH executor. */
+  private remoteLegacyBuildContainerTracker(
+    executor: CommandExecutor,
+    ownershipHost: string,
+  ): LegacyBuildContainerTracker {
+    return new LegacyBuildContainerTracker(
+      {
+        inspect: async (id) => {
+          try {
+            const output = await executor.exec(`docker container inspect ${sq(id)}`);
+            const parsed: unknown = JSON.parse(output);
+            return Array.isArray(parsed) && parsed[0] && typeof parsed[0] === "object"
+              ? (parsed[0] as LegacyBuildContainerInspect)
+              : null;
+          } catch (error) {
+            if (/No such (?:object|container)|not found/i.test(safeErrorMessage(error)))
+              return null;
+            throw error;
+          }
+        },
+        kill: async (id) => {
+          await executor.exec(`docker container kill --signal KILL ${sq(id)} >/dev/null`);
+        },
+      },
+      // The native CLI path intentionally applies no OpenShip memory flag.
+      undefined,
+      ownershipHost,
+    );
+  }
+
+  /**
    * Dockerode build path. Used for local socket and TCP transports, plus
    * SSH transports that didn't get an executor wired in (shouldn't happen
    * in normal operation but kept as a safety net).
@@ -1865,7 +2094,7 @@ export class DockerRuntime implements RuntimeAdapter {
   ): Promise<void> {
     log.log(`Streaming build context to Docker daemon - image tag: ${tag}`);
 
-    const { body, abortSignal, takeError } = packBuildContext(
+    const { body, abortSignal, abort, detachCancellation, takeError } = packBuildContext(
       buildContext.buildContextDir,
       buildContext.contextEntries,
       cancelSignal,
@@ -1873,6 +2102,14 @@ export class DockerRuntime implements RuntimeAdapter {
     );
 
     const builder = this.selectDockerodeBuilder(config, buildContext.requiresBuildKit, log);
+    const buildLimits = dockerBuildResourceLimits(config.resources);
+    const ownershipHost = builder.options.version !== "2" ? newBuildOwnershipHost() : null;
+    const diagnosticContext: DockerBuildDiagnosticContext = {
+      configuredMemoryMb: config.resources.memoryMb,
+      // Engine API build limits work only with the classic builder. The
+      // BuildKit selection above already logs that its build runs uncapped.
+      memoryLimitApplied: builder.options.version !== "2" && buildLimits.memory !== undefined,
+    };
 
     try {
       const stream = await this.docker.buildImage(body, {
@@ -1883,14 +2120,24 @@ export class DockerRuntime implements RuntimeAdapter {
         // Omitted entirely unless the project set a build cap — a self-hosted
         // build should be free to use the machine (a production build often
         // needs several GB). Opt-in only; see dockerBuildResourceLimits.
-        ...dockerBuildResourceLimits(config.resources),
+        ...buildLimits,
+        ...(ownershipHost && { extrahosts: `${ownershipHost}:127.0.0.1` }),
         forcerm: true,
         ...builder.options,
         abortSignal,
       });
+      detachCancellation();
 
       log.log("Connected to Docker daemon. Build output follows:");
-      await this.streamDockerodeBuild(stream, log, builder.trace);
+      await this.streamDockerodeBuild(stream, log, {
+        trace: builder.trace,
+        diagnosticContext,
+        abortBuild: abort,
+        cancelSignal,
+        ...(ownershipHost && {
+          legacyBuilder: { expectedMemoryBytes: buildLimits.memory, ownershipHost },
+        }),
+      });
       log.log("Docker daemon finished streaming build output. Finalizing image...\n");
     } catch (err) {
       // A context-pack failure aborts the request, so the rejection here is the
@@ -1902,6 +2149,7 @@ export class DockerRuntime implements RuntimeAdapter {
           })
         : err;
     } finally {
+      detachCancellation();
       // Clean up only AFTER the daemon has fully consumed the context. dockerode's
       // buildImage promise resolves as soon as the response starts, while tar-fs
       // may still be walking contextDir — deleting it here (the old `finally`
@@ -1918,78 +2166,133 @@ export class DockerRuntime implements RuntimeAdapter {
   private async streamDockerodeBuild(
     stream: NodeJS.ReadableStream,
     log: BuildLogger,
-    trace?: BuildKitTraceDecoder,
+    options: DockerodeBuildStreamOptions = {},
   ): Promise<void> {
     let fatalBuildError: string | null = null;
+    const timeoutMs = getDockerBuildIdleTimeoutMs();
+    const diagnosticContext = options.diagnosticContext ?? {};
+    const buildContainerTracker = options.legacyBuilder
+      ? this.legacyBuildContainerTracker(
+          options.legacyBuilder.expectedMemoryBytes,
+          options.legacyBuilder.ownershipHost,
+        )
+      : null;
+    let inactivityTimedOut = false;
 
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      let idleTimer: NodeJS.Timeout | null = null;
-      let keepaliveTimer: NodeJS.Timeout | null = null;
-      let idleMinutes = 0;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        let idleMonitor: ReturnType<typeof startDockerBuildIdleMonitor> | null = null;
+        let cancellationTimer: ReturnType<typeof setTimeout> | null = null;
 
-      const clearTimers = () => {
-        if (idleTimer) {
-          clearTimeout(idleTimer);
-          idleTimer = null;
-        }
-        if (keepaliveTimer) {
-          clearInterval(keepaliveTimer);
-          keepaliveTimer = null;
-        }
-        idleMinutes = 0;
-      };
+        const clearTimers = () => {
+          idleMonitor?.stop();
+          if (cancellationTimer) clearTimeout(cancellationTimer);
+          options.cancelSignal?.removeEventListener("abort", requestCancellation);
+        };
 
-      const fail = (error: Error) => {
-        if (settled) return;
-        settled = true;
-        clearTimers();
-        (stream as any).destroy?.(error);
-        reject(error);
-      };
+        const fail = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          clearTimers();
+          (stream as any).destroy?.(error);
+          reject(error);
+        };
 
-      const succeed = () => {
-        if (settled) return;
-        settled = true;
-        clearTimers();
-        resolve();
-      };
+        const abortCancelledBuild = () => {
+          if (settled) return;
+          buildContainerTracker?.flush();
+          if (buildContainerTracker) void buildContainerTracker.terminateActive();
+          const error = new BuildCancelledError();
+          fail(error);
+          options.abortBuild?.(error);
+        };
 
-      const resetIdleTimer = () => {
-        clearTimers();
-        keepaliveTimer = setInterval(() => {
-          idleMinutes += 1;
-          log.log(`Still building... (no output for ${idleMinutes}m)`);
-        }, 60_000);
-        if ((keepaliveTimer as any).unref) (keepaliveTimer as any).unref();
-
-        idleTimer = setTimeout(() => {
-          fail(
-            new Error(
-              "Docker build produced no output for 30 minutes. This usually means the remote server cannot reach the package registry, has broken DNS, or the Docker daemon stalled during the build.",
-            ),
+        const requestCancellation = () => {
+          if (settled || cancellationTimer) return;
+          idleMonitor?.stop();
+          // A cancel can land after `Step ... : RUN` but just before Docker emits
+          // `Running in <id>`. Keep only the response stream alive for this tiny
+          // grace window so cleanup can identify the exact container; no new
+          // build step is allowed to outlive the cancellation request.
+          cancellationTimer = setTimeout(
+            abortCancelledBuild,
+            buildContainerTracker ? BUILD_CONTAINER_IDENTIFICATION_GRACE_MS : 0,
           );
-        }, DOCKER_BUILD_IDLE_TIMEOUT_MS);
-        if ((idleTimer as any).unref) (idleTimer as any).unref();
-      };
+          cancellationTimer.unref?.();
+        };
 
-      resetIdleTimer();
-
-      this.docker.modem.followProgress(
-        stream,
-        (err: Error | null) => {
-          if (err) {
-            fail(err);
+        const succeed = () => {
+          if (settled) return;
+          if (options.cancelSignal?.aborted) {
+            abortCancelledBuild();
             return;
           }
-          succeed();
-        },
-        (event) => {
-          resetIdleTimer();
-          fatalBuildError ??= this.handleBuildEvent(event, log, trace);
-        },
+          settled = true;
+          clearTimers();
+          resolve();
+        };
+
+        idleMonitor = startDockerBuildIdleMonitor({
+          timeoutMs,
+          onIdle: (idleMs) => {
+            log.log(`Still building... (no output for ${Math.floor(idleMs / 60_000)}m)`);
+          },
+          onTimeout: () => {
+            const error = dockerBuildIdleTimeoutError(timeoutMs, diagnosticContext);
+            // Start exact-container cleanup before closing the response. The
+            // Engine API does not reliably stop a legacy build when its client
+            // disconnects, so stream destruction alone can leave the compiler
+            // consuming the host after OpenShip has already reported failure.
+            inactivityTimedOut = true;
+            if (buildContainerTracker) {
+              void buildContainerTracker.terminateActive();
+            }
+            fail(error);
+            options.abortBuild?.(error);
+          },
+        });
+
+        if (options.cancelSignal?.aborted) requestCancellation();
+        else options.cancelSignal?.addEventListener("abort", requestCancellation, { once: true });
+
+        this.docker.modem.followProgress(
+          stream,
+          (err: Error | null) => {
+            if (err) {
+              fail(err);
+              return;
+            }
+            succeed();
+          },
+          (event) => {
+            idleMonitor?.progress();
+            buildContainerTracker?.observe(event.stream);
+            fatalBuildError = chooseDockerBuildFailureHint(
+              fatalBuildError,
+              this.handleBuildEvent(event, log, options.trace, diagnosticContext),
+            );
+          },
+        );
+      });
+    } catch (error) {
+      // Cancellation and transport failure can strand a legacy builder exactly
+      // like an inactivity timeout. The same proof gate applies to all three.
+      await stopTrackedBuildContainer(
+        buildContainerTracker,
+        log,
+        inactivityTimedOut ? "timed-out" : "interrupted",
       );
-    });
+      throw error;
+    }
+
+    // dockerode's followProgress may report a deliberately aborted response as
+    // a clean EOF. The caller's signal is the source of truth, and the daemon
+    // may still be running the intermediate container behind that closed stream.
+    if (options.cancelSignal?.aborted) {
+      await stopTrackedBuildContainer(buildContainerTracker, log, "interrupted");
+      throw new BuildCancelledError();
+    }
 
     if (fatalBuildError) {
       throw new Error(fatalBuildError);
@@ -2945,13 +3248,20 @@ export class DockerRuntime implements RuntimeAdapter {
             // failure fails just this service instead of crashing the API — see
             // packBuildContext (#448). tree.cleanup() only runs after the whole
             // loop (outer finally), so the context stays put while tar-fs walks.
-            const { body, abortSignal, takeError } = packBuildContext(
+            const { body, abortSignal, abort, detachCancellation, takeError } = packBuildContext(
               buildContextDir ?? tree!.contextDir,
               contextEntries ?? [],
               signal,
               ignoreContextPath,
             );
             const builder = this.selectDockerodeBuilder(spec.config, requiresBuildKit, spec.logger);
+            const buildLimits = dockerBuildResourceLimits(spec.config.resources);
+            const ownershipHost = builder.options.version !== "2" ? newBuildOwnershipHost() : null;
+            const diagnosticContext: DockerBuildDiagnosticContext = {
+              configuredMemoryMb: spec.config.resources.memoryMb,
+              memoryLimitApplied:
+                builder.options.version !== "2" && buildLimits.memory !== undefined,
+            };
             try {
               const stream = await this.docker.buildImage(body, {
                 t: tag,
@@ -2961,12 +3271,22 @@ export class DockerRuntime implements RuntimeAdapter {
                   sessionId: spec.config.sessionId,
                 }),
                 buildargs: resolveDockerBuildArgs(spec.config),
-                ...dockerBuildResourceLimits(spec.config.resources),
+                ...buildLimits,
+                ...(ownershipHost && { extrahosts: `${ownershipHost}:127.0.0.1` }),
                 forcerm: true,
                 ...builder.options,
                 abortSignal,
               });
-              await this.streamDockerodeBuild(stream, spec.logger, builder.trace);
+              detachCancellation();
+              await this.streamDockerodeBuild(stream, spec.logger, {
+                trace: builder.trace,
+                diagnosticContext,
+                abortBuild: abort,
+                cancelSignal: signal,
+                ...(ownershipHost && {
+                  legacyBuilder: { expectedMemoryBytes: buildLimits.memory, ownershipHost },
+                }),
+              });
             } catch (err) {
               const contextErr = takeError();
               throw contextErr
@@ -2975,6 +3295,8 @@ export class DockerRuntime implements RuntimeAdapter {
                     { cause: contextErr },
                   )
                 : err;
+            } finally {
+              detachCancellation();
             }
           }
 
