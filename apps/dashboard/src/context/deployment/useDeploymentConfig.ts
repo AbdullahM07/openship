@@ -39,7 +39,8 @@ import {
   syncPublicEndpointState,
 } from "./types";
 import { buildSingleModeSnapshot, syncActiveModeSnapshot } from "./mode-config";
-import { mergePreparedSourceEnv, savedDeploymentEnvRows } from "./env-payload";
+import { mergePreparedSourceEnv } from "./env-payload";
+import { createProjectEnvEditState } from "@/lib/project-env-diff";
 import { normalizeSubdomain } from "@/utils/subdomain";
 import { useDefaultDomainType } from "@/context/CloudContext";
 
@@ -1239,11 +1240,11 @@ export function useDeploymentConfig() {
         const svcRes = await servicesApi.list(projectId).catch(() => null);
         const serviceRows: Service[] = svcRes?.services ?? [];
 
-        // Production env → config.envVars. Secret plaintext never enters this
-        // context; preserveValue keeps its display blank distinct from a real
-        // empty value when the deployment request is serialized (#801).
-        const envRes = await projectsApi.getEnv(projectId).catch(() => null);
-        const envVars: DeploymentConfig["envVars"] = savedDeploymentEnvRows(envRes?.data ?? []);
+        // Load editable production env and its immutable baseline as one unit.
+        // This read is data-loss-sensitive: fail the whole initialization if it
+        // fails, rather than treating an unknown environment as an empty one.
+        const envRes = await projectsApi.getEnv(projectId);
+        const envState = createProjectEnvEditState(envRes?.data ?? []);
 
         const response = buildSavedProjectResponse(project, serviceRows);
         const repoName = project.gitRepo || project.name || "project";
@@ -1281,7 +1282,10 @@ export function useDeploymentConfig() {
             return {
               ...prev,
               projectId,
-              envVars: envVars.length ? envVars : prev.envVars,
+              // The successful env read is authoritative even when empty. Keeping
+              // stale rows here would turn a later save into unintended upserts.
+              envVars: envState.rows,
+              projectEnvBaseline: envState.baseline,
               ...(savedTarget
                 ? {
                     deployTarget: savedTarget,
@@ -1308,7 +1312,8 @@ export function useDeploymentConfig() {
             }),
             // buildPreparedConfig (shared with detection) doesn't load production
             // env — overlay the saved values we fetched above.
-            envVars,
+            envVars: envState.rows,
+            projectEnvBaseline: envState.baseline,
             // Repo-less catalog app: deploys from its saved service rows with no
             // git source (the deploy guards treat this like local/upload).
             isApp: Boolean((project as { isApp?: boolean }).isApp),

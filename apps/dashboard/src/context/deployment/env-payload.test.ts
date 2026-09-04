@@ -1,15 +1,25 @@
 import { describe, expect, it } from "vitest";
 import { ENV_MASK } from "@repo/core";
-import {
-  deploymentEnvPayload,
-  mergePreparedSourceEnv,
-  savedDeploymentEnvRows,
-} from "./env-payload";
+import type { EnvironmentVariable } from "@/components/import-project/types";
+import type { PersistedProjectEnv } from "@/lib/project-env-diff";
+import { mergePreparedSourceEnv, planDeploymentEnvPersistence } from "./env-payload";
+
+const row = (
+  key: string,
+  value: string,
+  options: Partial<EnvironmentVariable> = {},
+): EnvironmentVariable => ({ key, value, visible: true, ...options });
+
+const saved = (key: string, value: string, isSecret = false): PersistedProjectEnv => ({
+  key,
+  value,
+  isSecret,
+});
 
 describe("mergePreparedSourceEnv", () => {
   it("activates openship.json keys, keeps .env opt-in, and preserves operator overrides", () => {
     const result = mergePreparedSourceEnv(
-      [{ key: "SHARED", value: "operator", visible: true }],
+      [row("SHARED", "operator")],
       {
         DECLARED: ENV_MASK,
         SHARED: ENV_MASK,
@@ -19,45 +29,105 @@ describe("mergePreparedSourceEnv", () => {
     );
 
     expect(result.envVars).toEqual([
-      { key: "SHARED", value: "operator", visible: true },
-      { key: "DECLARED", value: ENV_MASK, visible: true, preserveValue: true },
+      row("SHARED", "operator"),
+      row("DECLARED", ENV_MASK, { preserveValue: true }),
     ]);
-    expect(result.rootEnvVars).toEqual([
-      { key: "DOT_ENV_ONLY", value: ENV_MASK, visible: true, preserveValue: true },
-    ]);
-    expect(deploymentEnvPayload(result.envVars)).toEqual({
-      SHARED: "operator",
-      DECLARED: ENV_MASK,
-    });
+    expect(result.rootEnvVars).toEqual([row("DOT_ENV_ONLY", ENV_MASK, { preserveValue: true })]);
   });
 });
 
-describe("deploymentEnvPayload", () => {
-  it("marks only saved production secrets for preservation", () => {
-    expect(
-      savedDeploymentEnvRows([
-        { key: "AUTH_SECRET", value: ENV_MASK, isSecret: true, environment: "production" },
-        { key: "PUBLIC_SETTING", value: "enabled", isSecret: false, environment: "production" },
-        { key: "PREVIEW_ONLY", value: "preview", isSecret: false, environment: "preview" },
-      ]),
-    ).toEqual([
-      { key: "AUTH_SECRET", value: "", visible: true, preserveValue: true },
-      { key: "PUBLIC_SETTING", value: "enabled", visible: true, preserveValue: undefined },
-    ]);
-  });
-
-  it("#801: sends a preserve sentinel for an unreadable saved secret", () => {
-    expect(
-      deploymentEnvPayload([
-        { key: "AUTH_SECRET", value: "", visible: false, preserveValue: true },
-        { key: "PUBLIC_SETTING", value: "enabled", visible: true },
-      ]),
-    ).toEqual({ AUTH_SECRET: ENV_MASK, PUBLIC_SETTING: "enabled" });
-  });
-
-  it("keeps an explicitly entered empty value distinct from a preserved secret", () => {
-    expect(deploymentEnvPayload([{ key: "OPTIONAL", value: "", visible: true }])).toEqual({
-      OPTIONAL: "",
+describe("planDeploymentEnvPersistence", () => {
+  it("sends entered and source-owned values through build/access for a new project", () => {
+    const result = planDeploymentEnvPersistence({
+      envVars: [
+        row("PUBLIC_SETTING", "enabled"),
+        row("OPTIONAL", ""),
+        row("DECLARED_BY_SOURCE", ENV_MASK, { preserveValue: true }),
+      ],
+      baseline: null,
     });
+
+    expect(result).toEqual({
+      ok: true,
+      merge: null,
+      buildAccessEnvVars: {
+        PUBLIC_SETTING: "enabled",
+        OPTIONAL: "",
+        DECLARED_BY_SOURCE: ENV_MASK,
+      },
+    });
+  });
+
+  it("plans a partial merge and omits the full build/access payload for an existing project", () => {
+    const result = planDeploymentEnvPersistence({
+      projectId: "project-1",
+      envVars: [
+        row("AUTH_SECRET", "replacement", {
+          originalKey: "AUTH_SECRET",
+          isSecret: true,
+        }),
+        row("PUBLIC_SETTING", "enabled", {
+          originalKey: "PUBLIC_SETTING",
+          isSecret: false,
+        }),
+      ],
+      baseline: [saved("AUTH_SECRET", ENV_MASK, true), saved("PUBLIC_SETTING", "enabled")],
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      merge: {
+        upserts: [{ key: "AUTH_SECRET", value: "replacement", isSecret: true }],
+        deletes: [],
+      },
+      buildAccessEnvVars: undefined,
+    });
+  });
+
+  it("omits an untouched saved secret from the existing-project merge", () => {
+    const result = planDeploymentEnvPersistence({
+      projectId: "project-1",
+      envVars: [
+        row("AUTH_SECRET", "", {
+          originalKey: "AUTH_SECRET",
+          preserveValue: true,
+          isSecret: true,
+        }),
+      ],
+      baseline: [saved("AUTH_SECRET", ENV_MASK, true)],
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      merge: { upserts: [], deletes: [] },
+      buildAccessEnvVars: undefined,
+    });
+  });
+
+  it("leaves untracked preserved source rows to the server-side source resolver", () => {
+    const result = planDeploymentEnvPersistence({
+      projectId: "project-1",
+      envVars: [
+        row("SAVED", "same", { originalKey: "SAVED", isSecret: false }),
+        row("SOURCE_DEFAULT", ENV_MASK, { preserveValue: true }),
+      ],
+      baseline: [saved("SAVED", "same")],
+    });
+
+    expect(result).toEqual({
+      ok: true,
+      merge: { upserts: [], deletes: [] },
+      buildAccessEnvVars: undefined,
+    });
+  });
+
+  it("fails closed when an existing project's environment was not loaded", () => {
+    const result = planDeploymentEnvPersistence({
+      projectId: "project-1",
+      envVars: [],
+      baseline: null,
+    });
+
+    expect(result).toMatchObject({ ok: false });
   });
 });

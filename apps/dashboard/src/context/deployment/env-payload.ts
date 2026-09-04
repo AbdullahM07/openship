@@ -1,5 +1,11 @@
-import { ENV_MASK, isMaskedValue } from "@repo/core";
+import { isMaskedValue } from "@repo/core";
 import type { EnvironmentVariable } from "@/components/import-project/types";
+import {
+  computeProjectEnvDiff,
+  serializeNewProjectEnv,
+  type PersistedProjectEnv,
+  type ProjectEnvDiff,
+} from "@/lib/project-env-diff";
 
 function sourceEnvRows(env?: Record<string, string>): EnvironmentVariable[] {
   return Object.entries(env ?? {}).map(([key, value]) => ({
@@ -33,33 +39,52 @@ export function mergePreparedSourceEnv(
   };
 }
 
-/** Keep an unreadable API secret distinct from an explicitly empty value. */
-export function savedDeploymentEnvRows(
-  rows: Array<{ key: string; value: string; isSecret: boolean; environment: string }>,
-): EnvironmentVariable[] {
-  return rows
-    .filter((row) => row.environment === "production")
-    .map((row) => ({
-      key: row.key,
-      value: row.isSecret ? "" : row.value,
-      visible: true,
-      preserveValue: row.isSecret || undefined,
-    }));
-}
+export type DeploymentEnvPersistencePlan =
+  | { ok: false; error: string }
+  | {
+      ok: true;
+      /** Existing projects apply this partial merge before save/deploy. */
+      merge: ProjectEnvDiff | null;
+      /** Only a new project sends env through build/access. */
+      buildAccessEnvVars: Record<string, string> | undefined;
+    };
 
 /**
- * Serialize the wizard's project env rows without turning unreadable saved
- * secrets into empty strings. The mask is a transport sentinel; the API
- * resolves it against the stored encrypted project row before snapshotting.
+ * Decide which persistence path owns deployment-wizard env changes.
+ *
+ * A new project has no env store yet, so build/access receives its values and
+ * persists them. An existing project is patched through the same partial merge
+ * contract as the dedicated env editor, then build/access reads that store.
+ * Requiring a loaded baseline for existing projects prevents a failed env read
+ * from being mistaken for an empty environment and deleting data.
  */
-export function deploymentEnvPayload(
-  envVars: EnvironmentVariable[] | null | undefined,
-): Record<string, string> | undefined {
-  const result: Record<string, string> = {};
-  for (const envVar of envVars ?? []) {
-    const key = envVar.key.trim();
-    if (!key) continue;
-    result[key] = envVar.preserveValue ? ENV_MASK : envVar.value;
+export function planDeploymentEnvPersistence({
+  projectId,
+  envVars,
+  baseline,
+}: {
+  projectId?: string;
+  envVars: readonly EnvironmentVariable[];
+  baseline: readonly PersistedProjectEnv[] | null;
+}): DeploymentEnvPersistencePlan {
+  if (!projectId) {
+    const serialized = serializeNewProjectEnv(envVars);
+    return serialized.ok
+      ? { ok: true, merge: null, buildAccessEnvVars: serialized.envVars }
+      : serialized;
   }
-  return Object.keys(result).length > 0 ? result : undefined;
+
+  if (baseline === null) {
+    return {
+      ok: false,
+      error: "Project environment was not loaded. Reload the page and try again.",
+    };
+  }
+
+  const result = computeProjectEnvDiff(envVars, baseline, {
+    // openship.json values are owned and resolved by the server-side source
+    // scan. They intentionally have no originalKey/project-env baseline row.
+    ignoreUntrackedPreserved: true,
+  });
+  return result.ok ? { ok: true, merge: result.diff, buildAccessEnvVars: undefined } : result;
 }

@@ -17,6 +17,7 @@ import {
 } from "@repo/core";
 import type { BuildLog } from "@/utils/deploymentPhaseDetector";
 import type { BuildSessionLoadResult } from "./load-session";
+import type { PersistedProjectEnv } from "@/lib/project-env-diff";
 import { randomUUID } from "@/lib/random-uuid";
 
 // ─── Monorepo sub-app ────────────────────────────────────────────────────────
@@ -399,6 +400,12 @@ export interface DeploymentConfig {
   buildImage: string;
   publicEndpoints: PublicEndpoint[];
   envVars: EnvironmentVariable[];
+  /**
+   * Authoritative production-env snapshot used to persist only the wizard's
+   * changes. `null` means an existing project's env was never loaded, which is
+   * intentionally different from a project with no saved variables.
+   */
+  projectEnvBaseline: PersistedProjectEnv[] | null;
   /** Root .env values detected during prepare; user must import before they apply.
    *  Explicit openship.json env is placed directly in envVars instead. */
   rootEnvVars: EnvironmentVariable[];
@@ -503,6 +510,7 @@ export const DEFAULT_CONFIG: DeploymentConfig = {
     workloadType: "web",
   },
   envVars: [],
+  projectEnvBaseline: null,
   rootEnvVars: [],
 };
 

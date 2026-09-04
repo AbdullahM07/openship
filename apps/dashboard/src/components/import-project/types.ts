@@ -1,4 +1,5 @@
 import type { StackId } from "@repo/core";
+import type { EditableProjectEnvRow } from "@/lib/project-env-diff";
 
 export interface Framework {
   id: string;
@@ -13,19 +14,7 @@ export interface RepoData {
   private: boolean | false;
 }
 
-export interface EnvironmentVariable {
-  key: string;
-  value: string;
-  visible: boolean;
-  /**
-   * The row's plaintext was intentionally not loaded (a saved secret or a
-   * source-scanned value). Deploy serialization sends the mask sentinel so the
-   * API can recover it from its trusted store/source. Any edit clears this.
-   */
-  preserveValue?: boolean;
-  /** Explicit secret flag: true = secret (masked on read), false = non-secret. */
-  isSecret?: boolean;
-}
+export type EnvironmentVariable = EditableProjectEnvRow;
 
 export type StartCommand = string;
 
