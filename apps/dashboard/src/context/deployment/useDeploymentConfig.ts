@@ -39,7 +39,8 @@ import {
   syncPublicEndpointState,
 } from "./types";
 import { buildSingleModeSnapshot, syncActiveModeSnapshot } from "./mode-config";
-import { mergePreparedSourceEnv, savedDeploymentEnvRows } from "./env-payload";
+import { mergePreparedSourceEnv } from "./env-payload";
+import { createProjectEnvEditState, type ProjectEnvEditState } from "@/lib/project-env-diff";
 import { normalizeSubdomain } from "@/utils/subdomain";
 import { useDefaultDomainType } from "@/context/CloudContext";
 
@@ -55,6 +56,46 @@ interface PreparedConfigArgs {
   projectId?: string;
   localPath?: string;
   uploadSessionId?: string;
+}
+
+interface LoadedProjectState {
+  project: PersistedProject;
+  envState: ProjectEnvEditState | null;
+}
+
+/**
+ * Existing-project configuration and env are one hydration boundary. Loading
+ * project metadata without its env baseline leaves the deploy wizard unable to
+ * distinguish an empty environment from a failed or unattempted read.
+ */
+async function loadPersistedProjectState(projectId: string): Promise<LoadedProjectState> {
+  const projectResponse = await projectsApi.getInfo(projectId);
+  const project: PersistedProject =
+    projectResponse?.data?.project ?? projectResponse?.project ?? null;
+  if (!project) return { project: null, envState: null };
+
+  const envResponse = await projectsApi.getEnv(projectId);
+  return {
+    project,
+    envState: createProjectEnvEditState(envResponse?.data ?? []),
+  };
+}
+
+function seedLoadedProjectEnv(
+  prev: DeploymentConfig,
+  projectId: string | undefined,
+  envState: ProjectEnvEditState | null,
+  preserveCurrent: boolean,
+): DeploymentConfig {
+  if (!projectId || !envState) return prev;
+  if (preserveCurrent && prev.projectId === projectId && prev.projectEnvBaseline !== null) {
+    return prev;
+  }
+  return {
+    ...prev,
+    envVars: envState.rows,
+    projectEnvBaseline: envState.baseline,
+  };
 }
 
 interface PreparedProjectContext {
@@ -901,6 +942,7 @@ export function useDeploymentConfig() {
         projectId?: string;
         composePath?: string;
         env?: Record<string, string>;
+        preserveEnvState?: boolean;
       },
     ): Promise<{
       success: boolean;
@@ -910,10 +952,12 @@ export function useDeploymentConfig() {
     }> => {
       try {
         let project: PersistedProject = null;
+        let projectEnvState: ProjectEnvEditState | null = null;
 
         if (context?.projectId) {
-          const projectResponse = await projectsApi.getInfo(context.projectId);
-          project = projectResponse?.data?.project ?? projectResponse?.project ?? null;
+          const loaded = await loadPersistedProjectState(context.projectId);
+          project = loaded.project;
+          projectEnvState = loaded.envState;
 
           if (!project) {
             return {
@@ -958,15 +1002,23 @@ export function useDeploymentConfig() {
             ? [selectedBranch, ...branches]
             : branches;
         setConfig((prev) =>
-          buildPreparedConfig(prev, {
-            response,
-            project,
-            repoName,
-            owner: response.repository.owner?.login || sourceOwner,
-            branch: selectedBranch,
-            branches: branchOptions,
-            projectId: context?.projectId,
-          }),
+          buildPreparedConfig(
+            seedLoadedProjectEnv(
+              prev,
+              context?.projectId,
+              projectEnvState,
+              context?.preserveEnvState === true,
+            ),
+            {
+              response,
+              project,
+              repoName,
+              owner: response.repository.owner?.login || sourceOwner,
+              branch: selectedBranch,
+              branches: branchOptions,
+              projectId: context?.projectId,
+            },
+          ),
         );
 
         return { success: true };
@@ -987,14 +1039,24 @@ export function useDeploymentConfig() {
   const initializeFromLocal = useCallback(
     async (
       path: string,
-      context?: { projectId?: string; composePath?: string; env?: Record<string, string> },
+      context?: {
+        projectId?: string;
+        composePath?: string;
+        env?: Record<string, string>;
+        preserveEnvState?: boolean;
+      },
     ): Promise<{ success: boolean; error?: string; errorType?: string }> => {
       try {
         let project: PersistedProject = null;
+        let projectEnvState: ProjectEnvEditState | null = null;
 
         if (context?.projectId) {
-          const projectResponse = await projectsApi.getInfo(context.projectId);
-          project = projectResponse?.data?.project ?? projectResponse?.project ?? null;
+          const loaded = await loadPersistedProjectState(context.projectId);
+          project = loaded.project;
+          projectEnvState = loaded.envState;
+          if (!project) {
+            return { success: false, error: "Project was not found", errorType: "api_error" };
+          }
         }
 
         const response = await deployApi.prepare({
@@ -1010,16 +1072,24 @@ export function useDeploymentConfig() {
 
         const name = response.repository.name || path.split("/").pop() || "project";
         setConfig((prev) =>
-          buildPreparedConfig(prev, {
-            response,
-            project,
-            repoName: name,
-            owner: "local",
-            branch: project?.gitBranch || response.repository.default_branch || "main",
-            branches: [],
-            projectId: context?.projectId,
-            localPath: path,
-          }),
+          buildPreparedConfig(
+            seedLoadedProjectEnv(
+              prev,
+              context?.projectId,
+              projectEnvState,
+              context?.preserveEnvState === true,
+            ),
+            {
+              response,
+              project,
+              repoName: name,
+              owner: "local",
+              branch: project?.gitBranch || response.repository.default_branch || "main",
+              branches: [],
+              projectId: context?.projectId,
+              localPath: path,
+            },
+          ),
         );
 
         return { success: true };
@@ -1056,6 +1126,7 @@ export function useDeploymentConfig() {
         return initializeFromLocal(config.localPath, {
           projectId: config.projectId,
           composePath: trimmed,
+          preserveEnvState: true,
           ...env,
         });
       }
@@ -1070,6 +1141,7 @@ export function useDeploymentConfig() {
         branch: config.branch,
         projectId: config.projectId,
         composePath: trimmed,
+        preserveEnvState: true,
         ...env,
       });
       return { success: result.success, error: result.error, errorType: result.errorType };
@@ -1098,9 +1170,14 @@ export function useDeploymentConfig() {
     ): Promise<{ success: boolean; error?: string; errorType?: string }> => {
       try {
         let project: PersistedProject = null;
+        let projectEnvState: ProjectEnvEditState | null = null;
         if (context?.projectId) {
-          const projectResponse = await projectsApi.getInfo(context.projectId);
-          project = projectResponse?.data?.project ?? projectResponse?.project ?? null;
+          const loaded = await loadPersistedProjectState(context.projectId);
+          project = loaded.project;
+          projectEnvState = loaded.envState;
+          if (!project) {
+            return { success: false, error: "Project was not found", errorType: "api_error" };
+          }
         }
 
         // The upload wizard has the user pick the stack up front (like the
@@ -1180,16 +1257,19 @@ export function useDeploymentConfig() {
         }
 
         setConfig((prev) =>
-          buildPreparedConfig(prev, {
-            response,
-            project,
-            repoName: name,
-            owner: "upload",
-            branch: "main",
-            branches: [],
-            projectId: context?.projectId,
-            uploadSessionId: sessionId,
-          }),
+          buildPreparedConfig(
+            seedLoadedProjectEnv(prev, context?.projectId, projectEnvState, false),
+            {
+              response,
+              project,
+              repoName: name,
+              owner: "upload",
+              branch: "main",
+              branches: [],
+              projectId: context?.projectId,
+              uploadSessionId: sessionId,
+            },
+          ),
         );
 
         return { success: true };
@@ -1226,8 +1306,8 @@ export function useDeploymentConfig() {
       savedTarget?: DeployTarget | null;
     }> => {
       try {
-        const res = await projectsApi.getInfo(projectId);
-        const project: PersistedProject = res?.data?.project ?? res?.project ?? null;
+        const loaded = await loadPersistedProjectState(projectId);
+        const project = loaded.project;
         if (!project) {
           return { success: false, error: "Project was not found", errorType: "api_error" };
         }
@@ -1239,11 +1319,9 @@ export function useDeploymentConfig() {
         const svcRes = await servicesApi.list(projectId).catch(() => null);
         const serviceRows: Service[] = svcRes?.services ?? [];
 
-        // Production env → config.envVars. Secret plaintext never enters this
-        // context; preserveValue keeps its display blank distinct from a real
-        // empty value when the deployment request is serialized (#801).
-        const envRes = await projectsApi.getEnv(projectId).catch(() => null);
-        const envVars: DeploymentConfig["envVars"] = savedDeploymentEnvRows(envRes?.data ?? []);
+        // The shared loader makes this a data-loss-sensitive boundary: a failed
+        // env read fails initialization rather than masquerading as an empty env.
+        const envState = loaded.envState!;
 
         const response = buildSavedProjectResponse(project, serviceRows);
         const repoName = project.gitRepo || project.name || "project";
@@ -1281,7 +1359,10 @@ export function useDeploymentConfig() {
             return {
               ...prev,
               projectId,
-              envVars: envVars.length ? envVars : prev.envVars,
+              // The successful env read is authoritative even when empty. Keeping
+              // stale rows here would turn a later save into unintended upserts.
+              envVars: envState.rows,
+              projectEnvBaseline: envState.baseline,
               ...(savedTarget
                 ? {
                     deployTarget: savedTarget,
@@ -1308,7 +1389,8 @@ export function useDeploymentConfig() {
             }),
             // buildPreparedConfig (shared with detection) doesn't load production
             // env — overlay the saved values we fetched above.
-            envVars,
+            envVars: envState.rows,
+            projectEnvBaseline: envState.baseline,
             // Repo-less catalog app: deploys from its saved service rows with no
             // git source (the deploy guards treat this like local/upload).
             isApp: Boolean((project as { isApp?: boolean }).isApp),

@@ -134,6 +134,13 @@ export const BuildAccessBody = Type.Object({
   envVars: Type.Optional(
     Type.Record(Type.String(), Type.String(), { description: "Runtime env vars { KEY: value }." }),
   ),
+  sourceEnvKeys: Type.Optional(
+    Type.Array(Type.String({ minLength: 1, maxLength: 256 }), {
+      maxItems: 100,
+      description:
+        "Root .env keys explicitly selected for trusted server-side import; values never cross the browser boundary.",
+    }),
+  ),
   publicEndpoints: Type.Optional(
     Type.Array(PublicEndpointInput, {
       description: "Domains/routes; omit to auto-derive a free subdomain from the project slug.",

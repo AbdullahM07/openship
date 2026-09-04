@@ -1137,6 +1137,7 @@ function mergeSourceEnvDefaults(
   encryptedProjectEnv: Record<string, string> | null,
   sourceInfo: SourceEnvInfo | undefined,
   submitted?: Record<string, string>,
+  selectedSourceEnvKeys: readonly string[] = [],
 ): {
   encrypted: Record<string, string> | null;
   additions: PersistableProjectEnv[];
@@ -1148,16 +1149,16 @@ function mergeSourceEnvDefaults(
     sourceDefaults.set(key, openshipEnvValue(value));
   }
 
-  // A root `.env` remains opt-in. The wizard represents an imported value by
-  // sending its masked key; recover only those selected keys, never every value
-  // discovered beside the source tree.
+  // A root `.env` remains opt-in. New clients send a values-free key list so an
+  // existing project's full env map stays server-owned; masked entries in the
+  // legacy full payload remain supported. Recover only those selected keys,
+  // never every value discovered beside the source tree.
+  const selectedRootEnvKeys = new Set(selectedSourceEnvKeys);
   for (const [key, value] of Object.entries(submitted ?? {})) {
-    if (
-      isMaskedValue(value) &&
-      !sourceDefaults.has(key) &&
-      sourceInfo?.rootEnv &&
-      Object.hasOwn(sourceInfo.rootEnv, key)
-    ) {
+    if (isMaskedValue(value)) selectedRootEnvKeys.add(key);
+  }
+  for (const key of selectedRootEnvKeys) {
+    if (!sourceDefaults.has(key) && sourceInfo?.rootEnv && Object.hasOwn(sourceInfo.rootEnv, key)) {
       sourceDefaults.set(key, {
         value: sourceInfo.rootEnv[key]!,
         isSecret: looksLikeSecretKey(key),
@@ -1421,6 +1422,7 @@ export async function requestBuildAccess(
     branch,
     environment,
     envVars,
+    sourceEnvKeys,
     publicEndpoints,
     buildStrategy,
     deployTarget,
@@ -1584,7 +1586,12 @@ export async function requestBuildAccess(
   // this deployment. This is the missing link in #795: the downstream Docker
   // adapter already consumes deployment env as build args, but the declared
   // values previously never entered that snapshot.
-  const sourceEnv = mergeSourceEnvDefaults(deploymentEnvVars, sourceInfo, envVars);
+  const sourceEnv = mergeSourceEnvDefaults(
+    deploymentEnvVars,
+    sourceInfo,
+    envVars,
+    sourceEnvKeys,
+  );
   deploymentEnvVars = sourceEnv.encrypted;
 
   // Source interpolation and the wizard payload have different ownership. The

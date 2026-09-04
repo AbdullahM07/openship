@@ -21,20 +21,15 @@ import { useOptionalDeployment } from "@/context/DeploymentContext";
 import { useToast } from "@/context/ToastContext";
 import { useI18n, interpolate } from "@/components/i18n-provider";
 import type { Dictionary } from "@/i18n";
+import type { EnvironmentVariable } from "./types";
 
 // #336: env values arrive masked as ENV_MASK (shared with the API via @repo/core
 // so the exact sentinel can't drift). A masked row keeps the sentinel in state —
 // a save round-trips it and the backend restores the stored secret; "show
 // values" reveals real values into a display-only overlay; editing a revealed
 // row replaces the sentinel with the typed value.
-type EnvironmentVariableRow = {
+type EnvironmentVariableRow = EnvironmentVariable & {
   sourceId?: string;
-  key: string;
-  value: string;
-  visible: boolean;
-  /** Saved secret whose plaintext is intentionally absent from local state. */
-  preserveValue?: boolean;
-  isSecret?: boolean;
 };
 
 type EnvironmentVariableMeta = {
@@ -344,18 +339,12 @@ const EnvironmentVariables: React.FC<EnvironmentVariablesPropsOptional> = ({
   }, [allShown, maskedKeys, hideKeys, revealAndShow]);
 
   const handleKeyChange = (index: number, value: string) => {
-    const row = currentEnvVars[index];
+    // Keep preserveValue until the VALUE is actually edited. The env planner
+    // can then reject a masked-secret rename/classification change instead of
+    // mistaking the blank display value for the user's intent.
     updateEnvVars(
       currentEnvVars.map((env, i) =>
-        i === index
-          ? {
-              ...env,
-              key: value,
-              // A stored value belongs to its original key. Renaming the row
-              // cannot carry that secret to a different variable implicitly.
-              preserveValue: row?.key === value ? row.preserveValue : false,
-            }
-          : env,
+        i === index ? { ...env, key: value } : env,
       ),
     );
   };

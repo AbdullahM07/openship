@@ -335,6 +335,8 @@ export const deployApi = {
     branch?: string;
     environment?: string;
     envVars?: Record<string, string>;
+    /** Masked root .env rows explicitly selected for trusted server-side import. */
+    sourceEnvKeys?: string[];
     publicEndpoints?: Array<{
       port?: string;
       targetPath?: string;
