@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { buildCatalog } from "../../scripts/gen-catalog";
 import { isValidAppTemplate, parseAppTemplate, templateEngineOk } from "./schema";
-import { APP_TEMPLATES } from "../app-templates";
+import { APP_TEMPLATES, getAppTemplate } from "../app-templates";
 
 const committed = JSON.parse(
   readFileSync(fileURLToPath(new URL("./catalog.json", import.meta.url)), "utf8"),
@@ -18,6 +18,20 @@ describe("app catalog (JSON)", () => {
     for (const app of APP_TEMPLATES) {
       expect(isValidAppTemplate(app), `${app.id} failed schema`).toBe(true);
     }
+  });
+
+  it("keeps Supabase's advertised SAML endpoints on its public Kong routes", () => {
+    const supabase = getAppTemplate("supabase");
+    const samlBase = supabase?.services?.find((service) => service.name === "auth")?.environment
+      ?.GOTRUE_SAML_EXTERNAL_URL;
+    const kongConfig = supabase?.files?.find(
+      (file) => file.service === "kong" && file.path === "/usr/local/kong/kong.yml",
+    )?.content;
+
+    expect(samlBase).toBe("{{publicUrl:kong}}/auth/v1");
+    const routePrefix = samlBase?.replace("{{publicUrl:kong}}", "");
+    expect(kongConfig).toContain(`- ${routePrefix}/sso/saml/acs`);
+    expect(kongConfig).toContain(`- ${routePrefix}/sso/saml/metadata`);
   });
 
   it("rejects a malformed template (missing required fields)", () => {
