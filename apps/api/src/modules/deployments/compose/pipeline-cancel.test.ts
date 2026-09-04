@@ -115,6 +115,7 @@ async function run(
     ctx: { dep: { id: "d1" }, provisioned: {} } as never,
     snapshot: snapshot as never,
     buildSessionId: "bld_x",
+    composeInterpolationEnv: {},
     buildEnvVars: {},
     buildResources: DEFAULT_RESOURCE_CONFIG,
     runtimeResources: DEFAULT_RESOURCE_CONFIG,

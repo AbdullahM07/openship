@@ -1350,6 +1350,7 @@ async function deployComposeServicesUnlocked(
     const pullRefs = new Set<string>();
     for (const service of ordered) {
       if (opts?.targetServiceIds && !opts.targetServiceIds.has(service.id)) continue;
+      if (opts?.buildFailures?.has(service.id)) continue;
       const image = resolveDeployImage({
         builtImage: opts?.builtImages?.get(service.id),
         rowImage: service.image,

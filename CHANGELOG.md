@@ -3,7 +3,7 @@
 All notable changes to Openship. Versions follow [semver](https://semver.org);
 the in-app updater surfaces critical advisories from `release-advisories.json`.
 
-## 0.7.0
+## 0.7.1
 
 This release hardens the full deployment lifecycle, makes Compose reconciliation
 lossless, completes remote-server setup and CLI targeting, fixes external mail
@@ -60,6 +60,11 @@ update-experience work accumulated since 0.6.9.
 
 ### Builds
 
+- **`openship.json` environment now reaches Dockerfile builds end to end** — top-level project
+  variables are recovered from the trusted source, encrypted into each deployment snapshot, and passed
+  through the existing shared Docker build-argument resolver for first deploys, redeploys, webhooks,
+  folder uploads, and explicit single-app mode. Native `services[].buildArgs` adds per-image overrides
+  (`null` inherits the matching project value), while service `env` remains runtime-only (#795).
 - **BuildKit builds work from Bun-based self-hosted installations** — Docker's
   reverse h2c session now bypasses Bun's incompatible `node:http` upgrade path
   while retaining dockerode's BuildKit session and registry-auth service. Local

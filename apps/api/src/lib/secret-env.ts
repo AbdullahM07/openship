@@ -29,9 +29,7 @@ export { ENV_MASK, isMaskedValue };
  * Blanket masking (decision on #336): zero false negatives, no secret can leak
  * through an unusual key name. Non-secret config is revealed on demand instead.
  */
-export function maskEnv(
-  env: Record<string, string> | null | undefined,
-): Record<string, string> {
+export function maskEnv(env: Record<string, string> | null | undefined): Record<string, string> {
   const out: Record<string, string> = {};
   if (!env) return out;
   for (const key of Object.keys(env)) out[key] = maskValue(env[key]);
@@ -130,35 +128,49 @@ export function mergeServiceEnv(
 }
 
 /** Whether an env map contains any mask sentinel (i.e. an un-revealed value). */
-export function hasMaskedValue(
-  env: Record<string, string> | null | undefined,
-): boolean {
+export function hasMaskedValue(env: Record<string, string> | null | undefined): boolean {
   if (!env) return false;
   return Object.values(env).some(isMaskedValue);
 }
 
 /**
  * Mask the `environment` field of a single compose/deployable service. Returns a
- * shallow copy — the caller's stored object is left untouched. Anything without
- * an `environment` map passes through unchanged.
+ * shallow copy — the caller's stored object is left untouched. It also removes
+ * server-owned interpolation provenance before the service crosses an API
+ * boundary, even when the service has no runtime environment map.
  */
 export function maskServiceEnv<
   T extends {
     environment?: Record<string, string> | null;
     environmentTemplates?: Record<string, string> | null;
-    advanced?: { environmentTemplateKeys?: string[]; [key: string]: unknown } | null;
+    advanced?: {
+      imageTemplate?: unknown;
+      environmentTemplateKeys?: string[];
+      [key: string]: unknown;
+    } | null;
   },
->(
-  svc: T | null | undefined,
-): T | null | undefined {
+>(svc: T | null | undefined): T | null | undefined {
   if (!svc) return svc;
-  if (!svc.environment && !svc.environmentTemplates) return svc;
+  if (
+    !svc.environment &&
+    !svc.environmentTemplates &&
+    !svc.advanced?.imageTemplate &&
+    !svc.advanced?.environmentTemplateKeys
+  ) {
+    return svc;
+  }
   // `environmentTemplates` is transient parser provenance. Its expressions can
   // contain literal defaults, so never serialize it even though the persisted
   // raw copy is already protected by blanket environment masking.
   const { environmentTemplates: _templates, ...publicService } = svc;
   const advanced = svc.advanced ? { ...svc.advanced } : svc.advanced;
-  if (advanced) delete advanced.environmentTemplateKeys;
+  if (advanced) {
+    // Parser provenance is server-owned. Besides preventing a client from
+    // forging resolution state, stripping the raw expressions avoids exposing
+    // literal defaults embedded in `${VAR:-value}` through read APIs.
+    delete advanced.imageTemplate;
+    delete advanced.environmentTemplateKeys;
+  }
   return {
     ...publicService,
     ...(svc.environment ? { environment: maskEnv(svc.environment) } : {}),
@@ -173,9 +185,7 @@ export function maskServicesEnv<
     environmentTemplates?: Record<string, string> | null;
     advanced?: { environmentTemplateKeys?: string[]; [key: string]: unknown } | null;
   },
->(
-  svcs: T[] | null | undefined,
-): T[] {
+>(svcs: T[] | null | undefined): T[] {
   if (!svcs) return [];
   // Elements are concrete services, so the masked result is never null/undefined.
   return svcs.map((s) => maskServiceEnv(s) as T);
@@ -229,7 +239,11 @@ export function maskScanService<
     environment?: Record<string, string> | null;
     environmentTemplates?: Record<string, string> | null;
     environmentMeta?: Record<string, EnvMetaLike> | null;
-    advanced?: { environmentTemplateKeys?: string[]; [key: string]: unknown } | null;
+    advanced?: {
+      imageTemplate?: unknown;
+      environmentTemplateKeys?: string[];
+      [key: string]: unknown;
+    } | null;
   },
 >(svc: T): T {
   // svc is always a concrete service here (mapped from a scan list).
@@ -248,33 +262,61 @@ export function maskScanService<
  * keep plaintext. No-op when there's no `meta.composeServices`.
  */
 export function maskDeploymentEnv<T extends { meta?: unknown } | null | undefined>(dep: T): T {
-  if (!dep || typeof dep !== "object" || !("meta" in dep) || !dep.meta || typeof dep.meta !== "object") {
+  if (
+    !dep ||
+    typeof dep !== "object" ||
+    !("meta" in dep) ||
+    !dep.meta ||
+    typeof dep.meta !== "object"
+  ) {
     return dep;
   }
   const meta = dep.meta as Record<string, unknown>;
   if (!Array.isArray(meta.composeServices)) return dep;
   return {
     ...dep,
-    meta: { ...meta, composeServices: maskServicesEnv(meta.composeServices as { environment?: Record<string, string> | null }[]) },
+    meta: {
+      ...meta,
+      composeServices: maskServicesEnv(
+        meta.composeServices as { environment?: Record<string, string> | null }[],
+      ),
+    },
   };
 }
 
 /**
- * Mask the `environment` entries of a `composeSpecDiff()` result so the drift UI
- * never renders the raw `from`/`to` secret maps. Only the `environment` field's
- * `from`/`to` are masked; all other fields (image, ports, …) pass through.
+ * Mask value-bearing provenance in a `composeSpecDiff()` result so the drift UI
+ * never renders secrets from environment maps or Compose image defaults. Other
+ * fields (image, ports, readiness, …) pass through unchanged.
  */
-export function maskDriftChanges<
-  T extends { field: string; from: unknown; to: unknown },
->(changes: T[] | null | undefined): T[] {
+export function maskDriftChanges<T extends { field: string; from: unknown; to: unknown }>(
+  changes: T[] | null | undefined,
+): T[] {
   if (!changes) return [];
-  return changes.map((c) =>
-    c.field === "environment"
-      ? {
-          ...c,
-          from: maskEnv(c.from as Record<string, string> | null),
-          to: maskEnv(c.to as Record<string, string> | null),
+  return changes.map((c) => {
+    if (c.field === "environment") {
+      return {
+        ...c,
+        from: maskEnv(c.from as Record<string, string> | null),
+        to: maskEnv(c.to as Record<string, string> | null),
+      };
+    }
+    if (c.field === "advanced") {
+      const maskImageTemplate = (value: unknown): unknown => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+        const advanced = { ...(value as Record<string, unknown>) };
+        const template = advanced.imageTemplate;
+        if (template && typeof template === "object" && !Array.isArray(template)) {
+          advanced.imageTemplate = {
+            ...(template as Record<string, unknown>),
+            expression: ENV_MASK,
+            ...(Object.hasOwn(template, "sourceValue") && { sourceValue: ENV_MASK }),
+          };
         }
-      : c,
-  );
+        return advanced;
+      };
+      return { ...c, from: maskImageTemplate(c.from), to: maskImageTemplate(c.to) };
+    }
+    return c;
+  });
 }

@@ -160,11 +160,13 @@ describe("helpers", () => {
   });
 
   test("maskServicesEnv over a list, null-tolerant", () => {
-    expect(maskServicesEnv([{ environment: { A: "1" } }])).toEqual([{ environment: { A: ENV_MASK } }]);
+    expect(maskServicesEnv([{ environment: { A: "1" } }])).toEqual([
+      { environment: { A: ENV_MASK } },
+    ]);
     expect(maskServicesEnv(null)).toEqual([]);
   });
 
-  test("maskDriftChanges masks only the environment field", () => {
+  test("maskDriftChanges masks environment values and leaves ordinary fields", () => {
     const changes = [
       { field: "image", from: "a", to: "b" },
       { field: "environment", from: { K: "old" }, to: { K: "new" } },
@@ -174,16 +176,73 @@ describe("helpers", () => {
       { field: "environment", from: { K: ENV_MASK }, to: { K: ENV_MASK } },
     ]);
   });
+
+  test("maskDriftChanges hides raw Compose image expressions in advanced changes", () => {
+    const changes = [
+      {
+        field: "advanced",
+        from: {
+          imageTemplate: {
+            expression: "registry.example.com/app:${TAG:-private-old}",
+            unresolvedVariables: [],
+            sourceValue: "registry.example.com/app:private-old",
+          },
+          readiness: { enabled: true },
+        },
+        to: {
+          imageTemplate: {
+            expression: "registry.example.com/app:${TAG:-private-new}",
+            unresolvedVariables: ["TAG"],
+            sourceValue: "registry.example.com/app:private-new",
+          },
+          readiness: { enabled: false },
+        },
+      },
+    ];
+
+    expect(maskDriftChanges(changes)).toEqual([
+      {
+        field: "advanced",
+        from: {
+          imageTemplate: {
+            expression: ENV_MASK,
+            unresolvedVariables: [],
+            sourceValue: ENV_MASK,
+          },
+          readiness: { enabled: true },
+        },
+        to: {
+          imageTemplate: {
+            expression: ENV_MASK,
+            unresolvedVariables: ["TAG"],
+            sourceValue: ENV_MASK,
+          },
+          readiness: { enabled: false },
+        },
+      },
+    ]);
+  });
 });
 
 describe("maskEnvironmentMeta", () => {
   test("keeps source/variable, masks value-bearing fields, drops expression", () => {
     const meta = {
-      DB_PASSWORD: { source: "env-file", variable: "DB_PASSWORD", resolvedValue: "hunter2", defaultValue: "changeme", expression: "${DB_PASSWORD:-changeme}" },
+      DB_PASSWORD: {
+        source: "env-file",
+        variable: "DB_PASSWORD",
+        resolvedValue: "hunter2",
+        defaultValue: "changeme",
+        expression: "${DB_PASSWORD:-changeme}",
+      },
       NODE_ENV: { source: "default", resolvedValue: "production" },
     };
     expect(maskEnvironmentMeta(meta)).toEqual({
-      DB_PASSWORD: { source: "env-file", variable: "DB_PASSWORD", resolvedValue: ENV_MASK, defaultValue: ENV_MASK },
+      DB_PASSWORD: {
+        source: "env-file",
+        variable: "DB_PASSWORD",
+        resolvedValue: ENV_MASK,
+        defaultValue: ENV_MASK,
+      },
       NODE_ENV: { source: "default", resolvedValue: ENV_MASK },
     });
   });
@@ -222,7 +281,9 @@ describe("maskScanService", () => {
     };
     const masked = maskScanService(svc);
     expect(masked.environment).toEqual({ PASSWORD: ENV_MASK });
-    expect(masked.environmentMeta).toEqual({ PASSWORD: { source: "env-file", resolvedValue: ENV_MASK } });
+    expect(masked.environmentMeta).toEqual({
+      PASSWORD: { source: "env-file", resolvedValue: ENV_MASK },
+    });
     // input untouched
     expect(svc.environment.PASSWORD).toBe("secret");
   });
@@ -234,6 +295,11 @@ describe("maskScanService", () => {
       environment: { DATABASE_URL: "postgres://user:literal-secret@db/app" },
       environmentTemplates: { DATABASE_URL: expression },
       advanced: {
+        imageTemplate: {
+          expression: "registry.example.com/app:${IMAGE_TAG:-literal-secret}",
+          unresolvedVariables: [],
+          sourceValue: "registry.example.com/app:literal-secret",
+        },
         environmentTemplateKeys: ["DATABASE_URL"],
         readiness: { enabled: true },
       },
@@ -244,6 +310,23 @@ describe("maskScanService", () => {
     expect(masked.advanced).toEqual({ readiness: { enabled: true } });
     expect(JSON.stringify(masked)).not.toContain(expression);
     expect(JSON.stringify(masked)).not.toContain("literal-secret");
+  });
+
+  test("removes image provenance even when the service has no environment map", () => {
+    const masked = maskScanService({
+      name: "worker",
+      image: "registry.example.com/worker:1",
+      advanced: {
+        imageTemplate: {
+          expression: "registry.example.com/worker:${TAG:-private-default}",
+          unresolvedVariables: [],
+          sourceValue: "registry.example.com/worker:private-default",
+        },
+      },
+    });
+
+    expect(masked.advanced).toEqual({});
+    expect(JSON.stringify(masked)).not.toContain("private-default");
   });
 });
 

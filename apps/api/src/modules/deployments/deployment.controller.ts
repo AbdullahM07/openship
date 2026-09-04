@@ -14,7 +14,6 @@ import * as buildService from "./build.service";
 import * as buildStatusService from "./build-status.service";
 import * as sslService from "./ssl.service";
 import * as prepareService from "./prepare.service";
-import { maskEnv, maskScanService } from "../../lib/secret-env";
 import { maybeProxyCloudProject, proxyToSaaS } from "../../lib/cloud/project-router";
 import { promoteProjectToCloud, TransferConflictError } from "../projects/transfer.service";
 import { env } from "../../config";
@@ -488,14 +487,9 @@ export async function prepare(c: Context) {
     }
 
     const info = await prepareService.resolveProjectInfo(input);
-    // #336: mask env on output like the sibling scan endpoints (scanLocal /
-    // folder scan go through projectInfoToScanResponse). The deploy pipeline
-    // re-derives real values from source, so masking the scan is display-only.
-    return c.json({
-      ...info,
-      ...(info.services && { services: info.services.map(maskScanService) }),
-      ...(info.rootEnv && { rootEnv: maskEnv(info.rootEnv) }),
-    });
+    // One shared projection owns the response boundary for prepare + local /
+    // folder scans. Plaintext source env never leaves the API process.
+    return c.json(prepareService.projectInfoToPublicResponse(info));
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to initialize deploy";
     return c.json({ error: message }, 400);

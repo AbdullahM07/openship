@@ -19,7 +19,7 @@ vi.mock("../session-manager", () => ({
   broadcastInstallPhase: vi.fn(),
 }));
 
-import { buildComposeImages, resolveComposeBuildArgs } from "./build.service";
+import { buildComposeImages, resolveComposeBuildArgs, resolveComposeImage } from "./build.service";
 
 /**
  * These pin the AUTHOR-FACING contract of an inline catalog build (`advanced.build`):
@@ -128,6 +128,7 @@ async function run(
   snapshotOverrides?: Partial<typeof SNAPSHOT>,
   buildEnvVars: Record<string, string> = {},
   imageRefFor?: (item: Captured) => string,
+  composeInterpolationEnv: Record<string, string> = buildEnvVars,
 ) {
   listByProjectMock.mockResolvedValue(services);
   const captured: Captured[] = [];
@@ -166,6 +167,7 @@ async function run(
     logger: new BuildLogger(() => {}),
     snapshot: { ...SNAPSHOT, ...snapshotOverrides } as never,
     buildSessionId: "sess",
+    composeInterpolationEnv,
     buildEnvVars,
     buildResources: DEFAULT_RESOURCE_CONFIG,
   });
@@ -199,14 +201,15 @@ describe("buildComposeImages — static artifact provenance", () => {
     expect(result.staticServiceIds.has("svc-static")).toBe(true);
   });
 
-  it("does not trust an absolute configured image as a static artifact", async () => {
+  it("rejects an absolute configured image before it can become an artifact", async () => {
     const service = {
       ...repoService({ id: "svc-image", name: "image", build: null, dockerfile: null }),
       image: "/etc",
     };
     const { result } = await run([service]);
 
-    expect(result.imageRefs.get("svc-image")).toBe("/etc");
+    expect(result.imageRefs.has("svc-image")).toBe(false);
+    expect(result.buildFailures.get("svc-image")).toMatch(/repository path component/i);
     expect(result.staticArtifactRefs.has("svc-image")).toBe(false);
     expect(result.staticServiceIds.has("svc-image")).toBe(false);
   });
@@ -358,6 +361,33 @@ describe("buildComposeImages — inline catalog build materialization", () => {
  * These pin the producer side: which rows get a narrowed context, and which must not.
  */
 describe("buildComposeImages — declared build context", () => {
+  it("#795 carries project env into the posted root-Dockerfile setup without duplicate service env", async () => {
+    const projectEnv = {
+      DATABASE_URI: "postgres://db/app",
+      PAYLOAD_SECRET: "payload-secret",
+      SERVER_URL: "https://admin.example.com",
+      R4_SECRET_KEY: "r4-secret",
+    };
+    const { captured } = await run(
+      [
+        repoService({
+          id: "svc-admin",
+          name: "admin",
+          build: ".",
+          dockerfile: "Dockerfile",
+        }),
+      ],
+      undefined,
+      undefined,
+      projectEnv,
+    );
+
+    expect(captured[0]?.config.envVars).toEqual(projectEnv);
+    // The shared adapter resolver turns envVars into Docker --build-arg values;
+    // a duplicate services[].env or services[].buildArgs block is not required.
+    expect(captured[0]?.config.buildArgs).toBeUndefined();
+  });
+
   it("isolates build args for services sharing one context and Dockerfile (#689)", async () => {
     const shared = {
       build: "../../",
@@ -500,5 +530,95 @@ describe("buildComposeImages — declared build context", () => {
 
     expect(captured[0].config.buildContextDirectory).toBeUndefined();
     expect(captured[0].config.rootDirectory).toBe("apps/web");
+  });
+});
+
+describe("Compose image interpolation lifecycle (#809)", () => {
+  it("resolves an authored image expression from the deployment env", () => {
+    expect(
+      resolveComposeImage(
+        "ghcr.io/acme/app:",
+        {
+          expression: "ghcr.io/acme/app:${MY_VERSION}",
+          unresolvedVariables: ["MY_VERSION"],
+        },
+        { MY_VERSION: "1.2.3" },
+      ),
+    ).toBe("ghcr.io/acme/app:1.2.3");
+  });
+
+  it("uses a fully-resolved scan value when compose .env supplied the variable", () => {
+    expect(
+      resolveComposeImage(
+        "ghcr.io/acme/app:2.4.0",
+        {
+          expression: "ghcr.io/acme/app:${MY_VERSION}",
+          unresolvedVariables: [],
+        },
+        {},
+      ),
+    ).toBe("ghcr.io/acme/app:2.4.0");
+  });
+
+  it("fails closed instead of allowing an unresolved empty tag to become latest", () => {
+    expect(() =>
+      resolveComposeImage(
+        "ghcr.io/acme/app:",
+        {
+          expression: "ghcr.io/acme/app:${MY_VERSION}",
+          unresolvedVariables: ["MY_VERSION"],
+        },
+        {},
+      ),
+    ).toThrow(/missing variable: MY_VERSION/);
+  });
+
+  it("does not accept a syntactically-valid tag produced by deleting a missing variable", () => {
+    expect(() =>
+      resolveComposeImage(
+        "ghcr.io/acme/app:stable",
+        {
+          expression: "ghcr.io/acme/app:${CHANNEL}stable",
+          unresolvedVariables: ["CHANNEL"],
+        },
+        {},
+      ),
+    ).toThrow(/missing variable: CHANNEL/);
+  });
+
+  it("records a missing image variable as a build failure without producing a pull ref", async () => {
+    const service = {
+      ...repoService({ id: "svc-image", name: "api", build: null, dockerfile: null }),
+      image: "",
+      advanced: {
+        imageTemplate: {
+          expression: "ghcr.io/acme/api:${MY_VERSION:?set MY_VERSION}",
+          unresolvedVariables: ["MY_VERSION"],
+        },
+      },
+    };
+
+    const { result } = await run([service]);
+
+    expect(result.imageRefs.has("svc-image")).toBe(false);
+    expect(result.buildFailures.get("svc-image")).toMatch(/missing variable: MY_VERSION/);
+  });
+
+  it("does not resolve images from Openship's internal build-only variables", async () => {
+    const service = {
+      ...repoService({ id: "svc-image", name: "api", build: null, dockerfile: null }),
+      image: "ghcr.io/acme/api:",
+      advanced: {
+        imageTemplate: {
+          expression: "ghcr.io/acme/api:${CI}",
+          unresolvedVariables: ["CI"],
+        },
+      },
+    };
+
+    const { result } = await run([service], undefined, undefined, { CI: "true" }, undefined, {});
+
+    expect(result.imageRefs.has("svc-image")).toBe(false);
+    expect(result.buildFailures.get("svc-image")).toMatch(/missing variable: CI/);
   });
 });

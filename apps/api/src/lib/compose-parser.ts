@@ -166,7 +166,14 @@ export function parseComposeFile(
     return { services: [], volumes: [], networks: [], missingRequired: [], unsupported: [] };
   }
 
-  const interpolationEnv = buildInterpolationEnv(options);
+  // Keep the source-only value separate from the effective deployment value.
+  // Legacy rows have no imported baseline; this is the only reliable way to
+  // recognize the value an older scan stored without confusing a later manual
+  // image override for parser-owned state.
+  const sourceInterpolationEnv = buildInterpolationEnv({
+    envFileContent: options.envFileContent,
+  });
+  const interpolationEnv = { ...sourceInterpolationEnv, ...(options.env ?? {}) };
   const missingRequired = new Map<string, string | undefined>();
   missingRequiredSinks.set(interpolationEnv, missingRequired);
   const rawServices = doc.services ?? {};
@@ -178,6 +185,21 @@ export function parseComposeFile(
     const svc = def as Record<string, unknown>;
     const build = parseBuild(svc.build, interpolationEnv);
     const environment = parseEnvironment(svc.environment, interpolationEnv);
+    const rawImage = typeof svc.image === "string" ? svc.image : undefined;
+    const image =
+      rawImage === undefined ? undefined : resolveComposeInterpolation(rawImage, interpolationEnv);
+    const sourceImage =
+      rawImage === undefined
+        ? undefined
+        : resolveComposeInterpolation(rawImage, sourceInterpolationEnv);
+    const imageTemplate =
+      rawImage !== undefined && hasComposeInterpolation(rawImage)
+        ? {
+            expression: rawImage,
+            unresolvedVariables: image!.unresolvedVariables,
+            sourceValue: sourceImage!.value,
+          }
+        : undefined;
     const parsedAdvanced = parseAdvanced(svc, interpolationEnv, name, unsupported);
     // An empty marker is meaningful: it says this BUILD declaration came from a
     // provenance-aware parser. Stamp it even when the current `build:` block has
@@ -187,9 +209,10 @@ export function parseComposeFile(
     const hasEnvironmentDeclaration = Object.hasOwn(svc, "environment");
     const hasBuildDeclaration = Object.hasOwn(svc, "build");
     const advanced: ComposeAdvanced | undefined =
-      parsedAdvanced || hasEnvironmentDeclaration || hasBuildDeclaration
+      parsedAdvanced || imageTemplate || hasEnvironmentDeclaration || hasBuildDeclaration
         ? {
             ...(parsedAdvanced ?? {}),
+            ...(imageTemplate && { imageTemplate }),
             ...(hasEnvironmentDeclaration && {
               environmentTemplateKeys: Object.keys(environment.templates),
             }),
@@ -202,10 +225,7 @@ export function parseComposeFile(
 
     services.push({
       name,
-      image:
-        typeof svc.image === "string"
-          ? interpolateComposeString(svc.image, interpolationEnv)
-          : undefined,
+      image: image?.value,
       build: build.context,
       dockerfile: build.dockerfile,
       ...(build.args && { buildArgs: build.args }),
@@ -265,12 +285,18 @@ export function describeBlockingComposeFields(
  * in `parseComposeEnvFile`) simply has nowhere to report, which is fine.
  */
 const missingRequiredSinks = new WeakMap<Record<string, string>, Map<string, string | undefined>>();
+const unresolvedVariableSinks = new WeakMap<Record<string, string>, Set<string>>();
+
+function reportUnresolvedVariable(key: string, env: Record<string, string>): void {
+  unresolvedVariableSinks.get(env)?.add(key);
+}
 
 function reportMissingRequired(
   key: string,
   rawWord: string,
   env: Record<string, string>,
 ): { value: string; source: "missing"; variable: string; required: true } {
+  reportUnresolvedVariable(key, env);
   const sink = missingRequiredSinks.get(env);
   // First mention wins: the same variable is often required in several services
   // and the first message is as good as the last.
@@ -1062,6 +1088,7 @@ function interpolateComposeString(input: string, env: Record<string, string>): s
     } else {
       const bare = protectedInput.slice(dollar + 1).match(BARE_VARIABLE_RE);
       if (bare) {
+        if (!Object.hasOwn(env, bare[0])) reportUnresolvedVariable(bare[0], env);
         out += env[bare[0]] ?? "";
         cursor = dollar + 1 + bare[0].length;
         continue;
@@ -1074,25 +1101,73 @@ function interpolateComposeString(input: string, env: Record<string, string>): s
   return (out + protectedInput.slice(cursor)).replaceAll(escapedDollar, "$");
 }
 
-function interpolateComposeStringWithMissing(
+export interface ComposeInterpolationResolution {
+  value: string;
+  /** Variables whose selected Compose branch had no value in this scope. */
+  unresolvedVariables: string[];
+  /** The unresolved subset declared mandatory with `:?` / `?`. */
+  missingRequired: ComposeMissingVariable[];
+}
+
+/**
+ * Resolve one Compose scalar while retaining enough diagnostics for a later
+ * deployment stage to fail closed. Unlike the environment-map helper below,
+ * this also reports ordinary `${VAR}` / `$VAR` misses: an empty runtime env is
+ * legal, but an empty image tag must never be handed to a registry client that
+ * silently rewrites it to `latest`.
+ */
+export function resolveComposeInterpolation(
   input: string,
   env: Record<string, string>,
-): { value: string; missing: Map<string, string | undefined> } {
-  const parent = missingRequiredSinks.get(env);
-  const missing = new Map<string, string | undefined>();
-  missingRequiredSinks.set(env, missing);
+): ComposeInterpolationResolution {
+  const parentRequired = missingRequiredSinks.get(env);
+  const parentUnresolved = unresolvedVariableSinks.get(env);
+  const missingRequired = new Map<string, string | undefined>();
+  const unresolved = new Set<string>();
+  missingRequiredSinks.set(env, missingRequired);
+  unresolvedVariableSinks.set(env, unresolved);
+
   try {
-    return { value: interpolateComposeString(input, env), missing };
+    return {
+      value: interpolateComposeString(input, env),
+      unresolvedVariables: [...unresolved],
+      missingRequired: [...missingRequired].map(([variable, message]) => ({
+        variable,
+        ...(message && { message }),
+      })),
+    };
   } finally {
-    if (parent) {
-      missingRequiredSinks.set(env, parent);
-      for (const [key, message] of missing) {
-        if (!parent.has(key)) parent.set(key, message);
+    if (parentRequired) {
+      missingRequiredSinks.set(env, parentRequired);
+      for (const [key, message] of missingRequired) {
+        if (!parentRequired.has(key)) parentRequired.set(key, message);
       }
     } else {
       missingRequiredSinks.delete(env);
     }
+    if (parentUnresolved) {
+      unresolvedVariableSinks.set(env, parentUnresolved);
+      for (const key of unresolved) parentUnresolved.add(key);
+    } else {
+      unresolvedVariableSinks.delete(env);
+    }
   }
+}
+
+function hasComposeInterpolation(input: string): boolean {
+  return /\$\$|\$\{|\$[A-Za-z_]/.test(input);
+}
+
+function interpolateComposeStringWithMissing(
+  input: string,
+  env: Record<string, string>,
+): { value: string; missing: Map<string, string | undefined> } {
+  const resolution = resolveComposeInterpolation(input, env);
+  const missing = new Map<string, string | undefined>();
+  for (const { variable, message } of resolution.missingRequired) {
+    missing.set(variable, message);
+  }
+  return { value: resolution.value, missing };
 }
 
 export interface ComposeEnvironmentResolution {
@@ -1247,6 +1322,7 @@ function resolveInterpolationExpression(
 
   switch (operator) {
     case undefined:
+      if (!hasValue) reportUnresolvedVariable(key, env);
       return {
         value: hasValue ? value : "",
         source: hasValue ? "env-file" : "missing",
@@ -1283,6 +1359,7 @@ function resolveInterpolationExpression(
         return { value: replacement, source: "default", variable: key, defaultValue: replacement };
       }
     default:
+      reportUnresolvedVariable(key, env);
       return { value: "", source: "missing", variable: key };
   }
 }

@@ -3,7 +3,10 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { resolveProjectInfo } from "../../../src/modules/deployments/prepare.service";
+import {
+  resolveProjectInfo,
+  resolveProjectSourceEnv,
+} from "../../../src/modules/deployments/prepare.service";
 
 describe("resolveProjectInfo", () => {
   const tempDirs: string[] = [];
@@ -73,7 +76,141 @@ describe("resolveProjectInfo", () => {
     });
   });
 
-  it("normalizes an undetected package manager to \"npm\" instead of the internal \"unknown\" sentinel (#415)", async () => {
+  it("combines Compose .env and deployment env when resolving an image", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "openship-prepare-"));
+    tempDirs.push(tempDir);
+    await writeFile(join(tempDir, ".env"), "CHANNEL=stable\n");
+    await writeFile(
+      join(tempDir, "compose.yaml"),
+      ["services:", "  api:", "    image: ghcr.io/acme/api:${CHANNEL}-${MY_VERSION}"].join("\n"),
+    );
+
+    const info = await resolveProjectInfo({
+      source: "local",
+      path: tempDir,
+      env: { MY_VERSION: "1.2.3" },
+    });
+
+    expect(info.services?.[0]).toMatchObject({
+      image: "ghcr.io/acme/api:stable-1.2.3",
+      advanced: {
+        imageTemplate: {
+          expression: "ghcr.io/acme/api:${CHANNEL}-${MY_VERSION}",
+          unresolvedVariables: [],
+          sourceValue: "ghcr.io/acme/api:stable-",
+        },
+      },
+    });
+  });
+
+  it("#795 carries native service build args and source-env provenance", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "openship-build-args-"));
+    tempDirs.push(tempDir);
+    await writeFile(join(tempDir, "Dockerfile"), "FROM node:22-alpine\nARG SERVER_URL\n");
+    await writeFile(
+      join(tempDir, "openship.json"),
+      JSON.stringify({
+        env: {
+          SERVER_URL: "https://source.example.com",
+          PAYLOAD_SECRET: { value: "source-secret", secret: true },
+        },
+        services: [
+          {
+            name: "admin",
+            build: ".",
+            dockerfile: "Dockerfile",
+            buildArgs: { SERVER_URL: null, PAYLOAD_SECRET: null, CHANNEL: "stable" },
+            env: { SERVER_URL: "https://runtime.example.com" },
+          },
+        ],
+      }),
+    );
+
+    const info = await resolveProjectInfo({ source: "local", path: tempDir });
+
+    expect(info.projectType).toBe("services");
+    expect(info.rootEnv).toMatchObject({
+      SERVER_URL: "https://source.example.com",
+      PAYLOAD_SECRET: "source-secret",
+    });
+    expect(info.openshipEnv).toEqual({
+      SERVER_URL: "https://source.example.com",
+      PAYLOAD_SECRET: { value: "source-secret", secret: true },
+    });
+    expect(info.services?.[0]).toMatchObject({
+      build: ".",
+      dockerfile: "Dockerfile",
+      buildArgs: { SERVER_URL: null, PAYLOAD_SECRET: null, CHANNEL: "stable" },
+      environment: { SERVER_URL: "https://runtime.example.com" },
+    });
+  });
+
+  it("#795 retains a Compose build-arg template alongside openship.json env", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "openship-compose-build-args-"));
+    tempDirs.push(tempDir);
+    await writeFile(join(tempDir, "Dockerfile"), "FROM node:22-alpine\nARG SERVER_URL\n");
+    await writeFile(
+      join(tempDir, "compose.yaml"),
+      [
+        "services:",
+        "  admin:",
+        "    build:",
+        "      context: .",
+        "      dockerfile: Dockerfile",
+        "      args:",
+        "        SERVER_URL: ${SERVER_URL:?set SERVER_URL}",
+      ].join("\n"),
+    );
+    await writeFile(
+      join(tempDir, "openship.json"),
+      JSON.stringify({ env: { SERVER_URL: "https://source.example.com" } }),
+    );
+
+    const info = await resolveProjectInfo({ source: "local", path: tempDir });
+
+    expect(info.services?.[0]).toMatchObject({
+      build: ".",
+      dockerfile: "Dockerfile",
+      // Raw source stays frozen for the final deployment-env interpolation.
+      buildArgs: { SERVER_URL: "${SERVER_URL:?set SERVER_URL}" },
+      advanced: { buildArgTemplateKeys: ["SERVER_URL"] },
+    });
+    expect(info.openshipEnv).toEqual({ SERVER_URL: "https://source.example.com" });
+    expect(info.missingRequiredEnv).toBeUndefined();
+  });
+
+  it("reads single-app source env without parsing an unrelated Compose file", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "openship-source-env-"));
+    tempDirs.push(tempDir);
+    await mkdir(join(tempDir, "apps", "web"), { recursive: true });
+    await writeFile(join(tempDir, "compose.yaml"), "services: [this is not valid");
+    await writeFile(join(tempDir, "apps", "web", ".env"), "LOCAL_DEFAULT=from-dotenv\n");
+    await writeFile(
+      join(tempDir, "OpenShip.json"),
+      JSON.stringify({
+        env: {
+          PUBLIC_URL: "https://app.example.com",
+          AUTH_SECRET: { value: "source-secret", secret: true },
+        },
+      }),
+    );
+
+    await expect(
+      resolveProjectSourceEnv({ source: "local", path: tempDir }, "apps/web"),
+    ).resolves.toEqual({
+      rootEnv: {
+        LOCAL_DEFAULT: "from-dotenv",
+        PUBLIC_URL: "https://app.example.com",
+        AUTH_SECRET: "source-secret",
+      },
+      openshipEnv: {
+        PUBLIC_URL: "https://app.example.com",
+        AUTH_SECRET: { value: "source-secret", secret: true },
+      },
+    });
+  });
+
+  it('normalizes an undetected package manager to "npm" instead of the internal "unknown" sentinel (#415)', async () => {
     const tempDir = await mkdtemp(join(tmpdir(), "openship-prepare-"));
     tempDirs.push(tempDir);
 
@@ -476,9 +613,7 @@ describe("resolveProjectInfo", () => {
       const tempDir = await repoWithConfig(JSON.stringify({ ["k".repeat(5000)]: 1 }));
       const info = await resolveProjectInfo({ source: "local", path: tempDir });
 
-      const longest = Math.max(
-        ...(info.configDiagnostics?.warnings ?? [""]).map((w) => w.length),
-      );
+      const longest = Math.max(...(info.configDiagnostics?.warnings ?? [""]).map((w) => w.length));
       expect(longest).toBeLessThanOrEqual(240);
     });
 

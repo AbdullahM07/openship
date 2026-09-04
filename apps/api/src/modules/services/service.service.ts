@@ -807,6 +807,15 @@ export async function updateService(
       patch[key] = trimOrNull(patch[key]);
     }
   }
+  if ("image" in patch && patch.image !== svc.image) {
+    // An image edited through the service API is a literal override. Do not
+    // leave the old Compose expression attached or deployment would silently
+    // replace the operator's edit with a newly interpolated value.
+    patch.advanced = mergeAdvanced(
+      ("advanced" in patch ? patch.advanced : svc.advanced) as ComposeAdvanced | null,
+      { imageTemplate: null },
+    );
+  }
   // #332: `commandArgv` wins over `command` at deploy time, so a command edit that
   // leaves a stale argv behind silently keeps running the OLD command — the form's
   // command field did nothing on any row imported from a compose file. Re-derive on

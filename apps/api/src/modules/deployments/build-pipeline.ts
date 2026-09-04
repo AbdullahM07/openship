@@ -1084,6 +1084,7 @@ async function executeBuildAndDeploy(
           ctx,
           snapshot,
           buildSessionId,
+          composeInterpolationEnv: envMap,
           buildEnvVars: buildEnv.envVars,
           buildResources,
           runtimeResources: prodResources,
