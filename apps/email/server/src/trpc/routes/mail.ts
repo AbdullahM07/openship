@@ -156,24 +156,50 @@ export const mailRouter = router({
         threadId: z.string().nullable().optional(),
         isForward: z.boolean().optional(),
         originalMessage: z.string().optional(),
+        originalMessageId: z.string().optional(),
         scheduleAt: z.string().optional(),
         headers: z.record(z.string(), z.string()).optional(),
         inReplyTo: z.string().optional(),
         references: z.array(z.string()).optional(),
       }),
     )
-    .mutation(({ ctx, input }) => {
+    .mutation(async ({ ctx, input }) => {
       const refsHeader = input.headers?.References;
       const inReplyToHeader = input.headers?.['In-Reply-To'];
       const fromAddress = formatFromAddress(input.fromEmail, ctx.session.email, ctx.session.name);
+
+      let originalHtml = input.originalMessage;
+      let forwardedAttachments: typeof input.attachments;
+      if (input.isForward && input.originalMessageId) {
+        const original = await getThread(ctx.imap, input.originalMessageId, 'inbox', undefined, {
+          includeAttachmentBytes: true,
+        }).catch(() => null);
+        originalHtml = original?.latest.decodedBody ?? originalHtml;
+        forwardedAttachments = original?.latest.attachments
+          .filter((attachment) => attachment.body)
+          .map((attachment) => ({
+            name: attachment.filename,
+            type: attachment.contentType,
+            base64: attachment.body,
+          }));
+      }
+
+      const outgoingHtml = input.isForward
+        ? `${input.message ?? input.html ?? input.body ?? ''}${originalHtml ?? ''}`
+        : input.message ?? input.html ?? input.body ?? undefined;
+      const attachments =
+        forwardedAttachments?.length || input.attachments?.length
+          ? [...(forwardedAttachments ?? []), ...(input.attachments ?? [])]
+          : undefined;
+
       return driverSend(ctx.smtp, ctx.imap, fromAddress, {
         to: input.to.map(senderToAddress),
         cc: input.cc?.map(senderToAddress),
         bcc: input.bcc?.map(senderToAddress),
         subject: input.subject,
-        html: input.message ?? input.html ?? input.body ?? undefined,
+        html: outgoingHtml,
         text: input.text,
-        attachments: input.attachments,
+        attachments,
         inReplyTo: input.inReplyTo ?? inReplyToHeader ?? undefined,
         references:
           input.references ??
@@ -250,7 +276,9 @@ export const mailRouter = router({
   getMessageAttachments: protectedProcedure
     .input(z.object({ messageId: z.string() }))
     .query(async ({ ctx, input }) => {
-      const thread = await getThread(ctx.imap, input.messageId);
+      const thread = await getThread(ctx.imap, input.messageId, 'inbox', undefined, {
+        includeAttachmentBytes: true,
+      });
       return thread?.latest.attachments ?? [];
     }),
 
