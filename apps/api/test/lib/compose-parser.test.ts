@@ -31,6 +31,11 @@ EMPTY_VALUE=
     );
 
     expect(parsed.services[0]?.image).toBe("node:20");
+    expect(parsed.services[0]?.advanced?.imageTemplate).toEqual({
+      expression: "node:${NODE_VERSION:-22}",
+      unresolvedVariables: [],
+      sourceValue: "node:20",
+    });
     expect(parsed.services[0]?.environment).toEqual({
       BETTER_AUTH_SECRET: "from-env",
       DATABASE_URL: "postgres://openship:secret@db:5432/app",
@@ -47,6 +52,21 @@ EMPTY_VALUE=
       variable: "EMPTY_VALUE",
       defaultValue: "fallback",
       resolvedValue: "fallback",
+    });
+  });
+
+  it("retains image interpolation provenance and ordinary missing variables", () => {
+    const service = parseComposeFile(`
+services:
+  app:
+    image: ghcr.io/acme/app:\${RELEASE_CHANNEL}-\${VERSION}
+`).services[0]!;
+
+    expect(service.image).toBe("ghcr.io/acme/app:-");
+    expect(service.advanced?.imageTemplate).toEqual({
+      expression: "ghcr.io/acme/app:${RELEASE_CHANNEL}-${VERSION}",
+      unresolvedVariables: ["RELEASE_CHANNEL", "VERSION"],
+      sourceValue: "ghcr.io/acme/app:-",
     });
   });
 
@@ -829,6 +849,11 @@ services:
   it(":? reports instead of throwing when the variable is unset", () => {
     const parsed = parseComposeFile(compose("NODE_VERSION:?NODE_VERSION is required"));
     expect(parsed.services[0]?.image).toBe("node:");
+    expect(parsed.services[0]?.advanced?.imageTemplate).toEqual({
+      expression: "node:${NODE_VERSION:?NODE_VERSION is required}",
+      unresolvedVariables: ["NODE_VERSION"],
+      sourceValue: "node:",
+    });
     expect(parsed.missingRequired).toEqual([
       { variable: "NODE_VERSION", message: "NODE_VERSION is required" },
     ]);

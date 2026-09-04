@@ -18,9 +18,9 @@ export interface EnvironmentVariable {
   value: string;
   visible: boolean;
   /**
-   * The row is a saved secret whose plaintext was intentionally not loaded.
-   * Deploy serialization sends the mask sentinel for this row so the API keeps
-   * its stored ciphertext. Any key/value edit clears this marker.
+   * The row's plaintext was intentionally not loaded (a saved secret or a
+   * source-scanned value). Deploy serialization sends the mask sentinel so the
+   * API can recover it from its trusted store/source. Any edit clears this.
    */
   preserveValue?: boolean;
   /** Explicit secret flag: true = secret (masked on read), false = non-secret. */

@@ -62,8 +62,12 @@ const PREPARE_FILE_CONTENTS = [
   "nx.json",
   "rush.json",
 ] as const;
-const COMPOSE_FILES = ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"] as const;
-
+const COMPOSE_FILES = [
+  "docker-compose.yml",
+  "docker-compose.yaml",
+  "compose.yml",
+  "compose.yaml",
+] as const;
 
 export type Source =
   | {
@@ -223,6 +227,13 @@ export interface ProjectInfo {
   monorepoApps?: MonorepoApp[];
   monorepoWorkspace?: MonorepoWorkspace;
   rootEnv?: Record<string, string>;
+  /**
+   * Server-only copy of the environment explicitly declared in openship.json.
+   * `rootEnv` also contains compose-adjacent `.env` values, so keeping this
+   * provenance is what lets deploy auto-apply only the intentional config layer.
+   * API response mappers expose names, never these values.
+   */
+  openshipEnv?: OpenshipEnv;
   /** Routing config parsed from the repo-root `vercel.json`/`openship.json`
    *  (rewrites/redirects/headers/cleanUrls/trailingSlash). Persisted on the
    *  project + compiled to OpenResty at deploy. */
@@ -257,6 +268,10 @@ export interface ProjectInfo {
    */
   configDiagnostics?: OpenshipConfigDiagnostics;
 }
+
+/** Trusted source values used by the deployment lifecycle. This shape is
+ * deliberately server-only: response mappers expose masked values and keys. */
+export type ProjectSourceEnv = Pick<ProjectInfo, "rootEnv" | "openshipEnv">;
 
 /**
  * `errors` are fields the parse refused — or, for a syntax error / non-object
@@ -358,7 +373,9 @@ interface ExtractedOpenshipConfig {
  * failure becomes distinguishable from a field failure without matching a string.
  */
 function extractOpenshipConfig(fileContents: Record<string, string>): ExtractedOpenshipConfig {
-  const entry = Object.entries(fileContents).find(([name]) => name.toLowerCase() === "openship.json");
+  const entry = Object.entries(fileContents).find(
+    ([name]) => name.toLowerCase() === "openship.json",
+  );
   if (!entry?.[1]) return {};
 
   let raw: unknown;
@@ -403,11 +420,10 @@ function domainsToPublicEndpoints(domains: OpenshipDomain[]): DeclaredPublicEndp
 }
 
 /**
- * Flatten declared env to the plain `Record<string,string>` used both by compose
- * rows and the project-level `rootEnv` seed. The `secret` flag is dropped here —
- * the deploy seeds these as editable env rows (the user marks secrets in the UI /
- * the env-merge endpoint is the encrypt-at-rest path); a declared value is never
- * an opaque masked secret at this stage.
+ * Flatten declared env to the plain `Record<string,string>` used by Compose
+ * interpolation and the masked `rootEnv` preview. Secret provenance remains in
+ * the server-only `openshipEnv` copy and is restored before values are encrypted
+ * into project rows and deployment snapshots.
  */
 function envMapToRecord(envMap: OpenshipEnv): Record<string, string> {
   const out: Record<string, string> = {};
@@ -416,7 +432,11 @@ function envMapToRecord(envMap: OpenshipEnv): Record<string, string> {
 }
 
 /** Split a declared hostname into the (customDomain|domain, domainType) pair. */
-function splitDomain(host: string): { domain?: string; customDomain?: string; domainType: "free" | "custom" } {
+function splitDomain(host: string): {
+  domain?: string;
+  customDomain?: string;
+  domainType: "free" | "custom";
+} {
   return host.includes(".")
     ? { customDomain: host, domainType: "custom" }
     : { domain: host, domainType: "free" };
@@ -456,6 +476,7 @@ function openshipServicesToCompose(services: OpenshipService[]): ComposeService[
       ...(s.image && { image: s.image }),
       ...(s.build && { build: s.build }),
       ...(s.dockerfile && { dockerfile: s.dockerfile }),
+      ...(s.buildArgs && { buildArgs: { ...s.buildArgs } }),
       ports: s.ports ?? [],
       dependsOn: s.dependsOn ?? [],
       environment: s.env ? envMapToRecord(s.env) : {},
@@ -486,10 +507,11 @@ function openshipServicesToCompose(services: OpenshipService[]): ComposeService[
  * detected value; unmatched declarations are ignored (declaring apps the
  * detector didn't find is out of scope — use per-sub-app config instead).
  */
-function mergeMonorepoApps(detected: MonorepoApp[], declared: OpenshipMonorepoApp[]): MonorepoApp[] {
-  const byRoot = new Map(
-    declared.map((d) => [normalizeProjectRootDirectory(d.rootDirectory), d]),
-  );
+function mergeMonorepoApps(
+  detected: MonorepoApp[],
+  declared: OpenshipMonorepoApp[],
+): MonorepoApp[] {
+  const byRoot = new Map(declared.map((d) => [normalizeProjectRootDirectory(d.rootDirectory), d]));
   return detected.map((app) => {
     const d = byRoot.get(normalizeProjectRootDirectory(app.rootDirectory));
     if (!d) return app;
@@ -533,6 +555,7 @@ function applyOpenshipOverlay(info: ProjectInfo, config: OpenshipConfig | undefi
     // Merge onto detected `.env` seed (declared wins per key) so declared env
     // flows through the existing rootEnv → wizard env-row seam.
     info.rootEnv = { ...(info.rootEnv ?? {}), ...envMapToRecord(config.env) };
+    info.openshipEnv = config.env;
   }
   if (config.resources) info.resources = config.resources;
   if (config.readiness) info.readiness = config.readiness;
@@ -564,47 +587,69 @@ function applyOpenshipOverlay(info: ProjectInfo, config: OpenshipConfig | undefi
 }
 
 /**
- * Shared ProjectInfo → scan-response mapping. Used by BOTH the local-folder
- * scan (project.controller.scanLocal) and the folder-upload scan
- * (folder.controller.scanSession) so their payload shape can't drift. Callers
- * add their own extra field (`path` / `sessionId`) alongside.
+ * Strip or mask every source value before ProjectInfo crosses an API boundary.
+ * Both `/deployments/prepare` and the local/folder scan endpoints use this one
+ * projection so a newly-added response field cannot accidentally bypass the
+ * secret policy on just one route.
+ */
+export function projectInfoToPublicResponse(
+  result: ProjectInfo,
+): Omit<ProjectInfo, "openshipEnv"> & { openshipEnvKeys?: string[] } {
+  const { openshipEnv, ...publicInfo } = result;
+  return {
+    ...publicInfo,
+    ...(result.services && { services: result.services.map(maskScanService) }),
+    ...(result.rootEnv && { rootEnv: maskEnv(result.rootEnv) }),
+    ...(openshipEnv && { openshipEnvKeys: Object.keys(openshipEnv) }),
+  };
+}
+
+/**
+ * Shared public ProjectInfo → scan-response mapping. Used by BOTH the
+ * local-folder and folder-upload endpoints so their payload shape cannot drift.
+ * Callers add their own extra field (`path` / `sessionId`) alongside.
  */
 export function projectInfoToScanResponse(result: ProjectInfo) {
+  const publicInfo = projectInfoToPublicResponse(result);
   return {
-    name: result.repository.name,
-    stack: result.stack,
-    projectType: result.projectType,
-    category: result.category,
-    packageManager: result.packageManager,
-    installCommand: result.installCommand,
-    buildCommand: result.buildCommand,
-    startCommand: result.startCommand,
-    buildImage: result.buildImage,
-    outputDirectory: result.outputDirectory,
-    rootDirectory: result.rootDirectory,
-    ...(result.composePath && { composePath: result.composePath }),
-    productionPaths: result.productionPaths,
-    port: result.port,
+    name: publicInfo.repository.name,
+    stack: publicInfo.stack,
+    projectType: publicInfo.projectType,
+    category: publicInfo.category,
+    packageManager: publicInfo.packageManager,
+    installCommand: publicInfo.installCommand,
+    buildCommand: publicInfo.buildCommand,
+    startCommand: publicInfo.startCommand,
+    buildImage: publicInfo.buildImage,
+    outputDirectory: publicInfo.outputDirectory,
+    rootDirectory: publicInfo.rootDirectory,
+    ...(publicInfo.composePath && { composePath: publicInfo.composePath }),
+    productionPaths: publicInfo.productionPaths,
+    port: publicInfo.port,
     // #336: env values (and their environmentMeta) are masked on output. The
     // deploy pipeline recovers the real values by re-parsing the source, and the
     // wizard reveals them on demand via the write-gated reveal endpoint.
-    services: (result.services ?? []).map(maskScanService),
-    ...(result.missingRequiredEnv && { missingRequiredEnv: result.missingRequiredEnv }),
-    ...(result.unsupportedCompose && { unsupportedCompose: result.unsupportedCompose }),
+    services: publicInfo.services ?? [],
+    ...(publicInfo.missingRequiredEnv && { missingRequiredEnv: publicInfo.missingRequiredEnv }),
+    ...(publicInfo.unsupportedCompose && { unsupportedCompose: publicInfo.unsupportedCompose }),
     // Declared-overlay fields (openship.json) — omitted from the response when
     // absent so a repo without the file yields the exact same payload as before.
-    ...(result.productionMode && { productionMode: result.productionMode }),
-    ...(result.workloadType && { workloadType: result.workloadType }),
-    ...(result.volumes && { volumes: result.volumes }),
-    ...(result.runtimeMode && { runtimeMode: result.runtimeMode }),
-    ...(result.publicEndpoints && { publicEndpoints: result.publicEndpoints }),
-    ...(result.resources && { resources: result.resources }),
-    ...(result.readiness && { readiness: result.readiness }),
-    ...(result.configDiagnostics && { configDiagnostics: result.configDiagnostics }),
-    ...(result.rootEnv && Object.keys(result.rootEnv).length > 0 && { rootEnv: maskEnv(result.rootEnv) }),
-    ...(result.routing && { routing: result.routing }),
-    ...(result.monorepoWorkspace && { monorepoWorkspace: result.monorepoWorkspace }),
-    ...(result.monorepoApps && { monorepoApps: result.monorepoApps }),
+    ...(publicInfo.productionMode && { productionMode: publicInfo.productionMode }),
+    ...(publicInfo.workloadType && { workloadType: publicInfo.workloadType }),
+    ...(publicInfo.volumes && { volumes: publicInfo.volumes }),
+    ...(publicInfo.runtimeMode && { runtimeMode: publicInfo.runtimeMode }),
+    ...(publicInfo.publicEndpoints && { publicEndpoints: publicInfo.publicEndpoints }),
+    ...(publicInfo.resources && { resources: publicInfo.resources }),
+    ...(publicInfo.readiness && { readiness: publicInfo.readiness }),
+    ...(publicInfo.configDiagnostics && { configDiagnostics: publicInfo.configDiagnostics }),
+    ...(publicInfo.rootEnv &&
+      Object.keys(publicInfo.rootEnv).length > 0 && {
+        rootEnv: publicInfo.rootEnv,
+      }),
+    ...(publicInfo.openshipEnvKeys && { openshipEnvKeys: publicInfo.openshipEnvKeys }),
+    ...(publicInfo.routing && { routing: publicInfo.routing }),
+    ...(publicInfo.monorepoWorkspace && { monorepoWorkspace: publicInfo.monorepoWorkspace }),
+    ...(publicInfo.monorepoApps && { monorepoApps: publicInfo.monorepoApps }),
   };
 }
 
@@ -620,18 +665,20 @@ async function readProjectSnapshot(
 ): Promise<ProjectRootSnapshotInput> {
   const normalizedRootDirectory = normalizeProjectRootDirectory(rootDirectory);
   const files = await reader.listDirectory(normalizedRootDirectory);
-  const packageJson = await reader.readJson(joinProjectPath(normalizedRootDirectory, "package.json"));
+  const packageJson = await reader.readJson(
+    joinProjectPath(normalizedRootDirectory, "package.json"),
+  );
   const fileContents: Record<string, string> = {};
 
   await Promise.all(
-    PREPARE_FILE_CONTENTS
-      .filter((name) => files.some((file) => file.name.toLowerCase() === name.toLowerCase()))
-      .map(async (name) => {
-        const content = await reader.readText(joinProjectPath(normalizedRootDirectory, name));
-        if (content) {
-          fileContents[name] = content;
-        }
-      }),
+    PREPARE_FILE_CONTENTS.filter((name) =>
+      files.some((file) => file.name.toLowerCase() === name.toLowerCase()),
+    ).map(async (name) => {
+      const content = await reader.readText(joinProjectPath(normalizedRootDirectory, name));
+      if (content) {
+        fileContents[name] = content;
+      }
+    }),
   );
 
   // Workspace/project manifests with dynamic basenames - PREPARE_FILE_CONTENTS
@@ -690,9 +737,11 @@ async function selectProjectSnapshot(
     rootSnapshot.packageJson,
   );
 
-  const candidates = (await Promise.all(
-    hints.map((hint) => loadCandidateSnapshot(reader, hint.rootDirectory, hint.source)),
-  )).filter((candidate): candidate is ProjectRootSnapshotInput => Boolean(candidate));
+  const candidates = (
+    await Promise.all(
+      hints.map((hint) => loadCandidateSnapshot(reader, hint.rootDirectory, hint.source)),
+    )
+  ).filter((candidate): candidate is ProjectRootSnapshotInput => Boolean(candidate));
 
   const selected = applyWorkspaceContext(
     rootSnapshot,
@@ -703,13 +752,45 @@ async function selectProjectSnapshot(
   return { selected, monorepo };
 }
 
-
 async function readProjectText(
   reader: ProjectReader,
   rootDirectory: string,
   name: string,
 ): Promise<string | undefined> {
   return reader.readText(joinProjectPath(rootDirectory, name));
+}
+
+/**
+ * Read only the environment-bearing source files needed by a deployment.
+ * This intentionally does not run stack detection or parse Compose: an
+ * explicit single-app deployment may coexist with a Compose file that the
+ * operator chose not to deploy, while `openship.json.env` must still work.
+ */
+export async function resolveSourceEnvFromReader(
+  reader: ProjectReader,
+  rootDirectory = "",
+): Promise<ProjectSourceEnv> {
+  const normalizedRoot = normalizeProjectRootDirectory(rootDirectory);
+  const rootFiles = await reader.listDirectory("");
+  const openshipName = rootFiles.find(
+    (file) => file.type !== "dir" && file.name.toLowerCase() === "openship.json",
+  )?.name;
+  const [openshipContent, envContent] = await Promise.all([
+    openshipName ? reader.readText(openshipName) : undefined,
+    readProjectText(reader, normalizedRoot, ".env"),
+  ]);
+  const openship = extractOpenshipConfig(
+    openshipContent ? { [openshipName ?? "openship.json"]: openshipContent } : {},
+  ).config?.env;
+  const rootEnv = {
+    ...(envContent ? parseComposeEnvFile(envContent) : {}),
+    ...(openship ? envMapToRecord(openship) : {}),
+  };
+
+  return {
+    ...(Object.keys(rootEnv).length > 0 && { rootEnv }),
+    ...(openship && Object.keys(openship).length > 0 && { openshipEnv: openship }),
+  };
 }
 
 /** Which of `candidates` this directory listing actually holds, in candidate order. */
@@ -757,6 +838,36 @@ export async function resolveProjectInfo(input: Source): Promise<ProjectInfo> {
   // Dynamic import keeps local-source (node:fs) out of the cloud module graph.
   const { resolveFromLocal } = await import("./local-source");
   return resolveFromLocal(input.path, { composePath: input.composePath, env: input.env });
+}
+
+/**
+ * Lightweight source-env resolver for lifecycle paths that intentionally do
+ * not inspect Compose (notably explicit single-app deploys). The repository
+ * root owns `openship.json`; `rootDirectory` selects the adjacent opt-in `.env`.
+ */
+export async function resolveProjectSourceEnv(
+  input: Source,
+  rootDirectory = "",
+): Promise<ProjectSourceEnv> {
+  if (input.source === "github") {
+    if (!input.ctx) {
+      throw new Error("resolveProjectSourceEnv(github): ctx is required");
+    }
+    const branch =
+      input.branch?.trim() ||
+      (await githubService.getRepository(input.ctx, input.owner, input.repo)).default_branch;
+    return resolveSourceEnvFromReader(
+      createGitHubReader(input.ctx, input.owner, input.repo, branch),
+      rootDirectory,
+    );
+  }
+
+  if (env.CLOUD_MODE) {
+    throw new Error("Local project resolution is not available in cloud mode");
+  }
+
+  const { resolveSourceEnvFromLocal } = await import("./local-source");
+  return resolveSourceEnvFromLocal(input.path, rootDirectory);
 }
 
 type RepoMeta = Parameters<typeof toProjectInfo>[0];
@@ -862,7 +973,17 @@ export async function resolveFromReader(
     composeEnvContent,
     root.monorepo,
     routing,
-    { declaredCompose: !!root.declaredComposePath, env: opts.env },
+    {
+      declaredCompose: !!root.declaredComposePath,
+      // `openship.json.env` is the repository's explicit shared environment
+      // layer. Let it resolve Compose fields during the same source read; an
+      // environment supplied by the deploy request remains the higher-priority
+      // operator override. The adjacent `.env` stays the parser's lowest layer.
+      env: {
+        ...(openship.config?.env ? envMapToRecord(openship.config.env) : {}),
+        ...(opts.env ?? {}),
+      },
+    },
   );
   const overlaid = applyOpenshipOverlay(info, openship.config);
   if (openship.diagnostics) overlaid.configDiagnostics = openship.diagnostics;

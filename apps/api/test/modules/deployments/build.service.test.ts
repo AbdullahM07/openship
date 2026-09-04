@@ -11,6 +11,9 @@ const {
   kickoffBuild,
   repos,
   resolveProjectInfo,
+  resolveProjectSourceEnv,
+  resolveFolderSessionSourceEnv,
+  scanFolderSession,
   resolveProjectRouteState,
   resolveServicePipelineMode,
   resolveSmartRoute,
@@ -29,6 +32,7 @@ const {
       getEnvMap: vi.fn(),
       listEnvVars: vi.fn(),
       bulkSetEnvVars: vi.fn(),
+      mergeEnvVars: vi.fn(),
       listEnvVarChangeMeta: vi.fn(),
       update: vi.fn(),
     },
@@ -59,6 +63,9 @@ const {
     },
   },
   resolveProjectInfo: vi.fn(),
+  resolveProjectSourceEnv: vi.fn(),
+  resolveFolderSessionSourceEnv: vi.fn(),
+  scanFolderSession: vi.fn(),
   resolveProjectRouteState: vi.fn(),
   resolveServicePipelineMode: vi.fn(),
   resolveSmartRoute: vi.fn(),
@@ -80,6 +87,12 @@ vi.mock("../../../src/modules/deployments/preflight", () => ({
 
 vi.mock("../../../src/modules/deployments/prepare.service", () => ({
   resolveProjectInfo,
+  resolveProjectSourceEnv,
+}));
+
+vi.mock("../../../src/modules/projects/folder/folder.service", () => ({
+  scanFolderSession,
+  resolveFolderSessionSourceEnv,
 }));
 
 vi.mock("../../../src/modules/deployments/build-pipeline", () => ({
@@ -530,6 +543,7 @@ describe("triggerDeployment", () => {
       publicEndpoints: [],
     });
     resolveProjectInfo.mockResolvedValue({ services: composeServices });
+    resolveProjectSourceEnv.mockResolvedValue(undefined);
     resolveServicePipelineMode.mockResolvedValue({
       useServicePipeline: true,
       servicePreflightServices: composeServices,
@@ -563,6 +577,130 @@ describe("triggerDeployment", () => {
         composeServices,
       }),
     );
+  });
+
+  it("uses the same frozen project env for Compose reconciliation and the deployment", async () => {
+    const encryptedVersion = encrypt("1.2.3");
+    repos.project.getEnvMap.mockResolvedValue({ MY_VERSION: encryptedVersion });
+
+    await triggerDeployment(ctx, {
+      projectId: "project-1",
+      branch: "main",
+      commitSha: "abc123",
+    });
+
+    expect(resolveProjectInfo).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "local",
+        path: "/srv/my-stack",
+        env: { MY_VERSION: "1.2.3" },
+      }),
+    );
+    expect(repos.deployment.create).toHaveBeenCalledWith(
+      expect.objectContaining({ envVars: { MY_VERSION: encryptedVersion } }),
+    );
+  });
+
+  it("applies openship.json env to a single-app trigger without parsing Compose", async () => {
+    repos.project.findById.mockResolvedValue(baseProject({ framework: "nextjs" }));
+    resolveProjectSourceEnv.mockResolvedValueOnce({
+      rootEnv: { NEXT_PUBLIC_API_URL: "https://api.example.com" },
+      openshipEnv: { NEXT_PUBLIC_API_URL: "https://api.example.com" },
+    });
+    resolveServicePipelineMode.mockResolvedValueOnce({
+      useServicePipeline: false,
+      servicePreflightServices: [],
+      useSingleAppPipeline: true,
+    });
+
+    await triggerDeployment(ctx, {
+      projectId: "project-1",
+      branch: "main",
+      commitSha: "abc123",
+    });
+
+    expect(resolveProjectInfo).not.toHaveBeenCalled();
+    expect(resolveProjectSourceEnv).toHaveBeenCalledWith(
+      { source: "local", path: "/srv/my-stack" },
+      "",
+    );
+    const captured = repos.deployment.create.mock.calls.at(-1)?.[0]?.envVars;
+    expect(decrypt(captured.NEXT_PUBLIC_API_URL)).toBe("https://api.example.com");
+    expect(repos.project.mergeEnvVars).toHaveBeenCalledWith(
+      "project-1",
+      "production",
+      [expect.objectContaining({ key: "NEXT_PUBLIC_API_URL", isSecret: false })],
+      [],
+    );
+  });
+
+  it("reconciles a code-only webhook when a persisted image expression depends on env", async () => {
+    repos.project.findById.mockResolvedValue(
+      baseProject({
+        gitProvider: "github",
+        gitUrl: "https://github.com/acme/app.git",
+        gitOwner: "acme",
+        gitRepo: "app",
+        localPath: null,
+      }),
+    );
+    repos.service.listByProject.mockResolvedValue([
+      {
+        id: "svc-api",
+        name: "api",
+        kind: "compose",
+        enabled: true,
+        advanced: {
+          imageTemplate: {
+            expression: "ghcr.io/acme/api:${MY_VERSION}",
+            unresolvedVariables: [],
+          },
+        },
+        importedSpec: { buildArgs: {} },
+      },
+    ]);
+
+    await triggerDeployment(ctx, {
+      projectId: "project-1",
+      trigger: "webhook",
+      commitSha: "1eeaf7692a19ee6e7ecb64b9d1a5c3ee7c0ac2f5",
+      changedPaths: ["src/index.ts"],
+    });
+
+    expect(resolveProjectInfo).toHaveBeenCalledOnce();
+  });
+
+  it("reconciles a legacy image-only row before its first provenance-aware deploy", async () => {
+    repos.project.findById.mockResolvedValue(
+      baseProject({
+        gitProvider: "github",
+        gitUrl: "https://github.com/acme/app.git",
+        gitOwner: "acme",
+        gitRepo: "app",
+        localPath: null,
+      }),
+    );
+    repos.service.listByProject.mockResolvedValue([
+      {
+        id: "svc-api",
+        name: "api",
+        kind: "compose",
+        enabled: true,
+        image: "ghcr.io/acme/api:",
+        build: null,
+        advanced: null,
+        importedSpec: { image: "ghcr.io/acme/api:", buildArgs: {} },
+      },
+    ]);
+
+    await triggerDeployment(ctx, {
+      projectId: "project-1",
+      trigger: "webhook",
+      commitSha: "1eeaf7692a19ee6e7ecb64b9d1a5c3ee7c0ac2f5",
+      changedPaths: ["src/index.ts"],
+    });
+
+    expect(resolveProjectInfo).toHaveBeenCalledOnce();
   });
 
   it("persists exact scope and force-pull intent for an incoming multi-service hook", async () => {
@@ -810,6 +948,7 @@ describe("triggerDeployment", () => {
       source: "local",
       path: "/opt/apps/payments",
       composePath: "deploy/stack.yml",
+      env: {},
     });
     expect(repos.service.reconcileFromCompose).toHaveBeenCalledWith("project-1", composeServices);
     expect(runPreflightChecks).toHaveBeenCalledWith(
@@ -890,6 +1029,35 @@ describe("triggerDeployment", () => {
 
     expect(resolveProjectInfo).not.toHaveBeenCalled();
     expect(repos.service.reconcileFromCompose).not.toHaveBeenCalled();
+  });
+
+  it("reconciles native services when openship.json changes", async () => {
+    repos.project.findById.mockResolvedValue(
+      baseProject({
+        gitProvider: "github",
+        gitUrl: "https://github.com/acme/app.git",
+        gitOwner: "acme",
+        gitRepo: "app",
+        localPath: null,
+      }),
+    );
+    repos.service.listByProject.mockResolvedValue([
+      {
+        ...composeServices[0],
+        projectId: "project-1",
+        importedSpec: { buildArgs: { APP_PACKAGE: "@myorg/web" } },
+      },
+    ]);
+
+    await triggerDeployment(ctx, {
+      projectId: "project-1",
+      trigger: "webhook",
+      commitSha: "1eeaf7692a19ee6e7ecb64b9d1a5c3ee7c0ac2f5",
+      changedPaths: ["openship.json"],
+    });
+
+    expect(resolveProjectInfo).toHaveBeenCalledOnce();
+    expect(repos.service.reconcileFromCompose).toHaveBeenCalledWith("project-1", composeServices);
   });
 
   it("refuses an existing-project redeploy when changed Compose config is unsafe", async () => {
@@ -1066,6 +1234,54 @@ describe("triggerDeployment", () => {
       expect.objectContaining({
         multiService: true,
         composeServices,
+      }),
+    );
+  });
+
+  it("keeps a rollback on its frozen image expression and environment", async () => {
+    const frozenEnv = { MY_VERSION: encrypt("1.2.3") };
+    const frozenSnapshot = baseSnapshot();
+    frozenSnapshot.composeServices = [
+      {
+        name: "api",
+        image: "ghcr.io/acme/api:",
+        ports: [],
+        dependsOn: [],
+        environment: {},
+        volumes: [],
+        advanced: {
+          imageTemplate: {
+            expression: "ghcr.io/acme/api:${MY_VERSION}",
+            unresolvedVariables: ["MY_VERSION"],
+          },
+        },
+      },
+    ];
+    repos.project.getEnvMap.mockResolvedValue({ MY_VERSION: encrypt("9.9.9") });
+
+    await triggerDeployment(ctx, {
+      projectId: "project-1",
+      trigger: "rollback",
+      reuseSnapshot: { meta: frozenSnapshot, envVars: frozenEnv },
+    });
+
+    expect(repos.project.getEnvMap).not.toHaveBeenCalled();
+    expect(resolveProjectInfo).not.toHaveBeenCalled();
+    expect(repos.deployment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        envVars: frozenEnv,
+        meta: expect.objectContaining({
+          composeServices: [
+            expect.objectContaining({
+              image: "ghcr.io/acme/api:",
+              advanced: expect.objectContaining({
+                imageTemplate: expect.objectContaining({
+                  expression: "ghcr.io/acme/api:${MY_VERSION}",
+                }),
+              }),
+            }),
+          ],
+        }),
       }),
     );
   });
@@ -1276,6 +1492,7 @@ describe("redeployBuildSession environment snapshot", () => {
     repos.deployment.supersedeReconciling.mockResolvedValue(undefined);
     repos.deployment.supersedePendingDecisions.mockResolvedValue(undefined);
     assertGitHubRepoAccess.mockResolvedValue(undefined);
+    resolveProjectSourceEnv.mockResolvedValue(undefined);
     resolveStrategy.mockResolvedValue("local");
     kickoffBuild.mockResolvedValue("session-new");
   });
@@ -1286,6 +1503,30 @@ describe("redeployBuildSession environment snapshot", () => {
     expect(repos.deployment.create).toHaveBeenCalledWith(
       expect.objectContaining({ envVars: { MANUAL_ENV: "keep-me" } }),
     );
+  });
+
+  it("refreshes openship.json env for a single-app redeploy without parsing Compose", async () => {
+    repos.deployment.findById.mockResolvedValue({
+      id: "dep-old",
+      projectId: "project-1",
+      organizationId: "org-1",
+      branch: "main",
+      environment: "production",
+      framework: "nextjs",
+      commitSha: "old-sha",
+      commitMessage: "old commit",
+      envVars: null,
+      meta: { ...baseSnapshot(), framework: "nextjs", serviceDeploymentMode: "single" },
+    });
+    resolveProjectSourceEnv.mockResolvedValueOnce({
+      openshipEnv: { NEXT_PUBLIC_API_URL: "https://api.example.com" },
+    });
+
+    await redeployBuildSession(ctx, "dep-old");
+
+    expect(resolveProjectInfo).not.toHaveBeenCalled();
+    const captured = repos.deployment.create.mock.calls.at(-1)?.[0]?.envVars;
+    expect(decrypt(captured.NEXT_PUBLIC_API_URL)).toBe("https://api.example.com");
   });
 
   it("updates update_status cache when resolving a new commit on redeploy", async () => {
@@ -1314,6 +1555,72 @@ describe("redeployBuildSession environment snapshot", () => {
           key: "oblien/openship#main",
           latestSha: "new-sha-123456789012345678901234567890",
           latestMessage: "feat: new commit",
+        }),
+      }),
+    );
+  });
+
+  it("re-resolves a Compose image from the current project env on redeploy", async () => {
+    const project = baseProject({
+      activeDeploymentId: "dep-old",
+      composePath: "compose.yml",
+      gitProvider: "github",
+      gitUrl: "https://github.com/acme/app.git",
+      gitOwner: "acme",
+      gitRepo: "app",
+      localPath: null,
+    });
+    repos.project.findById.mockResolvedValue(project);
+    const imageTemplate = {
+      expression: "ghcr.io/acme/api:${MY_VERSION}",
+      unresolvedVariables: [],
+    };
+    const initial = {
+      name: "api",
+      image: "ghcr.io/acme/api:1.0.0",
+      ports: ["4000"],
+      dependsOn: [],
+      environment: {},
+      volumes: [],
+      advanced: { imageTemplate },
+    };
+    const state = installStatefulComposeRepo({
+      id: "svc-api",
+      projectId: "project-1",
+      kind: "compose",
+      enabled: true,
+      exposed: false,
+      exposedPort: null,
+      domain: null,
+      customDomain: null,
+      domainType: "free",
+      publicEndpoints: [],
+      driftSpec: null,
+      ...initial,
+      importedSpec: toComposeSpec(initial),
+    });
+    const next = { ...initial, image: "ghcr.io/acme/api:2.0.0" };
+    const encryptedVersion = encrypt("2.0.0");
+    repos.project.getEnvMap.mockResolvedValue({ MY_VERSION: encryptedVersion });
+    resolveProjectInfo.mockResolvedValue({ services: [next] });
+    getLatestCommit.mockResolvedValue({ sha: "new-sha", message: "release 2.0.0" });
+
+    await redeployBuildSession(ctx, "dep-old");
+
+    expect(resolveProjectInfo).toHaveBeenCalledWith(
+      expect.objectContaining({ env: { MY_VERSION: "2.0.0" } }),
+    );
+    expect(state.stored().image).toBe("ghcr.io/acme/api:2.0.0");
+    expect(repos.deployment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        envVars: { MY_VERSION: encryptedVersion },
+        meta: expect.objectContaining({
+          composeServices: [
+            expect.objectContaining({
+              image: "ghcr.io/acme/api:2.0.0",
+              advanced: expect.objectContaining({ imageTemplate }),
+            }),
+          ],
         }),
       }),
     );
@@ -1411,6 +1718,7 @@ describe("requestBuildAccess — folder-upload compose services", () => {
     repos.project.getEnvMap.mockResolvedValue({});
     repos.project.listEnvVars.mockResolvedValue([]);
     repos.project.bulkSetEnvVars.mockResolvedValue(undefined);
+    repos.project.mergeEnvVars.mockResolvedValue(undefined);
     repos.deployment.findById.mockResolvedValue(null);
     repos.deployment.listByProject.mockResolvedValue({ rows: [] });
     repos.deployment.getLatestSuccessfulForBranch.mockResolvedValue(null);
@@ -1442,6 +1750,9 @@ describe("requestBuildAccess — folder-upload compose services", () => {
     resolveStrategy.mockResolvedValue("server");
     runPreflightChecks.mockResolvedValue({ ok: true, checks: [] });
     kickoffBuild.mockResolvedValue("session-1");
+    scanFolderSession.mockImplementation(async (session) => ({ services: session.services }));
+    resolveFolderSessionSourceEnv.mockResolvedValue(undefined);
+    resolveProjectSourceEnv.mockResolvedValue(undefined);
   });
 
   it("rejects a foreign folder target before service or deployment writes", async () => {
@@ -1478,6 +1789,311 @@ describe("requestBuildAccess — folder-upload compose services", () => {
       expect.objectContaining({
         serviceDeploymentMode: "services",
         composeServices: scannedServices,
+      }),
+    );
+  });
+
+  it("re-scans uploaded Compose build inputs with the submitted project env", async () => {
+    const initial = {
+      ...scannedServices[0],
+      image: "ghcr.io/acme/api:base-",
+      buildArgs: { RELEASE_CHANNEL: "old" },
+      advanced: {
+        buildArgTemplateKeys: [],
+        imageTemplate: {
+          expression: "ghcr.io/acme/api:${BASE}-${MY_VERSION}",
+          unresolvedVariables: ["MY_VERSION"],
+        },
+      },
+    };
+    const refreshed = {
+      ...initial,
+      image: "ghcr.io/acme/api:base-1.2.3",
+      buildArgs: { RELEASE_CHANNEL: "stable", API_ORIGIN: "${API_ORIGIN}" },
+      advanced: {
+        buildArgTemplateKeys: ["API_ORIGIN"],
+        imageTemplate: {
+          expression: "ghcr.io/acme/api:${BASE}-${MY_VERSION}",
+          unresolvedVariables: [],
+        },
+      },
+    };
+    const uploadSessionId = seedSession({ services: [initial] });
+    scanFolderSession.mockResolvedValueOnce({ services: [refreshed] });
+
+    await requestBuildAccess(ctx, {
+      projectId: "project-1",
+      uploadSessionId,
+      envVars: { MY_VERSION: "1.2.3" },
+      services: [initial] as any,
+    });
+
+    expect(scanFolderSession).toHaveBeenCalledWith(
+      expect.objectContaining({ id: uploadSessionId }),
+      {
+        env: { MY_VERSION: "1.2.3" },
+        composePath: undefined,
+        rememberServices: false,
+      },
+    );
+    expect(repos.service.syncFromCompose).toHaveBeenCalledWith(
+      "project-1",
+      [
+        expect.objectContaining({
+          image: "ghcr.io/acme/api:base-1.2.3",
+          buildArgs: refreshed.buildArgs,
+          advanced: expect.objectContaining({
+            buildArgTemplateKeys: ["API_ORIGIN"],
+            imageTemplate: expect.objectContaining({ unresolvedVariables: [] }),
+          }),
+        }),
+      ],
+      { removeMissing: false },
+    );
+    expect(repos.deployment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        meta: expect.objectContaining({
+          composeServices: [
+            expect.objectContaining({
+              image: "ghcr.io/acme/api:base-1.2.3",
+              buildArgs: refreshed.buildArgs,
+              advanced: expect.objectContaining({ buildArgTemplateKeys: ["API_ORIGIN"] }),
+            }),
+          ],
+        }),
+      }),
+    );
+  });
+
+  it("#795 carries openship.json env through the deployment snapshot for Docker builds", async () => {
+    const sourceServices = [
+      {
+        ...scannedServices[0],
+        image: undefined,
+        build: ".",
+        dockerfile: "Dockerfile",
+        buildArgs: {
+          DATABASE_URI: null,
+          PAYLOAD_SECRET: null,
+          SERVER_URL: null,
+        },
+      },
+    ];
+    const uploadSessionId = seedSession({
+      services: sourceServices,
+      rootEnv: {
+        DATABASE_URI: "postgres://db/app",
+        PAYLOAD_SECRET: "payload-secret",
+        SERVER_URL: "https://admin.example.com",
+      },
+      openshipEnv: {
+        DATABASE_URI: { value: "postgres://db/app", secret: true },
+        PAYLOAD_SECRET: { value: "payload-secret", secret: true },
+        SERVER_URL: "https://admin.example.com",
+      },
+    });
+    scanFolderSession.mockResolvedValueOnce({
+      services: sourceServices,
+      rootEnv: {
+        DATABASE_URI: "postgres://db/app",
+        PAYLOAD_SECRET: "payload-secret",
+        SERVER_URL: "https://admin.example.com",
+      },
+      openshipEnv: {
+        DATABASE_URI: { value: "postgres://db/app", secret: true },
+        PAYLOAD_SECRET: { value: "payload-secret", secret: true },
+        SERVER_URL: "https://admin.example.com",
+      },
+    });
+
+    await requestBuildAccess(ctx, { projectId: "project-1", uploadSessionId });
+
+    const captured = repos.deployment.create.mock.calls.at(-1)?.[0]?.envVars;
+    expect(decrypt(captured.DATABASE_URI)).toBe("postgres://db/app");
+    expect(decrypt(captured.PAYLOAD_SECRET)).toBe("payload-secret");
+    expect(decrypt(captured.SERVER_URL)).toBe("https://admin.example.com");
+    expect(repos.project.mergeEnvVars).toHaveBeenCalledWith(
+      "project-1",
+      "production",
+      expect.arrayContaining([
+        expect.objectContaining({ key: "DATABASE_URI", isSecret: true }),
+        expect.objectContaining({ key: "PAYLOAD_SECRET", isSecret: true }),
+        expect.objectContaining({ key: "SERVER_URL", isSecret: false }),
+      ]),
+      [],
+    );
+    expect(repos.service.syncFromCompose).toHaveBeenCalledWith(
+      "project-1",
+      [expect.objectContaining({ buildArgs: sourceServices[0]!.buildArgs })],
+      { removeMissing: false },
+    );
+  });
+
+  it("keeps an operator project-env override above openship.json defaults", async () => {
+    const uploadSessionId = seedSession({
+      openshipEnv: { SERVER_URL: "https://source.example.com" },
+      rootEnv: { SERVER_URL: "https://source.example.com" },
+    });
+    scanFolderSession.mockResolvedValueOnce({
+      services: scannedServices,
+      openshipEnv: { SERVER_URL: "https://source.example.com" },
+      rootEnv: { SERVER_URL: "https://source.example.com" },
+    });
+
+    await requestBuildAccess(ctx, {
+      projectId: "project-1",
+      uploadSessionId,
+      envVars: { SERVER_URL: "https://override.example.com" },
+    });
+
+    const captured = repos.deployment.create.mock.calls.at(-1)?.[0]?.envVars;
+    expect(decrypt(captured.SERVER_URL)).toBe("https://override.example.com");
+    expect(repos.project.mergeEnvVars).not.toHaveBeenCalled();
+  });
+
+  it("recovers only explicitly imported root .env keys from the trusted source scan", async () => {
+    const uploadSessionId = seedSession({
+      rootEnv: { IMPORTED: "from-dotenv", NOT_IMPORTED: "leave-out" },
+    });
+    scanFolderSession.mockResolvedValueOnce({
+      services: scannedServices,
+      rootEnv: { IMPORTED: "from-dotenv", NOT_IMPORTED: "leave-out" },
+    });
+
+    await requestBuildAccess(ctx, {
+      projectId: "project-1",
+      uploadSessionId,
+      envVars: { IMPORTED: ENV_MASK },
+    });
+
+    const captured = repos.deployment.create.mock.calls.at(-1)?.[0]?.envVars;
+    expect(decrypt(captured.IMPORTED)).toBe("from-dotenv");
+    expect(captured.NOT_IMPORTED).toBeUndefined();
+  });
+
+  it("keeps a literal image override made after folder scan", async () => {
+    const initial = {
+      ...scannedServices[0],
+      image: "ghcr.io/acme/api:1",
+      advanced: {
+        imageTemplate: {
+          expression: "ghcr.io/acme/api:${MY_VERSION}",
+          unresolvedVariables: ["MY_VERSION"],
+        },
+      },
+    };
+    const refreshed = {
+      ...initial,
+      image: "ghcr.io/acme/api:2",
+      advanced: {
+        imageTemplate: {
+          expression: "ghcr.io/acme/api:${MY_VERSION}",
+          unresolvedVariables: [],
+        },
+      },
+    };
+    const uploadSessionId = seedSession({ services: [initial] });
+    scanFolderSession.mockResolvedValueOnce({ services: [refreshed] });
+
+    await requestBuildAccess(ctx, {
+      projectId: "project-1",
+      uploadSessionId,
+      envVars: { MY_VERSION: "2" },
+      services: [{ ...initial, image: "registry.example.com/acme/api:manual" }] as any,
+    });
+
+    const persisted = repos.service.syncFromCompose.mock.calls.at(-1)?.[1]?.[0];
+    expect(persisted.image).toBe("registry.example.com/acme/api:manual");
+    expect(persisted.advanced?.imageTemplate).toBeUndefined();
+  });
+
+  it("does not let a stale first-deploy payload overwrite reconciled build inputs", async () => {
+    repos.project.findById.mockResolvedValue(
+      baseProject({
+        composePath: "compose.yml",
+        gitProvider: "github",
+        gitUrl: "https://github.com/acme/app.git",
+        gitOwner: "acme",
+        gitRepo: "app",
+        localPath: null,
+      }),
+    );
+    const initial = {
+      name: "api",
+      image: "ghcr.io/acme/api:",
+      ports: [],
+      dependsOn: [],
+      environment: {},
+      volumes: [],
+      buildArgs: { RELEASE_CHANNEL: "old" },
+      advanced: {
+        buildArgTemplateKeys: [],
+        imageTemplate: {
+          expression: "ghcr.io/acme/api:${MY_VERSION}",
+          unresolvedVariables: ["MY_VERSION"],
+        },
+      },
+    };
+    const refreshed = {
+      ...initial,
+      image: "ghcr.io/acme/api:1.2.3",
+      buildArgs: { RELEASE_CHANNEL: "stable", API_ORIGIN: "${API_ORIGIN}" },
+      advanced: {
+        buildArgTemplateKeys: ["API_ORIGIN"],
+        imageTemplate: {
+          expression: "ghcr.io/acme/api:${MY_VERSION}",
+          unresolvedVariables: [],
+        },
+      },
+    };
+    const state = installStatefulComposeRepo({
+      id: "svc-api",
+      projectId: "project-1",
+      kind: "compose",
+      enabled: true,
+      exposed: false,
+      exposedPort: null,
+      domain: null,
+      customDomain: null,
+      domainType: "free",
+      publicEndpoints: [],
+      driftSpec: null,
+      ...initial,
+      importedSpec: toComposeSpec(initial),
+    });
+    resolveProjectInfo.mockResolvedValue({ services: [refreshed] });
+    getLatestCommit.mockResolvedValue({ sha: "new-sha", message: "release 1.2.3" });
+
+    await requestBuildAccess(ctx, {
+      projectId: "project-1",
+      envVars: { MY_VERSION: "1.2.3" },
+      services: [initial] as any,
+      serviceDeploymentMode: "services",
+    });
+
+    expect(state.stored().image).toBe("ghcr.io/acme/api:1.2.3");
+    expect(repos.service.syncFromCompose).toHaveBeenCalledWith(
+      "project-1",
+      [
+        expect.objectContaining({
+          image: "ghcr.io/acme/api:1.2.3",
+          buildArgs: refreshed.buildArgs,
+          advanced: expect.objectContaining({ buildArgTemplateKeys: ["API_ORIGIN"] }),
+        }),
+      ],
+      { removeMissing: false },
+    );
+    expect(repos.deployment.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        meta: expect.objectContaining({
+          composeServices: [
+            expect.objectContaining({
+              image: "ghcr.io/acme/api:1.2.3",
+              buildArgs: refreshed.buildArgs,
+              advanced: expect.objectContaining({ buildArgTemplateKeys: ["API_ORIGIN"] }),
+            }),
+          ],
+        }),
       }),
     );
   });
@@ -1724,6 +2340,39 @@ describe("requestBuildAccess — folder-upload compose services", () => {
     );
   });
 
+  it("applies openship.json env for an unscanned single-app upload", async () => {
+    const uploadSessionId = seedSession({ services: undefined });
+    repos.project.findById.mockResolvedValue(
+      baseProject({ gitProvider: "upload", localPath: null, framework: "nextjs" }),
+    );
+    resolveFolderSessionSourceEnv.mockResolvedValueOnce({
+      openshipEnv: {
+        NEXT_PUBLIC_API_URL: "https://api.example.com",
+        AUTH_SECRET: { value: "source-secret", secret: true },
+      },
+    });
+    resolveServicePipelineMode.mockResolvedValueOnce({
+      useServicePipeline: false,
+      servicePreflightServices: [],
+      useSingleAppPipeline: true,
+    });
+
+    await requestBuildAccess(ctx, {
+      projectId: "project-1",
+      uploadSessionId,
+      serviceDeploymentMode: "single",
+    });
+
+    expect(scanFolderSession).not.toHaveBeenCalled();
+    expect(resolveFolderSessionSourceEnv).toHaveBeenCalledWith(
+      expect.objectContaining({ id: uploadSessionId }),
+      "",
+    );
+    const captured = repos.deployment.create.mock.calls.at(-1)?.[0]?.envVars;
+    expect(decrypt(captured.NEXT_PUBLIC_API_URL)).toBe("https://api.example.com");
+    expect(decrypt(captured.AUTH_SECRET)).toBe("source-secret");
+  });
+
   it("does not parse or materialize compose for an explicit single-app deploy (#689)", async () => {
     const actualPipeline = await vi.importActual<
       typeof import("../../../src/modules/deployments/build-pipeline")
@@ -1747,6 +2396,7 @@ describe("requestBuildAccess — folder-upload compose services", () => {
     });
 
     expect(resolveProjectInfo).not.toHaveBeenCalled();
+    expect(resolveProjectSourceEnv).toHaveBeenCalledOnce();
     expect(repos.service.reconcileFromCompose).not.toHaveBeenCalled();
     expect(repos.service.syncFromCompose).not.toHaveBeenCalled();
     expect(runPreflightChecks).toHaveBeenCalledWith(

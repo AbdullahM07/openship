@@ -138,7 +138,7 @@ export function isComposeProvenanceUpgrade(
   const next = toComposeSpec(nextInput);
   const baseAdvanced = { ...(base.advanced ?? {}) } as Record<string, unknown>;
   const nextAdvanced = { ...(next.advanced ?? {}) } as Record<string, unknown>;
-  const markerKeys = ["environmentTemplateKeys", "buildArgTemplateKeys"] as const;
+  const markerKeys = ["imageTemplate", "environmentTemplateKeys", "buildArgTemplateKeys"] as const;
   const addsMarker = markerKeys.some(
     (key) => !Object.hasOwn(baseAdvanced, key) && Object.hasOwn(nextAdvanced, key),
   );
@@ -178,6 +178,7 @@ export function isComposeProvenanceUpgrade(
 export function composeWritePatch(
   parsed: ParsedComposeService,
   stored?: {
+    image?: string | null;
     advanced?: ComposeAdvanced | null;
     buildArgs?: Record<string, string | null> | null;
     command?: string | null;
@@ -196,7 +197,16 @@ export function composeWritePatch(
     parsed.buildArgs !== undefined && suppliedBuildArgCount > 0 && !hasBuildArgMarker
       ? { ...(parsed.advanced ?? {}), buildArgTemplateKeys: [] }
       : parsed.advanced;
+  const hasImageTemplateMarker = Object.hasOwn(parsed.advanced ?? {}, "imageTemplate");
+  const usesLiteralImage = parsed.image !== undefined && !hasImageTemplateMarker;
   const advanced = mergeAdvanced(stored?.advanced ?? null, parsedAdvanced);
+  if (usesLiteralImage) {
+    // A writer that supplies an image without parser provenance means that
+    // image literally. This includes manual edits AND old frozen snapshots;
+    // inheriting the current row's expression would make either one deploy a
+    // different artifact than it requested.
+    delete advanced.imageTemplate;
+  }
   // An explicit empty map clears build args and any stale template provenance,
   // but should not add metadata to an otherwise byte-for-byte snapshot replay.
   if (parsed.buildArgs !== undefined && suppliedBuildArgCount === 0 && !hasBuildArgMarker) {
@@ -264,6 +274,7 @@ const COMPOSE_OWNED_ADVANCED_KEYS = [
   "networkMode",
   "pidMode",
   "entrypoint",
+  "imageTemplate",
   "environmentTemplateKeys",
   "buildArgTemplateKeys",
 ] as const;
@@ -709,6 +720,9 @@ export function createServiceRepo(db: Database) {
       const removeMissing = opts?.removeMissing ?? true;
       // Default false: only a caller that just re-read the compose file may treat
       // an absent compose-owned key as a deletion (see COMPOSE_OWNED_ADVANCED_KEYS).
+      // That same authoritative read establishes/advances the 3-way-merge
+      // baseline. Without it, an image edited immediately after import is
+      // indistinguishable from a stale scan value during the first deployment.
       const composeAuthoritative = opts?.composeAuthoritative ?? false;
       // Defensive filter - even though every caller should already strip
       // non-compose entries before reaching here, an explicit kind="monorepo"
@@ -745,15 +759,18 @@ export function createServiceRepo(db: Database) {
           await this.update(ex.id, {
             ...patch,
             ...routing,
+            ...(composeAuthoritative ? { importedSpec: toComposeSpec(p), driftSpec: null } : {}),
             // enabled + sortOrder left as-is (already on ex)
           });
           results.push({
             ...ex,
             ...patch,
             ...routing,
+            ...(composeAuthoritative ? { importedSpec: toComposeSpec(p), driftSpec: null } : {}),
             updatedAt: new Date(),
           } as Service);
         } else {
+          const importedSpec = composeAuthoritative ? toComposeSpec(p) : undefined;
           // Create new - new compose services default to enabled.
           const svc = await this.create({
             projectId,
@@ -761,6 +778,7 @@ export function createServiceRepo(db: Database) {
             kind: "compose",
             ...toComposeSpec(p),
             ...routing,
+            ...(importedSpec ? { importedSpec } : {}),
             enabled: true,
             sortOrder: i,
           });
@@ -845,8 +863,8 @@ export function createServiceRepo(db: Database) {
         if (base === null) {
           // Older/import-wizard rows may hold scan-time interpolation results.
           // Adopt the raw expression only where that result is still untouched;
-          // a value the operator changed remains intact, but is marked as a
-          // template target so deploy can consume final scoped env consistently.
+          // a value the operator changed remains literal and is never marked as
+          // a template target.
           const environment = {
             ...((ex.environment as Record<string, string> | null) ?? {}),
           };
@@ -859,7 +877,17 @@ export function createServiceRepo(db: Database) {
           const buildArgTemplateKeys = (theirs.advanced?.buildArgTemplateKeys ?? []).filter(
             (key) => buildArgs[key] === theirs.buildArgs?.[key],
           );
+          const parsedImageTemplate = theirs.advanced?.imageTemplate;
+          const storedImageTemplate = (ex.advanced as ComposeAdvanced | null)?.imageTemplate;
+          const mayAdoptImageTemplate =
+            !!parsedImageTemplate &&
+            (!!storedImageTemplate || ours.image === parsedImageTemplate.sourceValue);
           const advanced = mergeAdvanced(ex.advanced as ComposeAdvanced | null, {
+            // A legacy row has no 3-way baseline. The source-only scan value is
+            // therefore the ownership proof: attach the expression when the
+            // stored image still matches it, but never graft provenance onto a
+            // different (operator-owned) literal image.
+            imageTemplate: mayAdoptImageTemplate ? parsedImageTemplate : null,
             environmentTemplateKeys: theirs.advanced?.environmentTemplateKeys ?? [],
             // A manually changed arg is a literal override, not the raw repo
             // expression whose provenance this marker describes.
@@ -886,7 +914,24 @@ export function createServiceRepo(db: Database) {
         // live row; treating metadata as a repo edit creates an unresolvable,
         // false-positive drift banner on every redeploy.
         if (isComposeProvenanceUpgrade(base, theirs)) {
-          await this.update(ex.id, { importedSpec: theirs, driftSpec: null });
+          const imageTemplate = theirs.advanced?.imageTemplate;
+          // Provenance may be attached only to the value it describes. If the
+          // live image diverged from the old baseline, it is an operator-owned
+          // override; attaching the newly discovered expression would make the
+          // build silently replace that override even though this branch is
+          // explicitly a metadata-only baseline upgrade.
+          const imageStillMatchesBaseline = ours.image === base.image;
+          await this.update(ex.id, {
+            ...(imageTemplate && imageStillMatchesBaseline
+              ? {
+                  advanced: mergeAdvanced(ex.advanced as ComposeAdvanced | null, {
+                    imageTemplate,
+                  }),
+                }
+              : {}),
+            importedSpec: theirs,
+            driftSpec: null,
+          });
           continue;
         }
 

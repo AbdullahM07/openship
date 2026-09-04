@@ -17,7 +17,7 @@ import type {
   BuildResult,
 } from "@repo/adapters";
 import { BuildLogger, STATIC_RELEASE_BASE } from "@repo/adapters";
-import { composeBuildIssues, type ComposeAdvanced } from "@repo/core";
+import { composeBuildIssues, validateImageReference, type ComposeAdvanced } from "@repo/core";
 import { repos, type Deployment, type Project, type Service } from "@repo/db";
 
 import {
@@ -35,7 +35,10 @@ import {
   resolveSubAppRecipe,
 } from "../../../lib/deployable-service";
 import { normalizeProjectRootDirectory } from "../../../lib/project-root-detector";
-import { resolveComposeEnvironmentTemplates } from "../../../lib/compose-parser";
+import {
+  resolveComposeEnvironmentTemplates,
+  resolveComposeInterpolation,
+} from "../../../lib/compose-parser";
 import { resolveServicePort } from "./domain-helpers";
 
 function sanitizeComposeImageName(value: string): string {
@@ -80,6 +83,43 @@ export function resolveComposeBuildArgs(
     );
   }
   return Object.keys(resolved).length > 0 ? resolved : undefined;
+}
+
+/**
+ * Resolve a Compose-authored image against the deployment's final project env.
+ *
+ * The parser also keeps its scan-time concrete value. That value is the safe
+ * fallback when the compose-adjacent `.env` file supplied variables which are
+ * intentionally not injected into every container/build environment. We only
+ * trust that fallback when the scan recorded zero unresolved variables; an
+ * unresolved preview can look syntactically valid (`repo:${TAG}suffix` →
+ * `repo:suffix`) and must never be pulled.
+ */
+export function resolveComposeImage(
+  image: string | null | undefined,
+  template: ComposeAdvanced["imageTemplate"],
+  deployEnv: Record<string, string>,
+): string {
+  let resolved = image?.trim() ?? "";
+
+  if (template) {
+    const dynamic = resolveComposeInterpolation(template.expression, deployEnv);
+    if (dynamic.unresolvedVariables.length === 0) {
+      resolved = dynamic.value.trim();
+    } else if (template.unresolvedVariables.length > 0) {
+      const variables = [...new Set(dynamic.unresolvedVariables)].sort();
+      throw new Error(
+        `Compose image requires missing variable${variables.length === 1 ? "" : "s"}: ${variables.join(", ")}`,
+      );
+    }
+    // Otherwise the source scan resolved every variable (normally from the
+    // compose-adjacent .env file). Keep that concrete, release-frozen preview.
+  }
+
+  const invalid = validateImageReference(resolved);
+  if (invalid) throw new Error(invalid);
+
+  return resolved;
 }
 
 /** A catalog template ships this service's Docker build context INLINE
@@ -373,6 +413,9 @@ export async function buildComposeImages(opts: {
   logger: BuildLogger;
   snapshot: BuildConfigSnapshotLike;
   buildSessionId: string;
+  /** Project-scoped deployment env only. Compose image interpolation must not
+   *  accidentally consume Openship's injected CI/build helper variables. */
+  composeInterpolationEnv: Record<string, string>;
   buildEnvVars: Record<string, string>;
   buildResources: ResourceConfig;
   gitToken?: string;
@@ -474,7 +517,10 @@ export async function buildComposeImages(opts: {
   );
   const external = enabled.filter(
     (service) =>
-      !isHandedOver(service) && !service.build && !hasInlineBuild(service) && !!service.image,
+      !isHandedOver(service) &&
+      !service.build &&
+      !hasInlineBuild(service) &&
+      Boolean(service.image || (service.advanced as ComposeAdvanced | null)?.imageTemplate),
   );
 
   // Repo-less catalog builds need their context on disk before any spec is built,
@@ -507,12 +553,32 @@ export async function buildComposeImages(opts: {
     }
 
     for (const service of external) {
-      if (service.image) {
-        imageRefs.set(service.id, service.image);
+      try {
+        const image = resolveComposeImage(
+          service.image,
+          (service.advanced as ComposeAdvanced | null)?.imageTemplate,
+          opts.composeInterpolationEnv,
+        );
+        imageRefs.set(service.id, image);
         sessionManager.broadcastServiceStatus(opts.dep.id, {
           serviceName: service.name,
           serviceId: service.id,
           status: "built",
+        });
+      } catch (err) {
+        const failureMessage =
+          err instanceof Error ? err.message : `Invalid image for service "${service.name}"`;
+        buildFailures.set(service.id, failureMessage);
+        opts.logger.log(
+          `Compose service "${service.name}" image resolution failed: ${failureMessage}\n`,
+          "error",
+          { serviceName: service.name },
+        );
+        sessionManager.broadcastServiceStatus(opts.dep.id, {
+          serviceName: service.name,
+          serviceId: service.id,
+          status: "failed",
+          error: failureMessage,
         });
       }
     }

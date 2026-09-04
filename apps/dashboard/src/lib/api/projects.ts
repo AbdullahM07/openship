@@ -162,6 +162,8 @@ export interface ScanProjectResponse {
   productionPaths: PrepareProjectResponse["productionPaths"];
   port: PrepareProjectResponse["port"];
   services?: PrepareComposeService[];
+  rootEnv?: PrepareProjectResponse["rootEnv"];
+  openshipEnvKeys?: PrepareProjectResponse["openshipEnvKeys"];
   configDiagnostics?: PrepareProjectResponse["configDiagnostics"];
 }
 

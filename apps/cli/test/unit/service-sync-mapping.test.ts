@@ -86,6 +86,15 @@ describe("service sync — compose config JSON mapping", () => {
     expect(errors).toEqual([]);
   });
 
+  it("keeps Docker-normalized images literal instead of inventing interpolation provenance", () => {
+    const errors: string[] = [];
+    const svc = mapComposeService("api", { image: "ghcr.io/acme/api:1.2.3" }, "/repo", errors);
+
+    expect(svc.image).toBe("ghcr.io/acme/api:1.2.3");
+    expect(svc).not.toHaveProperty("advanced.imageTemplate");
+    expect(errors).toEqual([]);
+  });
+
   it("refuses unsupported build behavior instead of silently dropping it", () => {
     const errors: string[] = [];
     mapComposeService(

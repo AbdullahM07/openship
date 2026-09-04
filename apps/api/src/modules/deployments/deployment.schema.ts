@@ -77,9 +77,10 @@ const BuildServiceInput = Type.Object({
   // unchanged string from disturbing argv; this lets a client be explicit.
   commandArgv: Type.Optional(Type.Array(Type.String())),
   restart: Type.Optional(Type.String()),
-  // Raw-parser provenance. Other advanced keys are accepted at runtime so the
-  // deploy snapshot can continue carrying healthchecks/resources/etc.; this one
-  // is named in the static schema because build execution reads it directly.
+  // Names-only raw-parser provenance. Other advanced keys are accepted at
+  // runtime so the deploy snapshot can continue carrying
+  // healthchecks/resources/etc.; image-expression provenance is deliberately
+  // server-owned and reattached from the canonical source/row in build.service.
   advanced: Type.Optional(
     Type.Object(
       {
