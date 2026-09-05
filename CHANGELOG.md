@@ -3,6 +3,21 @@
 All notable changes to Openship. Versions follow [semver](https://semver.org);
 the in-app updater surfaces critical advisories from `release-advisories.json`.
 
+## 0.7.2
+
+Soft maintenance patch for Docker build reliability. No breaking API changes or
+database migrations.
+
+### Builds
+
+- **Successful Docker builds are no longer rejected by diagnostic log text** —
+  fixes a regression present in 0.7.1 where successful workspace scripts reporting
+  `Exited with code 0` could fail deployment (#832). Single-image and Compose builds
+  now distinguish Docker Engine errors from application output, for both classic
+  and BuildKit builders. Diagnostic hints enrich real failures without overriding
+  successful completion or hiding Docker's error; SSH builds continue to use the
+  command's exit status. Cancellation and inactivity safeguards remain in place.
+
 ## 0.7.1
 
 This release hardens the full deployment lifecycle, makes Compose reconciliation

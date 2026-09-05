@@ -45,15 +45,18 @@ function memoryGuidance(context: DockerBuildDiagnosticContext): string {
   return "This build path was not under an OpenShip-enforced memory cap; check available RAM/swap and the host or Docker daemon OOM logs.";
 }
 
-function exitCodeFromLine(line: string): number | null {
-  const match = line.match(
-    /(?:returned a non-zero code|exited? with(?: exit)? code|exit code)\s*:?\s*(\d+)\b/i,
-  );
-  return match ? Number(match[1]) : null;
+function findNonZeroExitCode(output: string): number | null {
+  for (const match of output.matchAll(
+    /(?:returned a non-zero code|exit(?:ed)? with(?: exit)? code|exit code)\s*:?\s*(\d+)\b/gi,
+  )) {
+    const code = Number(match[1]);
+    if (code !== 0) return code;
+  }
+  return null;
 }
 
 /**
- * Turn Docker/compiler output into a useful failure while preserving the raw
+ * Turn Docker/compiler output into a useful failure hint while preserving the raw
  * line. Exit 137 is described as SIGKILL and a likely OOM, never as proof of
  * OOM: an operator or another supervisor can also send SIGKILL.
  */
@@ -61,7 +64,7 @@ export function extractDockerBuildFailureHint(
   line: string,
   context: DockerBuildDiagnosticContext = {},
 ): string | null {
-  const code = exitCodeFromLine(line);
+  const code = findNonZeroExitCode(line);
   if (code === 137) {
     return `${line} — The build process was killed by SIGKILL (exit code 137). Memory exhaustion is the most common cause, but exit 137 alone does not prove OOM. ${memoryGuidance(context)}`;
   }

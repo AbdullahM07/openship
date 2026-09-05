@@ -1283,11 +1283,14 @@ export class DockerRuntime implements RuntimeAdapter {
     logger: BuildLogger,
     trace?: BuildKitTraceDecoder,
     diagnosticContext: DockerBuildDiagnosticContext = {},
-  ): string | null {
-    const errorMessage = event.errorDetail?.message ?? event.error;
+  ): { errorMessage?: string; failureHint: string | null } | null {
+    const errorMessage = event.errorDetail?.message || event.error;
     if (errorMessage) {
       logger.log(errorMessage, "error");
-      return this.extractBuildFailureHint(errorMessage, diagnosticContext) ?? errorMessage;
+      return {
+        errorMessage,
+        failureHint: this.extractBuildFailureHint(errorMessage, diagnosticContext) ?? errorMessage,
+      };
     }
 
     // A BuildKit build emits its whole progress stream as protobuf traces instead of
@@ -1304,10 +1307,11 @@ export class DockerRuntime implements RuntimeAdapter {
         logger.log(line.message, line.level === "error" ? "error" : parseLogLevel(line.message));
         hint = chooseDockerBuildFailureHint(
           hint,
-          this.extractBuildFailureHint(line.message, diagnosticContext),
+          this.extractBuildFailureHint(line.message, diagnosticContext) ??
+            (line.level === "error" ? line.message : null),
         );
       }
-      return hint;
+      return { failureHint: hint };
     }
 
     if (event.stream) {
@@ -1342,7 +1346,7 @@ export class DockerRuntime implements RuntimeAdapter {
       }
 
       logger.log(line, parseLogLevel(line));
-      return this.extractBuildFailureHint(line, diagnosticContext);
+      return { failureHint: this.extractBuildFailureHint(line, diagnosticContext) };
     }
 
     if (event.status) {
@@ -2169,6 +2173,7 @@ export class DockerRuntime implements RuntimeAdapter {
     options: DockerodeBuildStreamOptions = {},
   ): Promise<void> {
     let fatalBuildError: string | null = null;
+    let streamedFailureHint: string | null = null;
     const timeoutMs = getDockerBuildIdleTimeoutMs();
     const diagnosticContext = options.diagnosticContext ?? {};
     const buildContainerTracker = options.legacyBuilder
@@ -2268,9 +2273,11 @@ export class DockerRuntime implements RuntimeAdapter {
           (event) => {
             idleMonitor?.progress();
             buildContainerTracker?.observe(event.stream);
-            fatalBuildError = chooseDockerBuildFailureHint(
-              fatalBuildError,
-              this.handleBuildEvent(event, log, options.trace, diagnosticContext),
+            const diagnostics = this.handleBuildEvent(event, log, options.trace, diagnosticContext);
+            fatalBuildError ??= diagnostics?.errorMessage ?? null;
+            streamedFailureHint = chooseDockerBuildFailureHint(
+              streamedFailureHint,
+              diagnostics?.failureHint ?? null,
             );
           },
         );
@@ -2295,7 +2302,12 @@ export class DockerRuntime implements RuntimeAdapter {
     }
 
     if (fatalBuildError) {
-      throw new Error(fatalBuildError);
+      const hint = chooseDockerBuildFailureHint(fatalBuildError, streamedFailureHint);
+      throw new Error(
+        hint && !hint.includes(fatalBuildError)
+          ? `${fatalBuildError}\n${hint}`
+          : (hint ?? fatalBuildError),
+      );
     }
   }
 

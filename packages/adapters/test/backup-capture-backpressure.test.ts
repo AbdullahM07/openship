@@ -30,6 +30,7 @@
 
 import net from "node:net";
 import { Writable } from "node:stream";
+import { finished } from "node:stream/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import { startAttachStream } from "../src/runtime/docker-exec-stream";
 import { demuxDockerStream } from "../src/runtime/docker-demux";
@@ -42,7 +43,8 @@ function frame(payload: Buffer): Buffer {
   return Buffer.concat([header, payload]);
 }
 
-const CHUNK = frame(Buffer.alloc(64 * 1024, 0x61));
+const PAYLOAD = Buffer.alloc(64 * 1024, 0x61);
+const CHUNK = frame(PAYLOAD);
 /** More than any buffer in the chain, so "it all fit" is not an explanation. */
 const TOTAL_TO_PUSH = 256 * 1024 * 1024;
 
@@ -60,7 +62,7 @@ interface FakeDaemon {
  * return — i.e. it is a well-behaved producer, exactly like dockerode's daemon. If the
  * consumer's backpressure is real, this number plateaus.
  */
-async function fakeDaemon(): Promise<FakeDaemon> {
+async function fakeDaemon(totalToPush = TOTAL_TO_PUSH): Promise<FakeDaemon> {
   let pushed = 0;
   // Tracked so teardown can destroy them explicitly. `server.close()` only stops
   // accepting — it waits for open connections, and a connection whose peer we paused
@@ -71,9 +73,11 @@ async function fakeDaemon(): Promise<FakeDaemon> {
     live.add(socket);
     socket.on("close", () => live.delete(socket));
     socket.once("data", () => {
-      socket.write("HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n");
+      socket.write(
+        "HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n",
+      );
       const pump = () => {
-        while (pushed < TOTAL_TO_PUSH) {
+        while (pushed < totalToPush) {
           pushed += CHUNK.length;
           if (!socket.write(CHUNK)) return void socket.once("drain", pump);
         }
@@ -121,65 +125,82 @@ afterEach(async () => {
 describe("a blocked destination stops the daemon", () => {
   it("plateaus the producer instead of buffering the whole stream in the API", async () => {
     daemon = await fakeDaemon();
-    const stream = await startAttachStream(
-      { host: "127.0.0.1", port: daemon.port },
-      "helper_1",
-      { stdin: false, stdout: true, stderr: true },
-    );
+    const stream = await startAttachStream({ host: "127.0.0.1", port: daemon.port }, "helper_1", {
+      stdin: false,
+      stdout: true,
+      stderr: true,
+    });
 
     const sink = blockedDestination();
     const discard = new Writable({ write: (_c, _e, cb) => cb() });
     demuxDockerStream(stream, sink, discard);
 
-    await sleep(600);
-    const early = daemon.pushed();
-    await sleep(900);
-    const late = daemon.pushed();
+    try {
+      await sleep(600);
+      const early = daemon.pushed();
+      await sleep(900);
+      const late = daemon.pushed();
 
-    // The property: the producer is STUCK. Not "the client stopped reporting" —
-    // the daemon itself can no longer place bytes on the wire.
-    expect(late).toBe(early);
+      // The property: the producer is STUCK. Not "the client stopped reporting" —
+      // the daemon itself can no longer place bytes on the wire.
+      expect(late).toBe(early);
 
-    // And it stopped early. Generous ceiling: the socket's own send/receive buffers
-    // plus the bridge's and the sink's are all legitimately in flight, but that is
-    // single-digit MB, nowhere near the 256 MB on offer. Before the fix this was
-    // the entire stream.
-    expect(late).toBeLessThan(32 * 1024 * 1024);
-    expect(late).toBeGreaterThan(0); // sanity: the handshake worked and bytes flowed
-
-    stream.destroy();
+      // And it stopped early. Generous ceiling: the socket's own send/receive buffers
+      // plus the bridge's and the sink's are all legitimately in flight, but that is
+      // single-digit MB, nowhere near the 256 MB on offer. Before the fix this was
+      // the entire stream.
+      expect(late).toBeLessThan(32 * 1024 * 1024);
+      expect(late).toBeGreaterThan(0); // sanity: the handshake worked and bytes flowed
+    } finally {
+      stream.destroy();
+      sink.destroy();
+      discard.destroy();
+    }
   });
 
-  it("resumes and completes once the destination drains", async () => {
-    // The other half: backpressure must be pressure, not a deadlock. Same wiring,
-    // but the sink acknowledges writes, so the whole stream should get through.
-    daemon = await fakeDaemon();
-    const stream = await startAttachStream(
-      { host: "127.0.0.1", port: daemon.port },
-      "helper_1",
-      { stdin: false, stdout: true, stderr: true },
-    );
+  it.each([1, 128, 129])(
+    "resumes and completes once the destination drains (%i frames)",
+    async (frameCount) => {
+      // The other half: backpressure must be pressure, not a deadlock. Same wiring,
+      // but the sink acknowledges writes, so the whole stream should get through.
+      const expectedWireBytes = frameCount * CHUNK.length;
+      daemon = await fakeDaemon(expectedWireBytes);
+      const stream = await startAttachStream({ host: "127.0.0.1", port: daemon.port }, "helper_1", {
+        stdin: false,
+        stdout: true,
+        stderr: true,
+      });
 
-    let received = 0;
-    const draining = new Writable({
-      highWaterMark: 64 * 1024,
-      write(chunk: Buffer, _enc, cb) {
-        received += chunk.byteLength;
-        // Acknowledge on a later tick, so the path really does pause and resume
-        // many times rather than never filling.
-        setImmediate(cb);
-      },
-    });
-    const discard = new Writable({ write: (_c, _e, cb) => cb() });
-    demuxDockerStream(stream, draining, discard);
+      let received = 0;
+      const draining = new Writable({
+        highWaterMark: PAYLOAD.length,
+        write(chunk: Buffer, _enc, cb) {
+          received += chunk.byteLength;
+          // Acknowledge on a later tick, so the path really does pause and resume
+          // many times rather than never filling.
+          setImmediate(cb);
+        },
+      });
+      const discard = new Writable({ write: (_c, _e, cb) => cb() });
+      const complete = Promise.all([
+        finished(stream, { writable: false, cleanup: true }).then(() => {
+          draining.end();
+          discard.end();
+        }),
+        finished(draining, { cleanup: true }),
+        finished(discard, { cleanup: true }),
+      ]);
+      demuxDockerStream(stream, draining, discard);
 
-    // Give it a bounded window to move a meaningful amount of data.
-    for (let i = 0; i < 60 && received < 8 * 1024 * 1024; i++) await sleep(50);
-
-    expect(received).toBeGreaterThan(8 * 1024 * 1024);
-    // Payload only — the 8-byte frame headers must not reach the destination.
-    expect(received % (64 * 1024)).toBe(0);
-
-    stream.destroy();
-  });
+      try {
+        await complete;
+        expect(daemon.pushed()).toBe(expectedWireBytes);
+        expect(received).toBe(frameCount * PAYLOAD.length);
+      } finally {
+        stream.destroy();
+        draining.destroy();
+        discard.destroy();
+      }
+    },
+  );
 });

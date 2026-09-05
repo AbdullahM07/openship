@@ -2,11 +2,15 @@ import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
+import { finished } from "node:stream/promises";
 import { createGunzip } from "node:zlib";
 import { promisify } from "node:util";
 
+import Dockerode from "dockerode";
 import { afterAll, describe, expect, it, vi } from "vitest";
 
+import { statusResponse } from "../../test/fixtures/docker-buildkit";
 import type { BuildConfig, CommandExecutor } from "../types";
 
 import { BuildLogger } from "./build-pipeline";
@@ -53,7 +57,9 @@ afterAll(async () => {
  */
 
 /** A repo with a self-contained `svc/` service dir and a decoy root Dockerfile. */
-async function makeRepo(): Promise<string> {
+async function makeRepo(
+  dockerfile = "FROM python:3.12\nCOPY requirements.txt /\n",
+): Promise<string> {
   const repo = await mkdtemp(join(tmpdir(), "dbsc-repo-"));
   cleanups.push(() => rm(repo, { recursive: true, force: true }));
 
@@ -65,10 +71,7 @@ async function makeRepo(): Promise<string> {
   await writeFile(join(repo, "Dockerfile"), "FROM node:22\n");
   await writeFile(join(repo, "root-only.txt"), "root\n");
   await mkdir(join(repo, "svc"), { recursive: true });
-  await writeFile(
-    join(repo, "svc", "Dockerfile.api"),
-    "FROM python:3.12\nCOPY requirements.txt /\n",
-  );
+  await writeFile(join(repo, "svc", "Dockerfile.api"), dockerfile);
   await writeFile(join(repo, "svc", "requirements.txt"), "flask\n");
 
   await exec("git", ["-C", repo, "add", "-A", "-f"]);
@@ -103,7 +106,7 @@ function serviceConfig(localPath: string, overrides: Partial<BuildConfig> = {}):
 }
 
 function runtimeFor(
-  transport: { kind: "ssh" | "local"; description: string },
+  transport: { kind: "ssh" | "local" | "socket" | "tcp"; description: string },
   extra: Record<string, unknown>,
 ) {
   const runtime = Object.create(DockerRuntime.prototype) as DockerRuntime & Record<string, unknown>;
@@ -416,5 +419,81 @@ describe("dockerode docker build — declared build context (#634)", () => {
     const { options } = await capturedTar();
 
     expect(options.version).toBeUndefined();
+  });
+});
+
+describe.each([
+  { mode: "single", transport: "socket" },
+  { mode: "single", transport: "tcp" },
+  { mode: "single", transport: "ssh" },
+  { mode: "batch", transport: "socket" },
+  { mode: "batch", transport: "tcp" },
+  { mode: "batch", transport: "ssh" },
+] as const)("$transport Engine API $mode build results", ({ mode, transport }) => {
+  describe.each(["classic", "buildkit"])("%s builder", (builder) => {
+    it.each([false, true])(
+      "keeps results authoritative and isolated across builds (firstFails=%s)",
+      async (firstFails) => {
+        const repo = await makeRepo(
+          builder === "buildkit" ? "# syntax=docker/dockerfile:1\nFROM scratch\n" : undefined,
+        );
+        const verifyImageBuilt = vi.fn(async () => {});
+        let buildCount = 0;
+        const daemonError = "failed to solve: process exited with code 1";
+        const buildImage = vi.fn(async (body: Readable, _options: Record<string, unknown>) => {
+          await finished(body.resume());
+          const output =
+            "fixture: Process exited with code 1\n@workspace/web build: Exited with code 0\n";
+          const events: object[] = [
+            builder === "classic"
+              ? { stream: output }
+              : {
+                  id: "moby.buildkit.trace",
+                  aux: statusResponse({ logs: [{ vertex: "sha256:build", msg: output }] }),
+                },
+          ];
+          if (buildCount === 0 && firstFails) events.push({ error: daemonError });
+          else events.push({ aux: { ID: "sha256:built-image" } });
+          buildCount += 1;
+          return Readable.from(events.map((event) => `${JSON.stringify(event)}\n`));
+        });
+        const runtime = runtimeFor(
+          { kind: transport, description: `${transport} Engine API` },
+          {
+            _docker: {
+              buildImage,
+              modem: new Dockerode({ socketPath: "/tmp/openship-test-absent.sock" }).modem,
+            },
+            verifyImageBuilt,
+          },
+        );
+        const configs = ["first", "next"].map((name) =>
+          serviceConfig(repo, {
+            sessionId: `result-${transport}-${mode}-${builder}-${firstFails}-${name}`,
+          }),
+        );
+        const results = [];
+        if (mode === "single") {
+          for (const config of configs) results.push(await runtime.build(config));
+        } else {
+          const batch = await runtime.buildImages(
+            configs.map((config, index) => ({ ...spec(config), serviceName: `service-${index}` })),
+            new BuildLogger(),
+          );
+          results.push(...batch.map((entry) => entry.result));
+        }
+
+        expect(results.map((result) => result.status)).toEqual([
+          firstFails ? "failed" : "deploying",
+          "deploying",
+        ]);
+        if (firstFails) expect(results[0]?.errorMessage).toContain(daemonError);
+        expect(buildImage).toHaveBeenCalledTimes(2);
+        for (const [, options] of buildImage.mock.calls) {
+          expect(options.version).toBe(builder === "buildkit" ? "2" : undefined);
+        }
+        expect(verifyImageBuilt).toHaveBeenCalledTimes(firstFails ? 1 : 2);
+      },
+    );
   });
 });
