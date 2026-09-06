@@ -1299,7 +1299,10 @@ export class DockerRuntime implements RuntimeAdapter {
     // string check matters — it is not decoration.
     if (event.id === "moby.buildkit.trace" && typeof event.aux === "string") {
       let hint: string | null = null;
-      for (const line of trace?.push(event.aux) ?? []) {
+      const lines = trace?.push(event.aux, (data, streamId) =>
+        logger.observeBuildOutput(data, streamId),
+      );
+      for (const line of lines ?? []) {
         // Same treatment the classic builder's `stream` lines get, deliberately: the
         // failure hints (OOM-killed install, wrong rootDirectory, BuildKit refused)
         // are the only thing that turns a bare exit code into an explanation, and
@@ -1315,6 +1318,7 @@ export class DockerRuntime implements RuntimeAdapter {
     }
 
     if (event.stream) {
+      logger.observeBuildOutput(event.stream);
       const line = event.stream.trim();
       if (!line) return null;
 
@@ -1655,6 +1659,7 @@ export class DockerRuntime implements RuntimeAdapter {
         buildCmd,
         (entry) => {
           idleMonitor.progress();
+          log.observeBuildOutput(entry.message, entry.level);
           buildContainerTracker?.observeChunk(entry.message);
           streamedFailureHint = chooseDockerBuildFailureHint(
             streamedFailureHint,

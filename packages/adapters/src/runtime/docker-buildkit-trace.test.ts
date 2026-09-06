@@ -72,6 +72,27 @@ describe("BuildKitTraceDecoder", () => {
     ]);
   });
 
+  it("observes raw fragments separately by vertex and stream without changing rendering", () => {
+    const decoder = new BuildKitTraceDecoder();
+    const baseline = new BuildKitTraceDecoder();
+    const observed: Array<[string, string]> = [];
+    const logs = [
+      { vertex: DIGEST, stream: 1, msg: "getaddrinfo ENO" },
+      { vertex: "sha256:other", stream: 1, msg: "another build step\n" },
+      { vertex: DIGEST, stream: 2, msg: "stderr output\n" },
+      { vertex: DIGEST, stream: 1, msg: "TFOUND db\n\n" },
+    ];
+
+    for (const log of logs) {
+      const payload = statusResponse({ logs: [log] });
+      expect(decoder.push(payload, (data, streamId) => observed.push([data, streamId]))).toEqual(
+        baseline.push(payload),
+      );
+    }
+
+    expect(observed).toEqual(logs.map((log) => [log.msg, `${log.vertex}:${log.stream}`]));
+  });
+
   it("reports a cached step as cached, and a plain one as done", () => {
     const decoder = new BuildKitTraceDecoder();
     expect(

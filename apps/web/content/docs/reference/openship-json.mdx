@@ -286,6 +286,10 @@ re-read on every deploy, and `build:` contexts resolve relative to it, exactly a
   }}
 />
 
+`dependsOn` takes service names such as `["db"]`, without a port. It controls container startup
+order, not database availability during an image build. For `ENOTFOUND db` during `next build`,
+see [Database access during a Next.js build](/docs/guides/compose-multi-service#database-access-during-a-nextjs-build).
+
 Top-level `env` is available to Dockerfile builds as well as running containers. Use
 `buildArgs` when a service needs an explicit override or when you want the config to document
 which Dockerfile arguments it consumes. A service's own `env` is runtime-only and is never shared

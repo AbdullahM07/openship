@@ -40,6 +40,7 @@ import {
   resolveComposeInterpolation,
 } from "../../../lib/compose-parser";
 import { resolveServicePort } from "./domain-helpers";
+import { ServiceBuildDnsDiagnostics } from "./build-service-dns";
 
 function sanitizeComposeImageName(value: string): string {
   return (
@@ -437,6 +438,8 @@ export async function buildComposeImages(opts: {
 }): Promise<ComposeBuildImagesResult> {
   const services = await repos.service.listByProject(opts.project.id);
   const enabled = services.filter((service) => service.enabled);
+  const serviceNames = new Set(enabled.map((service) => service.name));
+  const buildDnsDiagnostics = new Map<string, ServiceBuildDnsDiagnostics>();
   const imageRefs = new Map<string, string>();
   const preparedLocalImages = new Map<string, string>();
   const builtImageRefs = new Map<string, string>();
@@ -655,16 +658,22 @@ export async function buildComposeImages(opts: {
       // Per-service logger keeps native terminal bytes intact and routes by
       // serviceName. Inner step events are forwarded as plain service logs;
       // the outer orchestrator owns the top-level step lifecycle.
-      const serviceLogger = new BuildLogger((entry) => {
-        opts.logger.callback({
-          timestamp: entry.timestamp,
-          message: entry.message,
-          level: entry.level,
-          serviceName: service.name,
-          serviceId: service.id,
-          rawData: entry.rawData,
-        });
-      });
+      const dnsDiagnostics =
+        opts.runtime.name === "docker" ? new ServiceBuildDnsDiagnostics(serviceNames) : undefined;
+      if (dnsDiagnostics) buildDnsDiagnostics.set(service.id, dnsDiagnostics);
+      const serviceLogger = new BuildLogger(
+        (entry) => {
+          opts.logger.callback({
+            timestamp: entry.timestamp,
+            message: entry.message,
+            level: entry.level,
+            serviceName: service.name,
+            serviceId: service.id,
+            rawData: entry.rawData,
+          });
+        },
+        (data, streamId) => dnsDiagnostics?.observe(data, streamId),
+      );
 
       if (opts.runtime.name === "cloud" && !opts.project.localPath) {
         opts.logger.log(
@@ -768,6 +777,8 @@ export async function buildComposeImages(opts: {
 
     // Record a per-service build result: image refs / failures + status broadcast.
     const applyBuildResult = (service: Service, buildResult: BuildResult) => {
+      const dnsDiagnostics = buildDnsDiagnostics.get(service.id);
+      buildDnsDiagnostics.delete(service.id);
       // Cancelled ≠ failed: tracked separately so the pipeline can stop without
       // recording a build failure on the deployment. The per-service SSE status
       // union has no "cancelled" member, so the tab reports the reason instead of
@@ -787,8 +798,10 @@ export async function buildComposeImages(opts: {
       }
 
       if (buildResult.status === "failed" || !buildResult.imageRef) {
-        const failureMessage =
+        const originalFailure =
           buildResult.errorMessage ?? `Failed to build service "${service.name}"`;
+        const hint = dnsDiagnostics?.finish(originalFailure);
+        const failureMessage = hint ? `${originalFailure}\n\n${hint}` : originalFailure;
         buildFailures.set(service.id, failureMessage);
         opts.logger.log(
           `Compose service "${service.name}" build failed: ${failureMessage}\n`,

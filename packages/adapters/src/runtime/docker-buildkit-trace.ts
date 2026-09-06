@@ -124,6 +124,7 @@ interface TraceVertex {
 
 interface TraceLog {
   vertex: string;
+  stream: number;
   msg: string;
 }
 
@@ -174,6 +175,7 @@ function decodeVertex(bytes: Uint8Array): TraceVertex | null {
 function decodeLog(bytes: Uint8Array): TraceLog | null {
   const reader = new WireReader(bytes);
   let vertex = "";
+  let stream = 0;
   let msg: Uint8Array | null = null;
 
   while (!reader.done) {
@@ -183,6 +185,10 @@ function decodeLog(bytes: Uint8Array): TraceLog | null {
       const value = reader.bytes();
       if (!value) return null;
       vertex = text(value);
+    } else if (key.field === 3 && key.wire === WIRE_VARINT) {
+      const value = reader.varint();
+      if (value === null) return null;
+      stream = value;
     } else if (key.field === 4 && key.wire === WIRE_LENGTH) {
       const value = reader.bytes();
       if (!value) return null;
@@ -198,7 +204,7 @@ function decodeLog(bytes: Uint8Array): TraceLog | null {
   // log. Dropping it degrades to "no per-command output", never to garbage.
   if (!vertex.startsWith("sha256:") || !msg?.length) return null;
 
-  return { vertex, msg: text(msg) };
+  return { vertex, stream, msg: text(msg) };
 }
 
 /**
@@ -212,7 +218,10 @@ export class BuildKitTraceDecoder {
   private readonly settled = new Set<string>();
 
   /** Decode one `aux` payload into the lines it should add to the build log. */
-  push(auxBase64: string): BuildKitTraceLine[] {
+  push(
+    auxBase64: string,
+    onOutput?: (data: string, streamId: string) => void,
+  ): BuildKitTraceLine[] {
     let payload: Uint8Array;
     try {
       payload = Uint8Array.from(Buffer.from(auxBase64, "base64"));
@@ -240,7 +249,12 @@ export class BuildKitTraceDecoder {
         const bytes = reader.bytes();
         if (!bytes) break;
         const entry = decodeLog(bytes);
-        if (entry) lines.push(...this.renderLog(entry));
+        if (entry) {
+          // Preserve fragment boundaries and stdout/stderr identity before the
+          // renderer splits lines or adds step prefixes.
+          onOutput?.(entry.msg, `${entry.vertex}:${entry.stream}`);
+          lines.push(...this.renderLog(entry));
+        }
         continue;
       }
 

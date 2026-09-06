@@ -37,7 +37,15 @@ export {
  * instead of constructing raw LogEntry objects.
  */
 export class BuildLogger {
-  constructor(private readonly onLog?: LogCallback) {}
+  constructor(
+    private readonly onLog?: LogCallback,
+    private readonly onBuildOutput?: (data: string, streamId: string) => void,
+  ) {}
+
+  /** Observe command output before rendering, without emitting another log entry. */
+  observeBuildOutput(data: string, streamId = "default"): void {
+    this.onBuildOutput?.(data, streamId);
+  }
 
   /** Emit a plain log line. */
   log(
